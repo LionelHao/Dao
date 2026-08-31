@@ -53,6 +53,10 @@ import {
 } from "../tool-safety/database-authority.js";
 import type { ScopedCancellationCommitReceipt } from
   "../scoped-cancellation/scoped-cancellation-orchestrator.js";
+import {
+  type IssuedOfflineReadLease,
+  type OfflineReadLeaseIssuer,
+} from "../access/offline-lease-invalidation-port.js";
 import type {
   RouteAuthorityOperation,
   RouteAuthorityOperationResult,
@@ -114,6 +118,7 @@ import type { SnapshotVersion } from "@native-im/core";
 import { assignTopicKey } from "../route-runtime/route-decision.js";
 import type { AuthorityTransactionView } from "../room-governance/private-participant-contracts.js";
 import { withDatabaseAuthorityTransactionView } from "./authority-transaction-database.js";
+import { requireIdempotencyCleanupLimit } from "./idempotency-lifecycle.js";
 import {
   ArchivedMessageMutationBlockedError,
   requireMessageMutationAllowedInTransaction,
@@ -979,6 +984,56 @@ export function runAuthorityParticipantImmediateTransaction<Result>(
   );
 }
 
+export function issueOfflineReadLeaseDatabaseCommand(
+  database: DatabaseSync,
+  issuer: OfflineReadLeaseIssuer,
+  context: AuthenticatedSessionContext,
+  input: Readonly<{ roomId: string; requestedLeaseMs: number; now: number }>,
+): IssuedOfflineReadLease {
+  requireHumanSession(database, context, input.now);
+  const row = database.prepare(
+    `SELECT family.device_id AS deviceId,
+            room.archive_generation AS lifecycleGeneration,
+            access.access_revision AS accessRevision,
+            access.lease_generation AS leaseGeneration
+     FROM session_families AS family
+     JOIN room_memberships AS membership ON membership.actor_id = family.actor_id
+     JOIN rooms AS room ON room.id = membership.room_id
+     JOIN room_access_authority AS access ON access.room_id = room.id
+     WHERE family.family_id = ? AND family.account_id = ? AND family.actor_id = ?
+       AND family.revoked_at IS NULL AND family.refresh_expires_at > ?
+       AND membership.room_id = ? AND membership.kind = 'human'`,
+  ).get(
+    context.sessionFamilyId,
+    context.principal.accountId,
+    context.principal.actorId,
+    input.now,
+    input.roomId,
+  );
+  if (typeof row?.deviceId !== "string" || typeof row.lifecycleGeneration !== "number" ||
+      typeof row.accessRevision !== "number" || typeof row.leaseGeneration !== "number") {
+    return fail("permission_denied", "Offline read lease subject is not authorized");
+  }
+  return runAuthorityParticipantImmediateTransaction(
+    database,
+    input.roomId,
+    `offline-read-lease:${randomUUID()}`,
+    (transaction) => issuer.issueInTransaction(transaction, {
+      roomId: input.roomId,
+      accountId: context.principal.accountId,
+      actorId: context.principal.actorId,
+      sessionFamilyId: context.sessionFamilyId,
+      deviceId: row.deviceId as string,
+      installationId: row.deviceId as string,
+      requestedLeaseMs: input.requestedLeaseMs,
+      expectedLifecycleGeneration: row.lifecycleGeneration as number,
+      expectedAccessRevision: row.accessRevision as number,
+      expectedLeaseGeneration: row.leaseGeneration as number,
+      nowMs: input.now,
+    }),
+  );
+}
+
 function canonicalJson(value: unknown): string {
   if (value === null || typeof value === "boolean" || typeof value === "string") {
     return JSON.stringify(value);
@@ -1037,6 +1092,38 @@ function businessHash(command: PersistentCommand): string {
   return createHash("sha256").update(canonicalJson(command)).digest("base64url");
 }
 
+interface StoredIdempotencyRow {
+  readonly requestHash: unknown;
+  readonly responseJson: unknown;
+  readonly expiresAt: unknown;
+}
+
+function readActiveIdempotencyRow(
+  database: DatabaseSync,
+  scope: string,
+  key: string,
+  now: number,
+): StoredIdempotencyRow | undefined {
+  const row = database.prepare(
+    `SELECT request_hash AS requestHash, response_json AS responseJson,
+            expires_at AS expiresAt
+     FROM idempotency_records WHERE scope = ? AND key = ?`,
+  ).get(scope, key) as StoredIdempotencyRow | undefined;
+  if (row === undefined) return undefined;
+  if (typeof row.expiresAt !== "string" || !Number.isFinite(Date.parse(row.expiresAt))) {
+    return fail("storage_unavailable", "Stored idempotency expiry is corrupt");
+  }
+  if (now < Date.parse(row.expiresAt)) return row;
+  const removed = database.prepare(
+    `DELETE FROM idempotency_records
+     WHERE scope = ? AND key = ? AND expires_at = ?`,
+  ).run(scope, key, row.expiresAt);
+  if (removed.changes !== 1) {
+    return fail("storage_unavailable", "Expired idempotency receipt could not be removed");
+  }
+  return undefined;
+}
+
 interface IdempotentCommandInput {
   readonly actorId: string;
   readonly command: PersistentCommand;
@@ -1063,12 +1150,12 @@ function executeIdempotently(
     input.aggregateId,
   ].join("\u0000");
   const requestHash = businessHash(input.command);
-  const existing = database
-    .prepare(
-      `SELECT request_hash AS requestHash, response_json AS responseJson
-       FROM idempotency_records WHERE scope = ? AND key = ?`,
-    )
-    .get(scope, input.idempotencyKey);
+  const existing = readActiveIdempotencyRow(
+    database,
+    scope,
+    input.idempotencyKey,
+    input.now,
+  );
   if (existing !== undefined) {
     if (existing.requestHash !== requestHash) {
       return fail("idempotency_conflict", "Idempotency key payload changed");
@@ -1214,13 +1301,8 @@ export function revalidateSnapshotDatabaseQuery(
       return;
     }
     const room = database.prepare(
-      `SELECT room.status, stream.head_seq AS watermark
-       FROM rooms AS room
-       JOIN streams AS stream
-         ON stream.stream_kind = 'room' AND stream.stream_id = room.id
-       WHERE room.id = ?`,
-    )
-      .get(validation.roomId);
+      `SELECT room.status FROM rooms AS room WHERE room.id = ?`,
+    ).get(validation.roomId);
     if (room === undefined) {
       return fail("room_not_found", "Snapshot room was not found");
     }
@@ -1243,9 +1325,6 @@ export function revalidateSnapshotDatabaseQuery(
     }
     if (membership.accessRevision !== validation.accessRevision) {
       return fail("snapshot_stale", "Snapshot room access revision changed");
-    }
-    if (room.watermark !== validation.watermark) {
-      return fail("snapshot_stale", "Snapshot Room watermark changed");
     }
   });
 }
@@ -2264,9 +2343,39 @@ export function authorizeOutboxCandidateDatabaseQuery(
          AND session.revoked_at IS NULL
          AND actor.kind = 'human'
          AND membership.room_id = ?
-         AND room.status = 'active'`,
+         AND (room.status = 'active' OR room.status = 'archived')`,
     )
     .get(...sessionParameters, delivery.targetId)?.allowed === 1;
+}
+
+function settleProjectOutboxMirror(database: DatabaseSync, eventId: string, now: string): void {
+  const mirror = database
+    .prepare("SELECT status FROM project_event_outbox WHERE event_id = ?")
+    .get(eventId);
+  if (mirror?.status !== "pending") return;
+  const aggregate = database.prepare(
+    `SELECT
+       SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pendingCount,
+       SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END) AS deadLetterCount,
+       MAX(attempts) AS attempts,
+       MAX(CASE WHEN status = 'dead_letter' THEN last_error END) AS lastError,
+       MAX(CASE WHEN status = 'dead_letter' THEN dead_lettered_at END) AS deadLetteredAt
+     FROM outbox_deliveries WHERE event_id = ?`,
+  ).get(eventId);
+  if (typeof aggregate?.pendingCount !== "number" || aggregate.pendingCount > 0) return;
+  if (typeof aggregate.deadLetterCount === "number" && aggregate.deadLetterCount > 0) {
+    database.prepare(
+      `UPDATE project_event_outbox
+       SET status = 'dead_letter', attempts = 8, last_error = ?, dead_lettered_at = ?
+       WHERE event_id = ? AND status = 'pending'`,
+    ).run(aggregate.lastError ?? "send_rejected", aggregate.deadLetteredAt ?? now, eventId);
+    return;
+  }
+  database.prepare(
+    `UPDATE project_event_outbox
+     SET status = 'dispatched', attempts = MIN(?, 7), dispatched_at = ?, last_error = NULL
+     WHERE event_id = ? AND status = 'pending'`,
+  ).run(aggregate.attempts ?? 0, now, eventId);
 }
 
 export function markOutboxDispatchedDatabaseCommand(
@@ -2274,21 +2383,91 @@ export function markOutboxDispatchedDatabaseCommand(
   deliveryId: string,
   now: number,
 ): void {
-  const result = database
-    .prepare(
+  runAuthorityImmediateTransaction(database, () => {
+    const deliveredAt = new Date(now).toISOString();
+    const row = database.prepare(
+      "SELECT event_id AS eventId, status FROM outbox_deliveries WHERE id = ?",
+    ).get(deliveryId);
+    if (typeof row?.eventId !== "string") {
+      return fail("storage_unavailable", "Authority outbox delivery does not exist");
+    }
+    if (row.status === "dispatched") return;
+    if (row.status !== "pending") {
+      return fail("storage_unavailable", "Authority outbox delivery is already terminal");
+    }
+    database.prepare(
       `UPDATE outbox_deliveries
        SET status = 'dispatched', delivered_at = ?, last_error = NULL
        WHERE id = ? AND status = 'pending'`,
-    )
-    .run(new Date(now).toISOString(), deliveryId);
-  if (result.changes === 0) {
-    const existing = database
-      .prepare("SELECT status FROM outbox_deliveries WHERE id = ?")
-      .get(deliveryId);
-    if (existing?.status !== "dispatched") {
-      return fail("storage_unavailable", "Authority outbox delivery does not exist");
+    ).run(deliveredAt, deliveryId);
+    settleProjectOutboxMirror(database, row.eventId, deliveredAt);
+  });
+}
+
+interface OutboxRetryTransitionInput {
+  readonly deliveryId: string;
+  readonly eventId: string;
+  readonly attempt: number;
+  readonly reason: OutboxDeliveryFailureReason;
+  readonly availableAtMs: number;
+}
+
+export function scheduleOutboxRetryDatabaseCommand(
+  database: DatabaseSync,
+  input: OutboxRetryTransitionInput,
+): void {
+  runAuthorityImmediateTransaction(database, () => {
+    const availableAt = new Date(input.availableAtMs).toISOString();
+    const result = database.prepare(
+      `UPDATE outbox_deliveries
+       SET attempts = ?, last_error = ?, available_at = ?
+       WHERE id = ? AND event_id = ? AND status = 'pending' AND attempts = ?`,
+    ).run(
+      input.attempt, input.reason, availableAt, input.deliveryId, input.eventId, input.attempt - 1,
+    );
+    if (result.changes === 0) {
+      const row = database.prepare(
+        `SELECT event_id AS eventId, status, attempts, last_error AS lastError,
+                available_at AS availableAt FROM outbox_deliveries WHERE id = ?`,
+      ).get(input.deliveryId);
+      if (row?.eventId === input.eventId && row.status === "pending" &&
+          row.attempts === input.attempt && row.lastError === input.reason &&
+          row.availableAt === availableAt) return;
+      return fail("storage_unavailable", "Authority outbox retry transition conflicted");
     }
-  }
+    database.prepare(
+      `UPDATE project_event_outbox
+       SET attempts = MAX(attempts, ?), available_at = MAX(available_at, ?)
+       WHERE event_id = ? AND status = 'pending'`,
+    ).run(input.attempt, availableAt, input.eventId);
+  });
+}
+
+export function deadLetterOutboxDatabaseCommand(
+  database: DatabaseSync,
+  input: Omit<OutboxRetryTransitionInput, "availableAtMs"> & {
+    readonly deadLetteredAtMs: number;
+  },
+): void {
+  runAuthorityImmediateTransaction(database, () => {
+    const deadLetteredAt = new Date(input.deadLetteredAtMs).toISOString();
+    const result = database.prepare(
+      `UPDATE outbox_deliveries
+       SET status = 'dead_letter', attempts = 8, last_error = ?, dead_lettered_at = ?
+       WHERE id = ? AND event_id = ? AND status = 'pending' AND attempts = 7`,
+    ).run(input.reason, deadLetteredAt, input.deliveryId, input.eventId);
+    if (result.changes === 0) {
+      const row = database.prepare(
+        `SELECT event_id AS eventId, status, attempts, last_error AS lastError,
+                dead_lettered_at AS deadLetteredAt FROM outbox_deliveries WHERE id = ?`,
+      ).get(input.deliveryId);
+      if (row?.eventId === input.eventId && row.status === "dead_letter" &&
+          row.attempts === 8 && row.lastError === input.reason &&
+          row.deadLetteredAt === deadLetteredAt) return;
+      return fail("storage_unavailable", "Authority outbox dead-letter transition conflicted");
+    }
+    settleProjectOutboxMirror(database, input.eventId, deadLetteredAt);
+  });
 }
 
 export function markOutboxFailedDatabaseCommand(
@@ -2299,7 +2478,7 @@ export function markOutboxFailedDatabaseCommand(
   const result = database
     .prepare(
       `UPDATE outbox_deliveries
-       SET attempts = attempts + 1, last_error = ?
+       SET attempts = MIN(attempts + 1, 7), last_error = ?
        WHERE id = ? AND status = 'pending'`,
     )
     .run(reason, deliveryId);
@@ -2313,6 +2492,134 @@ export function markOutboxFailedDatabaseCommand(
   }
 }
 
+export interface IdempotencyCleanupBatchResult {
+  readonly deletedCount: number;
+  readonly hasMore: boolean;
+}
+
+export interface DeploymentProfileOutboxSettlementResult {
+  readonly settledCount: number;
+  readonly hasMore: boolean;
+}
+
+/**
+ * Deployment Profile clients recover from the authoritative profile cursor. There is no
+ * independent local realtime subscription in the current protocol, so absence of a local
+ * eligible connection is a successful local dispatch, not an unbounded pending delivery.
+ */
+export function settleDeploymentProfileCursorOutboxDatabaseCommand(
+  database: DatabaseSync,
+  now: number,
+  requestedLimit: number,
+): DeploymentProfileOutboxSettlementResult {
+  if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(requestedLimit) ||
+      requestedLimit <= 0 || requestedLimit > 100) {
+    return fail("invalid_request", "Deployment Profile outbox settlement input was invalid");
+  }
+  return runAuthorityImmediateTransaction(database, () => {
+    const timestamp = new Date(now).toISOString();
+    const rows = database.prepare(
+      `SELECT id FROM deployment_profile_outbox
+       WHERE status = 'pending' AND available_at <= ?
+       ORDER BY available_at, stream_seq, id LIMIT ?`,
+    ).all(timestamp, requestedLimit);
+    const update = database.prepare(
+      `UPDATE deployment_profile_outbox
+       SET status = 'dispatched', delivered_at = ?, last_error = NULL
+       WHERE id = ? AND status = 'pending'`,
+    );
+    for (const row of rows) {
+      if (typeof row.id !== "string") {
+        return fail("storage_unavailable", "Deployment Profile outbox row was corrupt");
+      }
+      update.run(timestamp, row.id);
+    }
+    const hasMore = database.prepare(
+      `SELECT 1 AS present FROM deployment_profile_outbox
+       WHERE status = 'pending' AND available_at <= ? LIMIT 1`,
+    ).get(timestamp)?.present === 1;
+    return Object.freeze({ settledCount: rows.length, hasMore });
+  });
+}
+
+export function cleanupExpiredIdempotencyDatabaseCommand(
+  database: DatabaseSync,
+  now: number,
+  requestedLimit: number,
+): IdempotencyCleanupBatchResult {
+  const limit = requireIdempotencyCleanupLimit(requestedLimit);
+  if (!Number.isSafeInteger(now) || now < 0) {
+    return fail("invalid_request", "Idempotency cleanup clock was invalid");
+  }
+  return runAuthorityImmediateTransaction(database, () => {
+    const nowIso = new Date(now).toISOString();
+    const families = [
+      {
+        table: "idempotency_records",
+        expiry: "expires_at",
+        value: nowIso,
+        predicate: "expires_at <= ?",
+      },
+      {
+        table: "deployment_idempotency_records",
+        expiry: "expires_at_ms",
+        value: now,
+        predicate: "expires_at_ms <= ?",
+      },
+      {
+        table: "room_memory_idempotency",
+        expiry: "expires_at_ms",
+        value: now,
+        predicate: "expires_at_ms <= ?",
+      },
+      {
+        table: "tool_safety_command_receipts_v2",
+        expiry: "expires_at",
+        value: nowIso,
+        predicate: "expires_at <= ?",
+      },
+      {
+        table: "project_command_receipts",
+        expiry: "expires_at",
+        value: nowIso,
+        predicate: "expires_at <= ?",
+      },
+      {
+        table: "invocation_cancellation_receipts",
+        expiry: "expires_at",
+        value: nowIso,
+        predicate: "expires_at IS NOT NULL AND expires_at <= ?",
+      },
+      {
+        table: "invocation_human_retry_receipts",
+        expiry: "expires_at",
+        value: nowIso,
+        predicate: "expires_at <= ?",
+      },
+    ] as const;
+    let deletedCount = 0;
+    for (const family of families) {
+      const remaining = limit - deletedCount;
+      if (remaining === 0) break;
+      const deleted = database.prepare(
+        `DELETE FROM ${family.table}
+         WHERE rowid IN (
+           SELECT rowid FROM ${family.table}
+           WHERE ${family.predicate}
+           ORDER BY ${family.expiry}, rowid
+           LIMIT ?
+         )`,
+      ).run(family.value, remaining);
+      deletedCount += Number(deleted.changes);
+    }
+    const hasMore = families.some((family) => database.prepare(
+      `SELECT 1 AS present FROM ${family.table}
+       WHERE ${family.predicate} LIMIT 1`,
+    ).get(family.value)?.present === 1);
+    return Object.freeze({ deletedCount, hasMore });
+  });
+}
+
 export function listCommittedRoomCacheInvalidationIntentsDatabaseQuery(
   database: DatabaseSync,
   limit: number,
@@ -2324,7 +2631,8 @@ export function listCommittedRoomCacheInvalidationIntentsDatabaseQuery(
     `SELECT id AS invalidationIntentId, room_id AS roomId,
             lifecycle_generation AS lifecycleGeneration,
             access_revision AS accessRevision, reason,
-            target_actor_id AS targetActorId
+            target_actor_id AS targetActorId, attempts,
+            CAST(strftime('%s', created_at) AS INTEGER) * 1000 AS createdAtMs
      FROM room_cache_invalidation_intents
      WHERE status = 'pending' AND available_at <= CURRENT_TIMESTAMP
      ORDER BY available_at, created_at, id
@@ -2337,6 +2645,10 @@ export function listCommittedRoomCacheInvalidationIntentsDatabaseQuery(
         !Number.isSafeInteger(row.lifecycleGeneration) || row.lifecycleGeneration < 0 ||
         typeof row.accessRevision !== "number" ||
         !Number.isSafeInteger(row.accessRevision) || row.accessRevision < 0 ||
+        typeof row.attempts !== "number" || !Number.isSafeInteger(row.attempts) ||
+        row.attempts < 0 || row.attempts > 7 ||
+        typeof row.createdAtMs !== "number" || !Number.isSafeInteger(row.createdAtMs) ||
+        row.createdAtMs < 0 ||
         (row.reason !== "room_archived" && row.reason !== "member_removed" &&
           row.reason !== "access_revoked") ||
         (row.reason === "room_archived" && row.targetActorId !== null) ||
@@ -2348,6 +2660,8 @@ export function listCommittedRoomCacheInvalidationIntentsDatabaseQuery(
       roomId: row.roomId,
       lifecycleGeneration: row.lifecycleGeneration,
       accessRevision: row.accessRevision,
+      attempts: row.attempts,
+      createdAtMs: row.createdAtMs,
     };
     return row.reason === "room_archived"
       ? { ...common, reason: "room_archived" as const }
@@ -2375,19 +2689,46 @@ export function markRoomCacheInvalidationCompletedDatabaseCommand(
 
 export function markRoomCacheInvalidationFailedDatabaseCommand(
   database: DatabaseSync,
-  invalidationIntentId: string,
-  errorCode: "purge_failed" | "authority_unavailable",
+  input: Readonly<{
+    invalidationIntentId: string;
+    attempt: number;
+    errorCode: "purge_failed" | "authority_unavailable";
+    availableAtMs?: number;
+    deadLetteredAtMs?: number;
+  }>,
 ): void {
-  const updated = database.prepare(
-    `UPDATE room_cache_invalidation_intents
-     SET attempts = attempts + 1, last_error_code = ?, available_at = CURRENT_TIMESTAMP
-     WHERE id = ? AND status = 'pending'`,
-  ).run(errorCode, invalidationIntentId);
+  const terminal = input.deadLetteredAtMs !== undefined;
+  if ((terminal && (input.availableAtMs !== undefined || input.attempt !== 8)) ||
+      (!terminal && (input.availableAtMs === undefined || input.attempt < 1 || input.attempt >= 8))) {
+    return fail("invalid_request", "Room cache invalidation failure transition was invalid");
+  }
+  const timestamp = new Date(
+    terminal ? input.deadLetteredAtMs! : input.availableAtMs!,
+  ).toISOString();
+  const updated = terminal
+    ? database.prepare(
+      `UPDATE room_cache_invalidation_intents
+       SET status = 'dead_letter', attempts = 8, last_error_code = ?, dead_lettered_at = ?
+       WHERE id = ? AND status = 'pending' AND attempts = 7`,
+    ).run(input.errorCode, timestamp, input.invalidationIntentId)
+    : database.prepare(
+      `UPDATE room_cache_invalidation_intents
+       SET attempts = ?, last_error_code = ?, available_at = ?
+       WHERE id = ? AND status = 'pending' AND attempts = ?`,
+    ).run(
+      input.attempt, input.errorCode, timestamp, input.invalidationIntentId, input.attempt - 1,
+    );
   if (updated.changes === 1) return;
   const existing = database.prepare(
-    "SELECT status FROM room_cache_invalidation_intents WHERE id = ?",
-  ).get(invalidationIntentId);
-  if (existing?.status !== "completed" && existing?.status !== "dead_letter") {
+    `SELECT status, attempts, last_error_code AS lastError,
+            available_at AS availableAt, dead_lettered_at AS deadLetteredAt
+     FROM room_cache_invalidation_intents WHERE id = ?`,
+  ).get(input.invalidationIntentId);
+  const idempotent = existing?.attempts === input.attempt &&
+    existing.lastError === input.errorCode && (terminal
+      ? existing.status === "dead_letter" && existing.deadLetteredAt === timestamp
+      : existing.status === "pending" && existing.availableAt === timestamp);
+  if (!idempotent) {
     return fail("storage_unavailable", "Room cache invalidation intent does not exist");
   }
 }
@@ -8596,10 +8937,26 @@ export function executeRuntimeAuthorityOperation(
       })).digest("hex");
       const replay = database.prepare(
         `SELECT principal_actor_id AS principalActorId,
-                request_sha256 AS requestSha256, response_json AS responseJson
+                request_sha256 AS requestSha256, response_json AS responseJson,
+                expires_at AS expiresAt
          FROM invocation_cancellation_receipts WHERE request_id = ?`,
       ).get(operation.context.requestId);
-      if (typeof replay?.responseJson === "string") {
+      if (replay !== undefined && (typeof replay.expiresAt !== "string" ||
+          !Number.isFinite(Date.parse(replay.expiresAt)))) {
+        return fail("storage_unavailable", "Cancellation receipt expiry was corrupt");
+      }
+      if (typeof replay?.expiresAt === "string" &&
+          operation.now >= Date.parse(replay.expiresAt)) {
+        const removed = database.prepare(
+          `DELETE FROM invocation_cancellation_receipts
+           WHERE request_id = ? AND expires_at = ?`,
+        ).run(operation.context.requestId, replay.expiresAt);
+        if (removed.changes !== 1) {
+          return fail("storage_unavailable", "Expired cancellation receipt was not removed");
+        }
+      }
+      if (typeof replay?.responseJson === "string" &&
+          operation.now < Date.parse(replay.expiresAt as string)) {
         if (replay.principalActorId !== actorId) {
           return fail("permission_denied", "Cancellation receipt principal did not match");
         }
@@ -8713,10 +9070,11 @@ export function executeRuntimeAuthorityOperation(
         database.prepare(
           `INSERT INTO invocation_cancellation_receipts (
              request_id, fence_id, principal_actor_id, request_sha256,
-             status_code, response_json, committed_at
-           ) VALUES (?, ?, ?, ?, 200, ?, ?)`,
+             status_code, response_json, committed_at, expires_at
+           ) VALUES (?, ?, ?, ?, 200, ?, ?, ?)`,
         ).run(operation.context.requestId, fenceId, actorId, requestSha256,
-          JSON.stringify(receipt), occurredAt);
+          JSON.stringify(receipt), occurredAt,
+          new Date(operation.now + 30 * 24 * 60 * 60 * 1_000).toISOString());
         appendCanonicalScopedCancellationEvent(database, canonicalReceipt, actorId, occurredAt);
         return receipt;
       }
@@ -8895,10 +9253,11 @@ export function executeRuntimeAuthorityOperation(
       database.prepare(
         `INSERT INTO invocation_cancellation_receipts (
            request_id, fence_id, principal_actor_id, request_sha256,
-           status_code, response_json, committed_at
-         ) VALUES (?, ?, ?, ?, 200, ?, ?)`,
+           status_code, response_json, committed_at, expires_at
+         ) VALUES (?, ?, ?, ?, 200, ?, ?, ?)`,
       ).run(operation.context.requestId, fenceId, operation.context.principal.actorId,
-        requestSha256, responseJson, occurredAt);
+        requestSha256, responseJson, occurredAt,
+        new Date(operation.now + 30 * 24 * 60 * 60 * 1_000).toISOString());
       appendCanonicalScopedCancellationEvent(
         database, canonicalReceipt, operation.context.principal.actorId, occurredAt,
       );
@@ -8962,10 +9321,26 @@ export function executeRuntimeAuthorityOperation(
       if (operation.expectedVersion !== undefined) {
         const replay = database.prepare(
           `SELECT principal_actor_id AS principalActorId,
-                  request_sha256 AS requestSha256, response_json AS responseJson
+                  request_sha256 AS requestSha256, response_json AS responseJson,
+                  expires_at AS expiresAt
            FROM invocation_human_retry_receipts WHERE request_id = ?`,
         ).get(operation.context.requestId);
-        if (typeof replay?.responseJson === "string") {
+        if (replay !== undefined && (typeof replay.expiresAt !== "string" ||
+            !Number.isFinite(Date.parse(replay.expiresAt)))) {
+          return fail("storage_unavailable", "Retry receipt expiry was corrupt");
+        }
+        if (typeof replay?.expiresAt === "string" &&
+            operation.now >= Date.parse(replay.expiresAt)) {
+          const removed = database.prepare(
+            `DELETE FROM invocation_human_retry_receipts
+             WHERE request_id = ? AND expires_at = ?`,
+          ).run(operation.context.requestId, replay.expiresAt);
+          if (removed.changes !== 1) {
+            return fail("storage_unavailable", "Expired retry receipt was not removed");
+          }
+        }
+        if (typeof replay?.responseJson === "string" &&
+            operation.now < Date.parse(replay.expiresAt as string)) {
           if (replay.principalActorId !== principalActorId) {
             return fail("permission_denied", "Retry receipt principal did not match");
           }
@@ -9112,11 +9487,12 @@ export function executeRuntimeAuthorityOperation(
           `INSERT INTO invocation_human_retry_receipts (
              request_id, source_execution_id, source_expected_version,
              child_execution_id, intent_id, execution_ordinal, principal_actor_id,
-             request_sha256, response_json, committed_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             request_sha256, response_json, committed_at, expires_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(operation.context.requestId, old.id, operation.expectedVersion,
           execution.id, lineage.intentId, lineage.executionOrdinal, principalActorId,
-          retryRequestSha256, JSON.stringify(response), occurredAt);
+          retryRequestSha256, JSON.stringify(response), occurredAt,
+          new Date(operation.now + 30 * 24 * 60 * 60 * 1_000).toISOString());
         appendCanonicalExecutionRetryEvent(
           database, retryReceipt, operation.context.principal.actorId, occurredAt,
         );
@@ -10307,10 +10683,7 @@ function executeMessageAuthorityIdempotently<Receipt extends StoredMessageAuthor
   },
 ): Receipt {
   const requestHash = messageAuthorityHash(input.command);
-  const existing = database.prepare(
-    `SELECT request_hash AS requestHash, response_json AS responseJson
-     FROM idempotency_records WHERE scope = ? AND key = ?`,
-  ).get(input.scope, input.key);
+  const existing = readActiveIdempotencyRow(database, input.scope, input.key, input.now);
   if (existing !== undefined) {
     if (existing.requestHash !== requestHash) {
       return fail("idempotency_conflict", "Message authority idempotency payload changed");
@@ -11649,9 +12022,12 @@ export function commitAgentMessageDatabaseCommand(
       String(input.context.attemptSeq),
       String(input.context.executionGeneration),
     ].join("\u0000");
-    const existingReceipt = database.prepare(
-      "SELECT request_hash AS requestHash, response_json AS responseJson FROM idempotency_records WHERE scope = ? AND key = ?",
-    ).get(scope, input.command.messageId);
+    const existingReceipt = readActiveIdempotencyRow(
+      database,
+      scope,
+      input.command.messageId,
+      input.now,
+    );
     if (existingReceipt !== undefined) {
       if (existingReceipt.requestHash !== messageAuthorityHash(input.command)) {
         return fail("idempotency_conflict", "Agent message idempotency payload changed");

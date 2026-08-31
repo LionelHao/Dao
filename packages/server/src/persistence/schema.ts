@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 26 as const;
+export const AUTHORITY_SCHEMA_VERSION = 27 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -78,6 +78,7 @@ const SCHEMA_FINGERPRINTS = {
   24: "ef4c3593ee4384350f57c1f92e6d229c523b4c99817f95222718c4abe10db896",
   25: "e0cd0a610c4777209877535e0d5651498984681bf9b3c3f825724f4946191815",
   26: "a5c6c02245dfab5a054e5035898f6a81ee805424901bb57ff96eb8eeac74f6cb",
+  27: "a7c507632ae5bd86f0e76df7be00f40d9872c4d7ff45e009fe51a166ec76717d",
 } as const;
 
 const V1_STATEMENTS = [
@@ -9461,12 +9462,331 @@ const V26_STATEMENTS = [
    BEGIN SELECT RAISE(ABORT, 'tool review is immutable'); END`,
 ] as const;
 
+const V27_STATEMENTS = [
+  `PRAGMA legacy_alter_table = ON`,
+  `ALTER TABLE outbox_deliveries RENAME TO outbox_deliveries_v26`,
+  `CREATE TABLE outbox_deliveries (
+    id TEXT NOT NULL UNIQUE,
+    event_id TEXT NOT NULL REFERENCES events(event_id),
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('room', 'principal', 'session-family')),
+    target_id TEXT NOT NULL CHECK (length(target_id) > 0),
+    stream_seq INTEGER NOT NULL CHECK (stream_seq >= 1),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'dispatched', 'dead_letter')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 8),
+    available_at TEXT NOT NULL,
+    delivered_at TEXT,
+    last_error TEXT CHECK (
+      last_error IS NULL OR last_error IN (
+        'closed', 'backpressure', 'send_rejected',
+        'superseded_by_message_revision', 'superseded_by_message_recall'
+      )
+    ),
+    dead_lettered_at TEXT,
+    PRIMARY KEY (event_id, target_kind, target_id),
+    FOREIGN KEY (event_id, stream_seq) REFERENCES events(event_id, stream_seq),
+    CHECK (
+      (status = 'pending' AND delivered_at IS NULL AND dead_lettered_at IS NULL)
+      OR (status = 'dispatched' AND delivered_at IS NOT NULL AND dead_lettered_at IS NULL
+          AND (last_error IS NULL OR last_error IN (
+            'superseded_by_message_revision', 'superseded_by_message_recall'
+          )))
+      OR (status = 'dead_letter' AND delivered_at IS NULL AND dead_lettered_at IS NOT NULL
+          AND attempts = 8 AND last_error IS NOT NULL)
+    )
+  ) STRICT`,
+  `INSERT INTO outbox_deliveries (
+     id, event_id, target_kind, target_id, stream_seq, status, attempts,
+     available_at, delivered_at, last_error, dead_lettered_at
+   ) SELECT id, event_id, target_kind, target_id, stream_seq, status,
+            MIN(attempts, 7), available_at, delivered_at,
+            CASE
+              WHEN status = 'dispatched' AND last_error IN (
+                'superseded_by_message_revision', 'superseded_by_message_recall'
+              ) THEN last_error
+              WHEN status = 'pending' AND last_error IS NOT NULL THEN 'send_rejected'
+              ELSE NULL
+            END,
+            NULL
+     FROM outbox_deliveries_v26`,
+  `DROP TABLE outbox_deliveries_v26`,
+  `PRAGMA legacy_alter_table = OFF`,
+  `CREATE INDEX outbox_deliveries_pending_v27
+   ON outbox_deliveries(status, available_at, stream_seq, id)`,
+  `CREATE INDEX outbox_deliveries_dead_letter_v27
+   ON outbox_deliveries(status, dead_lettered_at, id)`,
+  `CREATE INDEX idempotency_records_expiry_v27
+   ON idempotency_records(expires_at, scope, key)`,
+  `CREATE INDEX room_memory_idempotency_expiry_v27
+   ON room_memory_idempotency(expires_at_ms, scope, idempotency_key)`,
+  `CREATE INDEX deployment_idempotency_records_expiry_v27
+   ON deployment_idempotency_records(expires_at_ms, scope, idempotency_key)`,
+  `CREATE INDEX tool_safety_command_receipts_expiry_v27
+   ON tool_safety_command_receipts_v2(
+     expires_at, principal_actor_id, command_kind, idempotency_key
+   )`,
+  `ALTER TABLE project_command_receipts ADD COLUMN expires_at TEXT`,
+  `UPDATE project_command_receipts
+   SET expires_at = datetime(committed_at, '+30 days')`,
+  `CREATE TRIGGER project_command_receipts_v27_validate_insert
+   BEFORE INSERT ON project_command_receipts
+   WHEN NEW.expires_at IS NULL
+      OR julianday(NEW.expires_at) <= julianday(NEW.committed_at)
+      OR julianday(NEW.expires_at) > julianday(NEW.committed_at) + 30
+   BEGIN SELECT RAISE(ABORT, 'Project command receipt expiry is invalid'); END`,
+  `CREATE TRIGGER project_command_receipts_v27_immutable_update
+   BEFORE UPDATE ON project_command_receipts
+   BEGIN SELECT RAISE(ABORT, 'Project command receipt is immutable'); END`,
+  `CREATE INDEX project_command_receipts_expiry_v27
+   ON project_command_receipts(expires_at, actor_id, idempotency_key)`,
+  `DROP TRIGGER invocation_cancellation_receipts_v22_immutable_update`,
+  `DROP TRIGGER invocation_cancellation_receipts_v22_immutable_delete`,
+  `ALTER TABLE invocation_cancellation_receipts ADD COLUMN expires_at TEXT`,
+  `UPDATE invocation_cancellation_receipts
+   SET expires_at = datetime(committed_at, '+30 days')
+   WHERE principal_actor_id IS NOT NULL`,
+  `CREATE TRIGGER invocation_cancellation_receipts_v27_validate_insert
+   BEFORE INSERT ON invocation_cancellation_receipts
+   WHEN (NEW.principal_actor_id IS NULL AND NEW.expires_at IS NOT NULL)
+      OR (NEW.principal_actor_id IS NOT NULL AND (
+        NEW.expires_at IS NULL
+        OR julianday(NEW.expires_at) <= julianday(NEW.committed_at)
+        OR julianday(NEW.expires_at) > julianday(NEW.committed_at) + 30
+      ))
+   BEGIN SELECT RAISE(ABORT, 'Cancellation receipt expiry is invalid'); END`,
+  `CREATE TRIGGER invocation_cancellation_receipts_v27_immutable_update
+   BEFORE UPDATE ON invocation_cancellation_receipts
+   BEGIN SELECT RAISE(ABORT, 'Cancellation receipt is immutable'); END`,
+  `CREATE INDEX invocation_cancellation_receipts_expiry_v27
+   ON invocation_cancellation_receipts(expires_at, request_id)
+   WHERE expires_at IS NOT NULL`,
+  `DROP TRIGGER invocation_human_retry_receipts_v22_immutable_update`,
+  `DROP TRIGGER invocation_human_retry_receipts_v22_immutable_delete`,
+  `ALTER TABLE invocation_human_retry_receipts ADD COLUMN expires_at TEXT`,
+  `UPDATE invocation_human_retry_receipts
+   SET expires_at = datetime(committed_at, '+30 days')`,
+  `CREATE TRIGGER invocation_human_retry_receipts_v27_validate_insert
+   BEFORE INSERT ON invocation_human_retry_receipts
+   WHEN NEW.expires_at IS NULL
+      OR julianday(NEW.expires_at) <= julianday(NEW.committed_at)
+      OR julianday(NEW.expires_at) > julianday(NEW.committed_at) + 30
+   BEGIN SELECT RAISE(ABORT, 'Human retry receipt expiry is invalid'); END`,
+  `CREATE TRIGGER invocation_human_retry_receipts_v27_immutable_update
+   BEFORE UPDATE ON invocation_human_retry_receipts
+   BEGIN SELECT RAISE(ABORT, 'Human retry receipt is immutable'); END`,
+  `CREATE INDEX invocation_human_retry_receipts_expiry_v27
+   ON invocation_human_retry_receipts(expires_at, request_id)`,
+  `DROP INDEX room_cache_archive_invalidation_scope_v15`,
+  `DROP INDEX room_cache_target_invalidation_scope_v15`,
+  `DROP INDEX room_cache_invalidation_ready`,
+  `PRAGMA legacy_alter_table = ON`,
+  `ALTER TABLE room_cache_invalidation_intents RENAME TO room_cache_invalidation_intents_v26`,
+  `CREATE TABLE room_cache_invalidation_intents (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    access_revision INTEGER NOT NULL CHECK (access_revision >= 0),
+    reason TEXT NOT NULL CHECK (reason IN (
+      'room_archived', 'member_removed', 'access_revoked'
+    )),
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'completed', 'dead_letter')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 8),
+    available_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    last_error_code TEXT CHECK (
+      last_error_code IS NULL OR last_error_code IN ('purge_failed', 'authority_unavailable')
+    ),
+    target_actor_id TEXT REFERENCES actors(id),
+    dead_lettered_at TEXT,
+    CHECK (
+      (reason = 'room_archived' AND target_actor_id IS NULL) OR
+      (reason IN ('member_removed', 'access_revoked') AND target_actor_id IS NOT NULL)
+    ),
+    CHECK (
+      (status = 'pending' AND completed_at IS NULL AND dead_lettered_at IS NULL)
+      OR (status = 'completed' AND completed_at IS NOT NULL AND dead_lettered_at IS NULL
+          AND last_error_code IS NULL)
+      OR (status = 'dead_letter' AND completed_at IS NULL AND dead_lettered_at IS NOT NULL
+          AND attempts = 8 AND last_error_code IS NOT NULL)
+    )
+  ) STRICT`,
+  `INSERT INTO room_cache_invalidation_intents (
+     id, room_id, lifecycle_generation, access_revision, reason, status, attempts,
+     available_at, created_at, completed_at, last_error_code, target_actor_id,
+     dead_lettered_at
+   ) SELECT id, room_id, lifecycle_generation, access_revision, reason, status,
+            MIN(attempts, 7), available_at, created_at, completed_at,
+            CASE WHEN status = 'pending' AND last_error_code IS NOT NULL
+              THEN last_error_code ELSE NULL END,
+            target_actor_id, NULL
+     FROM room_cache_invalidation_intents_v26`,
+  `DROP TABLE room_cache_invalidation_intents_v26`,
+  `PRAGMA legacy_alter_table = OFF`,
+  `CREATE UNIQUE INDEX room_cache_archive_invalidation_scope_v27
+   ON room_cache_invalidation_intents(room_id, lifecycle_generation, reason)
+   WHERE reason = 'room_archived' AND target_actor_id IS NULL`,
+  `CREATE UNIQUE INDEX room_cache_target_invalidation_scope_v27
+   ON room_cache_invalidation_intents(
+     room_id, target_actor_id, access_revision, reason
+   ) WHERE reason IN ('member_removed', 'access_revoked') AND target_actor_id IS NOT NULL`,
+  `CREATE INDEX room_cache_invalidation_ready_v27
+   ON room_cache_invalidation_intents(status, available_at, created_at, id)`,
+  `CREATE INDEX room_cache_invalidation_dead_letter_v27
+   ON room_cache_invalidation_intents(status, dead_lettered_at, id)`,
+  `CREATE TRIGGER room_cache_invalidation_v27_validate_update
+   BEFORE UPDATE ON room_cache_invalidation_intents
+   WHEN NEW.id <> OLD.id OR NEW.room_id <> OLD.room_id
+      OR NEW.lifecycle_generation <> OLD.lifecycle_generation
+      OR NEW.access_revision <> OLD.access_revision OR NEW.reason <> OLD.reason
+      OR NEW.target_actor_id IS NOT OLD.target_actor_id OR OLD.status <> 'pending'
+      OR NEW.status NOT IN ('pending', 'completed', 'dead_letter')
+      OR NEW.attempts < OLD.attempts OR NEW.attempts > OLD.attempts + 1
+      OR (NEW.status = 'pending' AND (
+        NEW.attempts <> OLD.attempts + 1 OR NEW.available_at <= OLD.available_at
+      ))
+      OR (NEW.status = 'completed' AND NEW.attempts <> OLD.attempts)
+      OR (NEW.status = 'dead_letter' AND NEW.attempts <> 8)
+   BEGIN SELECT RAISE(ABORT, 'Room cache invalidation transition is invalid'); END`,
+  `CREATE TRIGGER room_cache_invalidation_v27_immutable_delete
+   BEFORE DELETE ON room_cache_invalidation_intents
+   BEGIN SELECT RAISE(ABORT, 'Room cache invalidation is immutable'); END`,
+  `DROP TRIGGER deployment_profile_outbox_v20_validate_insert`,
+  `DROP TRIGGER deployment_profile_outbox_v20_validate_update`,
+  `DROP TRIGGER deployment_profile_outbox_v20_immutable_delete`,
+  `DROP INDEX deployment_profile_outbox_pending_v20`,
+  `PRAGMA legacy_alter_table = ON`,
+  `ALTER TABLE deployment_profile_outbox RENAME TO deployment_profile_outbox_v26`,
+  `CREATE TABLE deployment_profile_outbox (
+    id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES deployment_agent_profile_events(event_id),
+    recipient_human_actor_id TEXT NOT NULL REFERENCES tenant_administrators(human_actor_id),
+    stream_seq INTEGER NOT NULL CHECK (stream_seq > 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'dispatched', 'dead_letter')),
+    attempts INTEGER NOT NULL CHECK (attempts BETWEEN 0 AND 8),
+    available_at TEXT NOT NULL,
+    delivered_at TEXT,
+    last_error TEXT CHECK (
+      last_error IS NULL OR last_error IN (
+        'closed', 'backpressure', 'send_rejected', 'recipient_unavailable'
+      )
+    ),
+    dead_lettered_at TEXT,
+    UNIQUE (event_id, recipient_human_actor_id),
+    CHECK (
+      (status = 'pending' AND delivered_at IS NULL AND dead_lettered_at IS NULL)
+      OR (status = 'dispatched' AND delivered_at IS NOT NULL AND dead_lettered_at IS NULL
+          AND last_error IS NULL)
+      OR (status = 'dead_letter' AND delivered_at IS NULL AND dead_lettered_at IS NOT NULL
+          AND attempts = 8 AND last_error IS NOT NULL)
+    )
+  ) STRICT`,
+  `INSERT INTO deployment_profile_outbox (
+     id, event_id, recipient_human_actor_id, stream_seq, status, attempts,
+     available_at, delivered_at, last_error, dead_lettered_at
+   ) SELECT id, event_id, recipient_human_actor_id, stream_seq, status,
+            MIN(attempts, 7), available_at, delivered_at,
+            CASE WHEN status = 'pending' AND last_error IS NOT NULL
+              THEN CASE WHEN last_error = 'recipient_unavailable'
+                THEN 'recipient_unavailable' ELSE 'send_rejected' END
+              ELSE NULL END,
+            NULL
+     FROM deployment_profile_outbox_v26`,
+  `DROP TABLE deployment_profile_outbox_v26`,
+  `PRAGMA legacy_alter_table = OFF`,
+  `CREATE INDEX deployment_profile_outbox_pending_v27
+   ON deployment_profile_outbox(status, available_at, stream_seq, id)`,
+  `CREATE INDEX deployment_profile_outbox_dead_letter_v27
+   ON deployment_profile_outbox(status, dead_lettered_at, id)`,
+  `CREATE TRIGGER deployment_profile_outbox_v27_validate_insert
+   BEFORE INSERT ON deployment_profile_outbox
+   WHEN NEW.status <> 'pending' OR NEW.attempts <> 0
+      OR NEW.delivered_at IS NOT NULL OR NEW.dead_lettered_at IS NOT NULL
+      OR NEW.last_error IS NOT NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM deployment_agent_profile_events AS event
+        WHERE event.event_id = NEW.event_id AND event.stream_seq = NEW.stream_seq
+      )
+      OR COALESCE((
+        SELECT status FROM tenant_administrators
+        WHERE human_actor_id = NEW.recipient_human_actor_id
+      ), '') <> 'active'
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile outbox row is invalid'); END`,
+  `CREATE TRIGGER deployment_profile_outbox_v27_validate_update
+   BEFORE UPDATE ON deployment_profile_outbox
+   WHEN NEW.id <> OLD.id OR NEW.event_id <> OLD.event_id
+      OR NEW.recipient_human_actor_id <> OLD.recipient_human_actor_id
+      OR NEW.stream_seq <> OLD.stream_seq OR OLD.status <> 'pending'
+      OR NEW.status NOT IN ('pending', 'dispatched', 'dead_letter')
+      OR NEW.attempts < OLD.attempts OR NEW.attempts > OLD.attempts + 1
+      OR (NEW.status = 'pending' AND (
+        NEW.attempts <> OLD.attempts + 1 OR NEW.available_at <= OLD.available_at
+      ))
+      OR (NEW.status = 'dispatched' AND NEW.attempts <> OLD.attempts)
+      OR (NEW.status = 'dead_letter' AND NEW.attempts <> 8)
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile outbox transition is invalid'); END`,
+  `CREATE TRIGGER deployment_profile_outbox_v27_immutable_delete
+   BEFORE DELETE ON deployment_profile_outbox
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile outbox is immutable'); END`,
+  `PRAGMA legacy_alter_table = ON`,
+  `ALTER TABLE project_event_outbox RENAME TO project_event_outbox_v26`,
+  `CREATE TABLE project_event_outbox (
+    event_id TEXT PRIMARY KEY REFERENCES project_events(event_id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    event_seq INTEGER NOT NULL CHECK (event_seq > 0),
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'dispatched', 'dead_letter')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 8),
+    available_at TEXT NOT NULL,
+    dispatched_at TEXT,
+    last_error TEXT CHECK (
+      last_error IS NULL OR last_error IN ('closed', 'backpressure', 'send_rejected')
+    ),
+    dead_lettered_at TEXT,
+    UNIQUE (room_id, event_seq),
+    CHECK (
+      (status = 'pending' AND dispatched_at IS NULL AND dead_lettered_at IS NULL)
+      OR (status = 'dispatched' AND dispatched_at IS NOT NULL AND dead_lettered_at IS NULL
+          AND last_error IS NULL)
+      OR (status = 'dead_letter' AND dispatched_at IS NULL AND dead_lettered_at IS NOT NULL
+          AND attempts = 8 AND last_error IS NOT NULL)
+    )
+  ) STRICT`,
+  `INSERT INTO project_event_outbox (
+     event_id, room_id, event_seq, status, attempts, available_at, dispatched_at,
+     last_error, dead_lettered_at
+   ) SELECT legacy.event_id, legacy.room_id, legacy.event_seq,
+            CASE WHEN EXISTS (
+              SELECT 1 FROM outbox_deliveries AS delivery
+              WHERE delivery.event_id = legacy.event_id AND delivery.status = 'pending'
+            ) THEN 'pending' ELSE 'dispatched' END,
+            MIN(legacy.attempts, 7), legacy.available_at,
+            CASE WHEN EXISTS (
+              SELECT 1 FROM outbox_deliveries AS delivery
+              WHERE delivery.event_id = legacy.event_id AND delivery.status = 'pending'
+            ) THEN NULL ELSE COALESCE(legacy.dispatched_at, CURRENT_TIMESTAMP) END,
+            NULL, NULL
+     FROM project_event_outbox_v26 AS legacy`,
+  `DROP TABLE project_event_outbox_v26`,
+  `PRAGMA legacy_alter_table = OFF`,
+  `CREATE INDEX project_event_outbox_pending_v27
+   ON project_event_outbox(status, available_at, event_seq, event_id)`,
+  `CREATE INDEX project_event_outbox_dead_letter_v27
+   ON project_event_outbox(status, dead_lettered_at, event_id)`,
+] as const;
+
 export const AUTHORITY_V26_STATEMENT_COUNT_FOR_TEST = V26_STATEMENTS.length;
 export const AUTHORITY_V26_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST =
   V26_STATEMENTS.filter((statement) => statement.startsWith("CREATE TRIGGER ")).length;
 export const AUTHORITY_V26_ROLLBACK_ASSERTION_COUNT_FOR_TEST = V26_STATEMENTS.length;
 export const AUTHORITY_V26_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
   26, "tool-safety-authority", V26_STATEMENTS,
+);
+
+export const AUTHORITY_V27_STATEMENT_COUNT_FOR_TEST = V27_STATEMENTS.length;
+export const AUTHORITY_V27_ROLLBACK_ASSERTION_COUNT_FOR_TEST = V27_STATEMENTS.length;
+export const AUTHORITY_V27_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
+  27, "sync-reliability-lifecycle", V27_STATEMENTS,
 );
 
 export const AUTHORITY_V22_STATEMENT_COUNT_FOR_TEST = V22_STATEMENTS.length;
@@ -9937,6 +10257,7 @@ const MIGRATIONS = [
   ),
   defineMigration(25, "project-transition-authority", V25_STATEMENTS),
   defineMigration(26, "tool-safety-authority", V26_STATEMENTS),
+  defineMigration(27, "sync-reliability-lifecycle", V27_STATEMENTS),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -10980,6 +11301,39 @@ const V26_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V27_SCHEMA_CONTRACT = {
+  ...V26_SCHEMA_CONTRACT,
+  outbox_deliveries: [
+    ...V26_SCHEMA_CONTRACT.outbox_deliveries,
+    "dead_lettered_at",
+  ],
+  room_cache_invalidation_intents: [
+    ...V26_SCHEMA_CONTRACT.room_cache_invalidation_intents,
+    "dead_lettered_at",
+  ],
+  deployment_profile_outbox: [
+    ...V26_SCHEMA_CONTRACT.deployment_profile_outbox,
+    "dead_lettered_at",
+  ],
+  project_event_outbox: [
+    ...V26_SCHEMA_CONTRACT.project_event_outbox,
+    "last_error",
+    "dead_lettered_at",
+  ],
+  project_command_receipts: [
+    ...V26_SCHEMA_CONTRACT.project_command_receipts,
+    "expires_at",
+  ],
+  invocation_cancellation_receipts: [
+    ...V26_SCHEMA_CONTRACT.invocation_cancellation_receipts,
+    "expires_at",
+  ],
+  invocation_human_retry_receipts: [
+    ...V26_SCHEMA_CONTRACT.invocation_human_retry_receipts,
+    "expires_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -11007,6 +11361,7 @@ const SCHEMA_CONTRACTS = {
   24: V24_SCHEMA_CONTRACT,
   25: V25_SCHEMA_CONTRACT,
   26: V26_SCHEMA_CONTRACT,
+  27: V27_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -13229,6 +13584,72 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
              'sandbox-file.write.compensation.v1'
        LIMIT 1`,
       "tool compensation must retain a new execution over the original frozen snapshot",
+    );
+  }
+  if (schemaVersion >= 27) {
+    requireNoRows(
+      database,
+      `SELECT 1 FROM (
+         SELECT status, attempts, delivered_at AS delivered_at,
+                dead_lettered_at, last_error FROM outbox_deliveries
+         UNION ALL
+         SELECT status, attempts, delivered_at, dead_lettered_at, last_error
+           FROM deployment_profile_outbox
+       ) AS delivery
+       WHERE attempts < 0 OR attempts > 8
+          OR (status = 'pending' AND (
+            delivered_at IS NOT NULL OR dead_lettered_at IS NOT NULL))
+          OR (status = 'dispatched' AND (
+            delivered_at IS NULL OR dead_lettered_at IS NOT NULL))
+          OR (status = 'dead_letter' AND (
+            attempts <> 8 OR delivered_at IS NOT NULL
+            OR dead_lettered_at IS NULL OR last_error IS NULL))
+       LIMIT 1`,
+      "bounded outbox rows must retain one closed terminal lifecycle",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_event_outbox
+       WHERE attempts < 0 OR attempts > 8
+          OR (status = 'pending' AND (
+            dispatched_at IS NOT NULL OR dead_lettered_at IS NOT NULL))
+          OR (status = 'dispatched' AND (
+            dispatched_at IS NULL OR dead_lettered_at IS NOT NULL))
+          OR (status = 'dead_letter' AND (
+            attempts <> 8 OR dispatched_at IS NOT NULL
+            OR dead_lettered_at IS NULL OR last_error IS NULL))
+       LIMIT 1`,
+      "Project shadow delivery rows must not remain outside a closed lifecycle",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_command_receipts
+       WHERE expires_at IS NULL
+          OR julianday(expires_at) <= julianday(committed_at)
+          OR julianday(expires_at) > julianday(committed_at) + 30
+       LIMIT 1`,
+      "Project command receipts must have a finite thirty-day replay boundary",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM invocation_human_retry_receipts
+       WHERE expires_at IS NULL
+          OR julianday(expires_at) <= julianday(committed_at)
+          OR julianday(expires_at) > julianday(committed_at) + 30
+       LIMIT 1`,
+      "Human retry receipts must have a finite thirty-day replay boundary",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM invocation_cancellation_receipts
+       WHERE (principal_actor_id IS NULL AND expires_at IS NOT NULL)
+          OR (principal_actor_id IS NOT NULL AND (
+            expires_at IS NULL
+            OR julianday(expires_at) <= julianday(committed_at)
+            OR julianday(expires_at) > julianday(committed_at) + 30
+          ))
+       LIMIT 1`,
+      "Human cancellation receipts must expire while internal producer facts remain durable",
     );
   }
 }

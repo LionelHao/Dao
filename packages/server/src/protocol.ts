@@ -40,6 +40,7 @@ import {
   type ScopedCancellationReceipt,
   type AgentExecutionRetryReceipt,
 } from "@native-im/core";
+import type { OfflineReadLeaseClaims } from "./access/offline-lease-invalidation-port.js";
 import {
   parseAttachmentClientFrame,
   type AttachmentClientFrame,
@@ -371,6 +372,19 @@ export interface SnapshotCompleteRequestFrame {
   readonly snapshotChecksum: string;
 }
 
+export interface OfflineReadLeaseIssueRequestFrame {
+  readonly type: "offline-read-lease.issue";
+  readonly requestId: string;
+  readonly roomId: string;
+}
+
+export interface OfflineReadLeaseIssuedFrame {
+  readonly type: "offline-read-lease.issued";
+  readonly requestId: string;
+  readonly token: string;
+  readonly claims: OfflineReadLeaseClaims;
+}
+
 export interface RoomSubscribeV2Frame {
   readonly type: "room.subscribe.v2";
   readonly requestId: string;
@@ -560,6 +574,7 @@ export type ClientFrame =
   | RoomRepairBeginRequestFrame
   | RoomRepairPageRequestFrame
   | SnapshotCompleteRequestFrame
+  | OfflineReadLeaseIssueRequestFrame
   | RoomSubscribeV2Frame
   | AgentInvokeFrame
   | AgentInterruptFrame
@@ -584,6 +599,8 @@ export interface AuthenticatedFrame {
   readonly requestId: string;
   readonly accountId: string;
   readonly actorId: string;
+  readonly sessionFamilyId?: string;
+  readonly deviceId?: string;
   readonly sessionId?: string;
   readonly accessToken?: string;
   readonly refreshToken?: string;
@@ -1030,6 +1047,7 @@ export type ServerFrame =
   | RoomSyncResult
   | RoomRepairPage
   | SnapshotCompleted
+  | OfflineReadLeaseIssuedFrame
   | RoomSubscribedV2Frame
   | RoomSubscribeV2RetryFrame
   | AgentExecutionAckFrame
@@ -1736,6 +1754,21 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
       return {
         ok: true,
         frame: { type: "room.repair.begin", requestId, roomId: value.roomId },
+      };
+    case "offline-read-lease.issue":
+      if (!hasOnlyFields(value, ROOM_FIELDS) || requestId === undefined ||
+          !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId)) {
+        return {
+          ok: false,
+          error: protocolError(
+            "offline-read-lease.issue requires string requestId and roomId",
+            requestId,
+          ),
+        };
+      }
+      return {
+        ok: true,
+        frame: { type: "offline-read-lease.issue", requestId, roomId: value.roomId },
       };
     case "snapshot.complete":
       if (

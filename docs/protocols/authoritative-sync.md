@@ -89,7 +89,19 @@ replacement 不复活旧 execution：route terminal 后只为实际 selected Age
 
 Legacy import 在正式激活新 authority 前解析并验证 closed 数据，使用 migration/事务写入临时目标；损坏输入、重复启动、启用前终止都不得留下半激活 authority。证据见 [`schema.test.ts`](../../packages/server/src/persistence/schema.test.ts) 和 [`legacy-importer.test.ts`](../../packages/server/src/persistence/legacy-importer.test.ts)。Snapshot cache 可随时删除重建，不能反向覆盖 authority。
 
-## 7. Buzz reference / translation / deviation
+## 7. FT-13 可靠性闭合合同
+
+schema v27 为四个 durable post-commit ledger 补齐显式状态列，但它们不是四条相同的 socket delivery：中央 `outbox_deliveries` 与 room cache invalidation intent 是独立消费者，生产批次最多 100 条，失败采用 250ms 起始、30s 封顶的指数 full-jitter backoff，最多尝试 8 次后进入持久 `dead_letter`；Project event shadow 只镜像中央 delivery 的终态，不独立发送或重试；Deployment Profile 表是 cursor recovery marker，客户端以权威 profile cursor catch-up，worker 将已提交 marker 本地结算为 `dispatched`，不存在 socket send 失败 seam，因此不宣称 send/retry/dead-letter delivery。独立消费者的同一 transition 可重放但不能倒退；60 秒与 5 分钟 backlog 分别发 closed warning/critical metadata，不能包含 token、payload、数据库路径或任意正文。正常关闭停止取新工作并等待有界 drain；超时必须显式失败，不能静默遗失。
+
+九类幂等/事实收据由 [`reliability-inventory.ts`](../../packages/server/src/persistence/reliability-inventory.ts) 完整登记。七类 command 收据以 `now < expires_at` 为有效边界，保留 30 天；边界时刻在同一 AuthorityWorker 事务中先删除旧收据，再按新请求处理。每小时启动一次、每批最多 500 条的有界清理；Project boundary、read/source 等领域事实永久保留，不能当作可清理 command receipt。TTL 过期不放松业务唯一约束，因此旧 key 可复用不等于重复业务事实可再次创建。
+
+Desktop 只把完整 active generation 暴露给 renderer。repair page 写 staging SQLite，records、event ledger 和 cursor 在事务内提交，checksum、计数与 generation bindings 全部通过后才原子翻转；旧 generation 在翻转前仍是唯一可见版本。数据库字段用随机 data key 的 AES-256-GCM 加密，data key 只能由系统凭据存储包装；room/account revoke、logout、AAD/tag/key unwrap 失败必须锁定并清除对应授权缓存，不能退化成明文或进程内事实。
+
+离线读取增加 closed 请求 `offline-read-lease.issue { requestId, roomId }` 与响应 `offline-read-lease.issued { requestId, token, claims }`。AuthorityWorker 在签发事务中复核 human session、family/device、membership、room lifecycle/access/lease generations；租约有效期不超过部署显式配置的有限正值 policy，也不超过当前 refresh session horizon。FT-13 不冻结 release 默认值或产品硬上限，二者仍由 FT-14 威胁模型裁决。生产服务必须显式配置 Ed25519 私钥、稳定 `keyId`、tenant 与 server subject；Desktop 必须显式固定匹配的 Ed25519 SPKI 公钥及相同 authority binding，未知 key、签名错误、过期、actor/device/family/room/generation 不匹配都 fail closed。没有 pinned verifier 时在线 repair 仍可工作，但离线缓存保持 locked。
+
+仅当签名租约有效且 active generation 完整、generation binding 完全相等时，Desktop 才显示带 `asOf` 和 lease expiry 的离线只读状态；所有本地 mutation 在 transport 前返回稳定 `409 room_read_only`，不得产生网络调用。普通断线不清缓存；membership/access 收紧、session revoke、logout、corruption 或租约失败必须持久清除后才发布 `purgeCompleted: true`。密钥轮换、多设备撤销分发和跨节点投递仍归 FT-14，不在本阶段伪装为已实现。
+
+## 8. Buzz reference / translation / deviation
 
 | Buzz 参照 | 本项目 TypeScript 翻译 | 明确偏离及原因 |
 | --- | --- | --- |

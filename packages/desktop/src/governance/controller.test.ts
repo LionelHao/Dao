@@ -271,7 +271,9 @@ describe("closed Governance controller", () => {
     const result = controller.submit({
       roomId: "room-1", intent: { command: "room.archive", expectedGovernanceRevision: 7 },
     });
-    expect(result.state).toMatchObject({ operation: { status: "failed", error: { status: 503 } } });
+    expect(result.state).toMatchObject({
+      operation: { status: "failed", error: { status: 409, code: "room_read_only" } },
+    });
     expect(authority.value.execute).not.toHaveBeenCalled();
 
     feed.listener?.({ roomId: "room-1", source: "revoked", eventIds: [], scope: "room", purgeCompleted: true });

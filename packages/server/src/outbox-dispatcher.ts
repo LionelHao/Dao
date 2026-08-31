@@ -5,6 +5,14 @@ import type {
   OutboxDispatchCandidate,
   SyncQueryStore,
 } from "./persistence/contracts.js";
+import {
+  createOutboxAlertController,
+  type OutboxAlertSink,
+} from "./outbox-alert-sink.js";
+import {
+  createOutboxRetryPolicy,
+  type OutboxRetryPolicy,
+} from "./outbox-retry-policy.js";
 import type {
   AuthSessionRevokedFrame,
   IdentityRoomAccessChangedFrame,
@@ -35,6 +43,23 @@ export type OutboxDispatchStore = Pick<
   | "markOutboxFailed"
 >;
 
+export interface OutboxFailureLifecyclePort {
+  scheduleRetry(input: Readonly<{
+    deliveryId: string;
+    eventId: string;
+    attempt: number;
+    reason: OutboxDeliveryFailureReason;
+    availableAtMs: number;
+  }>): Promise<void>;
+  deadLetter(input: Readonly<{
+    deliveryId: string;
+    eventId: string;
+    attempt: number;
+    reason: OutboxDeliveryFailureReason;
+    deadLetteredAtMs: number;
+  }>): Promise<void>;
+}
+
 export interface OutboxDispatcher {
   flushOnce(): Promise<number>;
   start(): void;
@@ -51,6 +76,12 @@ export interface OutboxDispatcherOptions {
   ) => Promise<OutboxSendResult> | OutboxSendResult;
   readonly batchSize?: number;
   readonly pollIntervalMs?: number;
+  readonly shutdownTimeoutMs?: number;
+  readonly now?: () => number;
+  readonly random?: () => number;
+  readonly retryPolicy?: OutboxRetryPolicy;
+  readonly failureLifecycle?: OutboxFailureLifecyclePort;
+  readonly alertSink?: OutboxAlertSink;
   readonly afterSendBeforeMark?: (delivery: OutboxDelivery) => Promise<void> | void;
 }
 
@@ -84,22 +115,126 @@ function dispatchFrame(delivery: OutboxDelivery): OutboxDispatchFrame {
 export function createOutboxDispatcher(
   options: OutboxDispatcherOptions,
 ): OutboxDispatcher {
-  const batchSize = options.batchSize ?? 100;
+  const retryPolicy = options.retryPolicy ?? createOutboxRetryPolicy({
+    ...(options.batchSize === undefined ? {} : { batchSize: options.batchSize }),
+    ...(options.random === undefined ? {} : { random: options.random }),
+  });
+  const batchSize = retryPolicy.batchSize;
   const pollIntervalMs = options.pollIntervalMs ?? 100;
-  if (!Number.isSafeInteger(batchSize) || batchSize <= 0) {
-    throw new RangeError("batchSize must be a positive safe integer");
-  }
-  if (batchSize > 1_000) {
-    throw new RangeError("batchSize must be at most 1000");
-  }
   if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs <= 0) {
     throw new RangeError("pollIntervalMs must be a positive safe integer");
   }
+  const shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000;
+  if (!Number.isSafeInteger(shutdownTimeoutMs) || shutdownTimeoutMs <= 0 ||
+      shutdownTimeoutMs > 30_000) {
+    throw new RangeError("shutdownTimeoutMs must be a positive safe integer at most 30000");
+  }
+  const now = options.now ?? Date.now;
+  const alertController = createOutboxAlertController({
+    sink: options.alertSink ?? { emit() {} },
+  });
 
   let started = false;
   let closed = false;
   let wakeTimer: ReturnType<typeof setTimeout> | undefined;
   let activeFlush: Promise<number> | undefined;
+  let loopFailureCount = 0;
+  const retryNotBefore = new Map<string, number>();
+  const acceptedPeers = new Map<string, Set<string>>();
+
+  function acceptedPeerKey(candidate: OutboxDispatchCandidate): string {
+    return `${candidate.connectionId}\0${candidate.credentialGeneration}`;
+  }
+
+  function clearDeliveryState(deliveryId: string): void {
+    retryNotBefore.delete(deliveryId);
+    acceptedPeers.delete(deliveryId);
+    alertController.settled("central", deliveryId);
+  }
+
+  async function reportDispatcherFailure(
+    reason: "storage_unavailable" | "shutdown_timeout",
+  ): Promise<void> {
+    try {
+      await alertController.dispatcherFailure(reason);
+    } catch {
+      // The alert adapter is operational telemetry, never a second authority writer.
+    }
+  }
+
+  async function observeBacklog(delivery: OutboxDelivery, currentNow: number): Promise<void> {
+    const occurredAtMs = Date.parse(delivery.event.occurredAt);
+    if (!Number.isSafeInteger(occurredAtMs) || occurredAtMs < 0) return;
+    try {
+      await alertController.observeBacklog({
+        family: "central",
+        deliveryId: delivery.deliveryId,
+        eventId: delivery.eventId,
+        occurredAtMs,
+        attempts: delivery.attempts,
+      }, currentNow);
+    } catch {
+      // Alert delivery cannot change an authoritative outbox row.
+    }
+  }
+
+  async function settleFailure(
+    delivery: OutboxDelivery,
+    reason: OutboxDeliveryFailureReason,
+    currentNow: number,
+  ): Promise<void> {
+    const decision = retryPolicy.afterFailure({
+      priorAttempts: delivery.attempts,
+      nowMs: currentNow,
+    });
+    if (decision.kind === "retry") {
+      if (options.failureLifecycle === undefined) {
+        await options.store.markOutboxFailed(delivery.deliveryId, reason);
+      } else {
+        await options.failureLifecycle.scheduleRetry({
+          deliveryId: delivery.deliveryId,
+          eventId: delivery.eventId,
+          attempt: decision.attempt,
+          reason,
+          availableAtMs: decision.availableAtMs,
+        });
+      }
+      retryNotBefore.set(delivery.deliveryId, decision.availableAtMs);
+      return;
+    }
+    if (options.failureLifecycle === undefined) {
+      await options.store.markOutboxFailed(delivery.deliveryId, reason);
+      retryNotBefore.set(delivery.deliveryId, Number.MAX_SAFE_INTEGER);
+    } else {
+      await options.failureLifecycle.deadLetter({
+        deliveryId: delivery.deliveryId,
+        eventId: delivery.eventId,
+        attempt: decision.attempt,
+        reason,
+        deadLetteredAtMs: currentNow,
+      });
+      acceptedPeers.delete(delivery.deliveryId);
+    }
+    const occurredAtMs = Date.parse(delivery.event.occurredAt);
+    const ageMs = Number.isSafeInteger(occurredAtMs) && occurredAtMs >= 0 && currentNow >= occurredAtMs
+      ? currentNow - occurredAtMs
+      : 0;
+    try {
+      await alertController.deadLetter({
+        family: "central",
+        deliveryId: delivery.deliveryId,
+        eventId: delivery.eventId,
+        attempts: decision.attempt,
+        ageMs,
+        reason,
+      });
+    } catch {
+      // The durable dead-letter row remains the authority when telemetry is unavailable.
+    }
+    if (options.failureLifecycle !== undefined) {
+      clearDeliveryState(delivery.deliveryId);
+    }
+  }
 
   async function flushOnce(): Promise<number> {
     if (closed) return 0;
@@ -108,9 +243,20 @@ export function createOutboxDispatcher(
       let dispatched = 0;
       const deliveries = await options.store.listPendingOutbox(batchSize);
       for (const delivery of deliveries) {
+        const currentNow = now();
+        if (!Number.isSafeInteger(currentNow) || currentNow < 0) {
+          throw new RangeError("outbox clock must return a non-negative safe integer");
+        }
+        if ((retryNotBefore.get(delivery.deliveryId) ?? 0) > currentNow) continue;
+        await observeBacklog(delivery, currentNow);
         const candidates = options.registry.candidates(delivery);
         let failedReason: OutboxDeliveryFailureReason | undefined;
         const frame = dispatchFrame(delivery);
+        let acceptedForDelivery = acceptedPeers.get(delivery.deliveryId);
+        if (acceptedForDelivery === undefined) {
+          acceptedForDelivery = new Set<string>();
+          acceptedPeers.set(delivery.deliveryId, acceptedForDelivery);
+        }
         for (const candidate of candidates) {
           const candidateSnapshot: OutboxDispatchCandidate = {
             connectionId: candidate.connectionId,
@@ -123,7 +269,12 @@ export function createOutboxDispatcher(
             delivery,
             candidateSnapshot,
           );
-          if (!eligible) continue;
+          const peerKey = acceptedPeerKey(candidateSnapshot);
+          if (!eligible) {
+            acceptedForDelivery.delete(peerKey);
+            continue;
+          }
+          if (acceptedForDelivery.has(peerKey)) continue;
 
           let result: OutboxSendResult;
           try {
@@ -135,6 +286,7 @@ export function createOutboxDispatcher(
             failedReason ??= result.reason;
             continue;
           }
+          acceptedForDelivery.add(peerKey);
           if (delivery.targetKind === "session-family") {
             options.registry.revokeConnection(
               candidateSnapshot.connectionId,
@@ -144,11 +296,12 @@ export function createOutboxDispatcher(
         }
 
         if (failedReason !== undefined) {
-          await options.store.markOutboxFailed(delivery.deliveryId, failedReason);
+          await settleFailure(delivery, failedReason, currentNow);
           continue;
         }
         await options.afterSendBeforeMark?.(delivery);
         await options.store.markOutboxDispatched(delivery.deliveryId);
+        clearDeliveryState(delivery.deliveryId);
         dispatched += 1;
       }
       return dispatched;
@@ -158,12 +311,27 @@ export function createOutboxDispatcher(
     return activeFlush;
   }
 
-  function schedule(): void {
+  function schedule(delayMs = pollIntervalMs): void {
     if (!started || closed) return;
     wakeTimer = setTimeout(() => {
       wakeTimer = undefined;
-      void flushOnce().catch(() => undefined).finally(schedule);
-    }, pollIntervalMs);
+      void runLoopIteration();
+    }, delayMs);
+  }
+
+  async function runLoopIteration(): Promise<void> {
+    let nextDelayMs = pollIntervalMs;
+    try {
+      await flushOnce();
+      loopFailureCount = 0;
+    } catch {
+      await reportDispatcherFailure("storage_unavailable");
+      const exponent = Math.min(loopFailureCount, 7);
+      nextDelayMs = Math.max(pollIntervalMs, Math.min(30_000, 250 * 2 ** exponent));
+      loopFailureCount += 1;
+    } finally {
+      schedule(nextDelayMs);
+    }
   }
 
   return {
@@ -171,7 +339,7 @@ export function createOutboxDispatcher(
     start() {
       if (started || closed) return;
       started = true;
-      void flushOnce().catch(() => undefined).finally(schedule);
+      void runLoopIteration();
     },
     async close() {
       if (closed) return;
@@ -180,7 +348,25 @@ export function createOutboxDispatcher(
         clearTimeout(wakeTimer);
         wakeTimer = undefined;
       }
-      await activeFlush;
+      if (activeFlush === undefined) return;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          activeFlush,
+          new Promise<never>((_resolve, reject) => {
+            timeout = setTimeout(() => {
+              reject(new Error("outbox dispatcher shutdown timed out"));
+            }, shutdownTimeoutMs);
+          }),
+        ]);
+      } catch (error: unknown) {
+        if (error instanceof Error && error.message === "outbox dispatcher shutdown timed out") {
+          void reportDispatcherFailure("shutdown_timeout");
+        }
+        throw error;
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout);
+      }
     },
   };
 }

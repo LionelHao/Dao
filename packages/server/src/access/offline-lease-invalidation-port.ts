@@ -150,6 +150,8 @@ export interface OfflineReadLeaseIssueInput {
   readonly expectedLifecycleGeneration: number;
   readonly expectedAccessRevision: number;
   readonly expectedLeaseGeneration: number;
+  /** AuthorityWorker-captured server clock for the enclosing transaction. */
+  readonly nowMs?: number;
 }
 
 interface SessionFamilyRow {
@@ -229,7 +231,7 @@ export class OfflineReadLeaseIssuer {
       reject("invalid_input");
     }
     if (input.requestedLeaseMs > this.#maxOfflineReadLeaseMs) reject("lease_too_long");
-    const now = this.#now();
+    const now = input.nowMs ?? this.#now();
     if (!isNonNegativeInteger(now)) reject("invalid_input");
 
     return useAuthorityTransactionDatabase(transaction, (database) => {
@@ -437,7 +439,7 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
   return actual.length === keys.length && keys.every((key) => key in value);
 }
 
-function isOfflineReadLeaseClaims(value: unknown): value is OfflineReadLeaseClaims {
+export function isOfflineReadLeaseClaims(value: unknown): value is OfflineReadLeaseClaims {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const claims = value as Record<string, unknown>;
   if (!hasExactKeys(claims, [

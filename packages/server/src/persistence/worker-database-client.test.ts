@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { EventEmitter, once } from "node:events";
 import {
   existsSync,
@@ -105,7 +105,7 @@ async function expectDatabasePathReusable(path: string): Promise<void> {
   const replacement = trackClient(
     await createWorkerDatabaseClient({ databasePath: path }),
   );
-  await expect(replacement.inspectSchema()).resolves.toEqual({ version: 26 });
+  await expect(replacement.inspectSchema()).resolves.toEqual({ version: 27 });
 }
 
 async function expectDatabasePathEventuallyReusable(path: string): Promise<void> {
@@ -144,7 +144,7 @@ function workerThatRuns(scriptBody: string): Worker {
         parentPort.postMessage({
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 26,
+          schemaVersion: 27,
         });
         return;
       }
@@ -210,7 +210,7 @@ class MessageErrorTransport extends EventEmitter implements AuthorityWorkerTrans
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 26,
+          schemaVersion: 27,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -231,7 +231,7 @@ class OperationStorageProbeTransport extends EventEmitter implements AuthorityWo
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 26,
+        schemaVersion: 27,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -259,7 +259,7 @@ class OperationStorageProbeTransport extends EventEmitter implements AuthorityWo
     queueMicrotask(() => this.emit("message", {
       type: "authority.schema",
       requestId: request.requestId,
-      schemaVersion: 26,
+      schemaVersion: 27,
     } satisfies AuthorityWorkerResponse));
   }
 
@@ -277,7 +277,7 @@ class CapabilityProbeTransport extends EventEmitter implements AuthorityWorkerTr
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 26,
+        schemaVersion: 27,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -312,7 +312,7 @@ class SyncResultProbeTransport extends EventEmitter implements AuthorityWorkerTr
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 26,
+        schemaVersion: 27,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -343,7 +343,7 @@ class CompactionResultProbeTransport extends EventEmitter implements AuthorityWo
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 26,
+        schemaVersion: 27,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -368,7 +368,7 @@ class PreviewDeliveryBarrierProbeTransport extends EventEmitter implements Autho
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 26,
+        schemaVersion: 27,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -425,7 +425,7 @@ class ThrowingPostTransport extends EventEmitter implements AuthorityWorkerTrans
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 26,
+          schemaVersion: 27,
         } satisfies AuthorityWorkerResponse);
       });
     }
@@ -448,7 +448,7 @@ class DeferredTerminationTransport
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 26,
+          schemaVersion: 27,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -477,7 +477,7 @@ class RejectingTerminationTransport
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 26,
+          schemaVersion: 27,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -505,7 +505,7 @@ class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTranspor
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 26,
+          schemaVersion: 27,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -534,7 +534,7 @@ class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTranspor
     this.emit("message", {
       type: "authority.schema",
       requestId: this.#inspectRequest.requestId,
-      schemaVersion: 26,
+      schemaVersion: 27,
     } satisfies AuthorityWorkerResponse);
   }
 
@@ -685,6 +685,39 @@ describe("AuthorityWorker closed protocol", () => {
       value: "forged",
     });
     expect(isAuthorityWorkerRequest(nonEnumerableExtra)).toBe(false);
+  });
+
+  it("accepts a bound device in authenticated commands without weakening exact keys", () => {
+    const request = {
+      type: "authority.message-submit" as const,
+      requestId: "message-submit-device-bound",
+      context: {
+        kind: "human" as const,
+        sessionId: createHash("sha256").update("device-session").digest("base64url"),
+        sessionFamilyId: createHash("sha256").update("device-family").digest("base64url"),
+        deviceId: "desktop-installation-01",
+        principal: { accountId: "account-1", actorId: "human-1" },
+        requestId: "device-bound-command",
+        idempotencyKey: "device-bound-command",
+      },
+      message: {
+        messageId: "message-device-bound",
+        roomId: "room-device-bound",
+        body: "hello",
+        mentionedTargets: [],
+        attachments: [],
+      },
+      now: 1_000,
+    };
+    expect(isAuthorityWorkerRequest(request)).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      ...request,
+      context: { ...request.context, deviceId: undefined },
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      ...request,
+      context: { ...request.context, unexpectedBinding: "forged" },
+    })).toBe(false);
   });
 
   it("accepts only exact request variants", () => {
@@ -923,7 +956,7 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.ready",
         requestId: "1",
-        schemaVersion: 26,
+        schemaVersion: 27,
       }),
     ).toBe(true);
     expect(isAuthorityWorkerResponse({
@@ -1040,7 +1073,7 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.schema",
         requestId: "2",
-        schemaVersion: 26,
+        schemaVersion: 27,
       }),
     ).toBe(true);
     expect(
@@ -1113,7 +1146,7 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.schema",
         requestId: "5",
-        schemaVersion: 26,
+        schemaVersion: 27,
         rows: [],
       }),
     ).toBe(false);
@@ -1182,14 +1215,19 @@ describe("AuthorityWorker closed protocol", () => {
       pathToFileURL(
         resolve(process.cwd(), "packages/server/dist/persistence/authority-worker.js"),
       ),
-      { workerData: { databasePath: databasePath() } },
+      {
+        workerData: {
+          databasePath: databasePath(),
+          testOnlyAllowMissingSharedAuthorityRecovery: true,
+        },
+      },
     );
     workers.add(worker);
 
     let response = once(worker, "message");
     worker.postMessage({ type: "authority.initialize", requestId: "1" });
     await expect(response).resolves.toEqual([
-      { type: "authority.ready", requestId: "1", schemaVersion: 26 },
+      { type: "authority.ready", requestId: "1", schemaVersion: 27 },
     ]);
 
     response = once(worker, "message");
@@ -1206,7 +1244,7 @@ describe("AuthorityWorker closed protocol", () => {
     response = once(worker, "message");
     worker.postMessage({ type: "authority.inspect-schema", requestId: "2" });
     await expect(response).resolves.toEqual([
-      { type: "authority.schema", requestId: "2", schemaVersion: 26 },
+      { type: "authority.schema", requestId: "2", schemaVersion: 27 },
     ]);
   });
 });
@@ -1273,7 +1311,7 @@ describe("authority database coordinator registry", () => {
     const initialized = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(initialized.inspectSchema()).resolves.toEqual({ version: 26 });
+    await expect(initialized.inspectSchema()).resolves.toEqual({ version: 27 });
     await initialized.close();
     linkSync(path, aliasPath);
 
@@ -1304,7 +1342,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 26 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 27 });
   });
 
   it("rejects a hardlink added while the original database is live", async () => {
@@ -1313,7 +1351,7 @@ describe("authority database coordinator registry", () => {
     const original = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(original.inspectSchema()).resolves.toEqual({ version: 26 });
+    await expect(original.inspectSchema()).resolves.toEqual({ version: 27 });
     linkSync(path, aliasPath);
 
     let spawnCount = 0;
@@ -1332,7 +1370,7 @@ describe("authority database coordinator registry", () => {
     expect((aliasError as { cause?: unknown }).cause).toBeUndefined();
     expect(publicErrorSurface(aliasError)).not.toContain(path);
     expect(publicErrorSurface(aliasError)).not.toContain(aliasPath);
-    await expect(original.inspectSchema()).resolves.toEqual({ version: 26 });
+    await expect(original.inspectSchema()).resolves.toEqual({ version: 27 });
   });
 
   it("atomically reserves a dangling relative symlink chain with its future target", async () => {
@@ -1374,7 +1412,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: otherPath }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 26 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 27 });
   });
 
   it("rejects a symlink cycle with a stable path-free error", async () => {
@@ -1407,7 +1445,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 26 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 27 });
   });
 
   it("releases the path after initialization failure so a retry can succeed", async () => {
@@ -1447,7 +1485,7 @@ describe("authority database coordinator registry", () => {
       code: "storage_unavailable",
       status: 503,
     });
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 26 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 27 });
   });
 
   it("releases the path after a worker crash so a replacement can start", async () => {
@@ -1465,7 +1503,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 26 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 27 });
   });
 
   it("keeps the path reserved until terminal transport teardown completes", async () => {
@@ -1561,7 +1599,7 @@ describe("authority database coordinator registry", () => {
 
     await expect(
       Promise.all([first.inspectSchema(), second.inspectSchema()]),
-    ).resolves.toEqual([{ version: 26 }, { version: 26 }]);
+    ).resolves.toEqual([{ version: 27 }, { version: 27 }]);
   });
 });
 
@@ -1860,6 +1898,79 @@ describe("WorkerDatabaseClient", () => {
     database.close();
   });
 
+  it("issues a server-signed offline read lease through the real AuthorityWorker", async () => {
+    const path = databasePath();
+    const context = {
+      sessionId: createHash("sha256").update("offline-lease-access").digest("base64url"),
+      sessionFamilyId: createHash("sha256").update("offline-lease-family").digest("base64url"),
+      principal: { accountId: "offline-account", actorId: "offline-human" },
+    };
+    const database = new DatabaseSync(path);
+    migrateAuthorityDatabase(database);
+    database.exec(`
+      INSERT INTO actors (id, kind, display_name, reachability, tool_permissions_json)
+      VALUES ('offline-human', 'human', 'Offline Human', 'online', '[]');
+      INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+      VALUES ('identity', 'offline-human', 0, 1), ('room', 'offline-room', 0, 1);
+      INSERT INTO session_families (
+        family_id, public_id, account_id, actor_id, device_id, device_label,
+        platform, created_at, refresh_expires_at, revoked_at
+      ) VALUES (
+        '${context.sessionFamilyId}', 'offline-public', 'offline-account', 'offline-human',
+        'offline-device', 'Offline Device', 'unknown', 0, 20000, NULL
+      );
+      INSERT INTO sessions (
+        family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
+        access_expires_at, refresh_expires_at, revoked_at
+      ) VALUES (
+        '${context.sessionFamilyId}', 'offline-account', 'offline-human',
+        '${context.sessionId}', 'offline-refresh', 10000, 20000, NULL
+      );
+      INSERT INTO rooms (id, name, status, created_at, owner_actor_id, governance_revision)
+      VALUES ('offline-room', 'Offline Room', 'active', 't', 'offline-human', 1);
+      INSERT INTO room_memberships (
+        room_id, actor_id, kind, role, participation, tool_permissions_json,
+        joined_at, configured_at, access_revision
+      ) VALUES ('offline-room', 'offline-human', 'human', 'owner', NULL, '[]', 't', NULL, 3);
+      INSERT INTO room_access_authority (room_id, access_revision, lease_generation)
+      VALUES ('offline-room', 3, 2);
+    `);
+    database.close();
+    const keys = generateKeyPairSync("ed25519");
+    const client = await createWorkerDatabaseClient({
+      databasePath: path,
+      sharedAuthorityRecovery: {
+        ballPolicy: { openItemDeadlineMs: 1, lightTaskDeadlineMs: 1 },
+        maxOfflineReadLeaseMs: 30_000,
+      },
+      offlineReadLeaseSigning: {
+        tenantId: "offline-tenant",
+        serverSubject: "offline-server",
+        keyId: "offline-key-1",
+        privateKey: keys.privateKey,
+      },
+    });
+    const lease = await client.issueOfflineReadLease(context, "offline-room", 30_000, 1_000);
+    expect(lease.claims).toMatchObject({
+      tenantId: "offline-tenant",
+      accountId: "offline-account",
+      actorId: "offline-human",
+      sessionFamilyId: context.sessionFamilyId,
+      deviceId: "offline-device",
+      installationId: "offline-device",
+      expiresAtMs: 20_000,
+      room: { roomId: "offline-room", lifecycleGeneration: 0,
+        accessRevision: 3, leaseGeneration: 2 },
+    });
+    expect(lease.token.split(".")).toHaveLength(2);
+    await client.close();
+    const inspection = new DatabaseSync(path, { readOnly: true });
+    expect(inspection.prepare(
+      "SELECT COUNT(*) AS count FROM offline_read_lease_issuances",
+    ).get()).toEqual({ count: 1 });
+    inspection.close();
+  });
+
   it("serializes live snapshot revalidation with current session and revision state", async () => {
     const path = databasePath();
     const context = {
@@ -2025,7 +2136,7 @@ describe("WorkerDatabaseClient", () => {
 
     await expect(heartbeat).resolves.toBeUndefined();
     const client = trackClient(await opening);
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 26 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 27 });
   });
 
   it("correlates concurrent responses to monotonically increasing request IDs", async () => {
@@ -2052,7 +2163,7 @@ describe("WorkerDatabaseClient", () => {
         setImmediate(() => parentPort.postMessage({
           type: "authority.schema",
           requestId: first.requestId,
-          schemaVersion: 26,
+          schemaVersion: 27,
         }));
       }
     `);
@@ -2066,7 +2177,7 @@ describe("WorkerDatabaseClient", () => {
     const first = client.inspectSchema();
     const secondRejection = rejectionOf(client.inspectSchema());
 
-    await expect(first).resolves.toEqual({ version: 26 });
+    await expect(first).resolves.toEqual({ version: 27 });
     await expect(secondRejection).resolves.toMatchObject({
       code: "invalid_request",
       status: 400,
@@ -2134,7 +2245,7 @@ describe("WorkerDatabaseClient", () => {
       parentPort.postMessage({
         type: "authority.schema",
         requestId: request.requestId,
-        schemaVersion: 26,
+        schemaVersion: 27,
         extra: true,
       });
     `);

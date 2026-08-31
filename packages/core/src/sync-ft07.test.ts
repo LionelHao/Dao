@@ -6,6 +6,7 @@ import {
   isPersistedDeploymentAgentProfileEvent,
   isRoomAgentAssignmentProjection,
   isRoomAgentAssignmentRepairSnapshot,
+  isRoomRepairPage,
   isRoomSyncResult,
 } from "./index.js";
 
@@ -151,6 +152,35 @@ describe("FT-07 sync projections", () => {
         roomRevision: 5,
         assignment: { ...assignment, providerSecret: "secret-canary" },
       },
+    }))).toBe(false);
+  });
+
+  it("treats the current Room Assignment as a closed central repair record", () => {
+    const page = (record: unknown) => ({
+      type: "room.repair.page",
+      requestId: "repair-room-assignment",
+      snapshotId: "snapshot-room-assignment",
+      roomId: "room-1",
+      page: 0,
+      records: [record],
+      watermark: 9,
+      snapshotChecksum: "sha256:assignment",
+      hasMore: false,
+      mode: "materialized",
+      expiresAt: "2026-08-24T02:00:00.000Z",
+    });
+
+    expect(isRoomRepairPage(page({
+      kind: "room-agent-assignment",
+      value: assignment,
+    }))).toBe(true);
+    expect(isRoomRepairPage(page({
+      kind: "room-agent-assignment",
+      value: { ...assignment, roomId: "room-2" },
+    }))).toBe(false);
+    expect(isRoomRepairPage(page({
+      kind: "room-agent-assignment",
+      value: { ...assignment, providerSecret: "secret-canary" },
     }))).toBe(false);
   });
 });

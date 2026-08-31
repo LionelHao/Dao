@@ -103,8 +103,8 @@ describe("authority SQLite v25 Project transition authority", () => {
         "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
       ).all();
       migrateAuthorityDatabase(database);
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(27);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(database.prepare(
         "SELECT version, name, checksum FROM schema_migrations WHERE version <= 24 ORDER BY version",
       ).all()).toEqual(history);

@@ -1877,10 +1877,27 @@ function replay(database: DatabaseSync, operation: Exclude<ProjectLoopAuthorityO
   { type: "project-loop.snapshot.read" }>): ProjectLoopAuthorityResult | undefined {
   const identity = commandIdentity(operation.context);
   const row = database.prepare(
-    `SELECT request_sha256 AS requestSha256, response_json AS responseJson
+    `SELECT request_sha256 AS requestSha256, response_json AS responseJson,
+            expires_at AS expiresAt
      FROM project_command_receipts WHERE actor_id = ? AND idempotency_key = ?`,
   ).get(identity.actorId, identity.idempotencyKey);
   if (row === undefined) return undefined;
+  if (typeof row.expiresAt !== "string" || !Number.isFinite(Date.parse(row.expiresAt))) {
+    throw new ProjectLoopAuthorityError("storage_unavailable", "Project receipt expiry is corrupt");
+  }
+  if (operation.now >= Date.parse(row.expiresAt)) {
+    const removed = database.prepare(
+      `DELETE FROM project_command_receipts
+       WHERE actor_id = ? AND idempotency_key = ? AND expires_at = ?`,
+    ).run(identity.actorId, identity.idempotencyKey, row.expiresAt);
+    if (removed.changes !== 1) {
+      throw new ProjectLoopAuthorityError(
+        "storage_unavailable",
+        "Expired Project receipt could not be removed",
+      );
+    }
+    return undefined;
+  }
   if (row.requestSha256 !== requestHash(operation) || typeof row.responseJson !== "string") {
     throw new ProjectLoopAuthorityError("idempotency_conflict", "Project idempotency key was reused");
   }
@@ -1946,10 +1963,12 @@ function mutate(database: DatabaseSync, operation: Exclude<ProjectLoopAuthorityO
     }
     database.prepare(
       `INSERT INTO project_command_receipts (
-         actor_id, idempotency_key, room_id, request_sha256, response_json, committed_at
-       ) VALUES (?, ?, ?, ?, ?, ?)`,
+         actor_id, idempotency_key, room_id, request_sha256, response_json,
+         committed_at, expires_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).run(identity.actorId, identity.idempotencyKey, roomId, requestHash(operation),
-      JSON.stringify(result), iso(operation.now));
+      JSON.stringify(result), iso(operation.now),
+      iso(operation.now + 30 * 24 * 60 * 60 * 1_000));
     database.exec("COMMIT");
     return result;
   } catch (error: unknown) {

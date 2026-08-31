@@ -30,6 +30,10 @@ import {
   type GovernanceAuthorityCommand,
 } from "./contracts.js";
 import type { DepartureConflictList, GovernanceCommand } from "../renderer/governance/view-model.js";
+import {
+  isDesktopOfflineReadLeaseClaims,
+  type DesktopOfflineReadLeaseClaims,
+} from "./offline-read-lease.js";
 
 type SocketEvent = "open" | "message" | "close" | "error";
 
@@ -86,6 +90,10 @@ export type InvocationWireAck =
       receipt: AgentExecutionRetryReceipt; replayed: boolean }>;
 
 export interface GovernanceAuthorityTransport extends SyncTransport {
+  issueOfflineReadLease(roomId: string): Promise<Readonly<{
+    token: string;
+    claims: DesktopOfflineReadLeaseClaims;
+  }>>;
   queryDepartureConflicts(input: {
     readonly requestId: string;
     readonly roomId: string;
@@ -150,6 +158,8 @@ type ParsedFrame =
   | InvocationWireAck
   | { readonly type: "room.departure.conflicts.result"; readonly requestId: string; readonly conflicts: DepartureConflictList }
   | WorkspaceBootstrapPage | RoomRepairPage | DesktopRoomSyncResult | SnapshotCompleted
+  | { readonly type: "offline-read-lease.issued"; readonly requestId: string;
+      readonly token: string; readonly claims: DesktopOfflineReadLeaseClaims }
   | { readonly type: "room.subscribed.v2"; readonly requestId: string; readonly roomId: string; readonly cursor: RoomCursor; readonly watermark: number }
   | { readonly type: "room.subscribe.v2.retry"; readonly requestId: string; readonly roomId: string; readonly reason: "gate_overflow"; readonly restartFrom: RoomCursor }
   | { readonly type: "room.event"; readonly event: DesktopRoomEvent }
@@ -215,8 +225,11 @@ export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined
   if (!record(value) || typeof value.type !== "string") return undefined;
   switch (value.type) {
     case "auth.authenticated":
-      return exact(value, ["type", "requestId", "accountId", "actorId", "sessionId"]) &&
-        text(value.requestId, 128) && text(value.accountId, 256) && text(value.actorId, 256) && text(value.sessionId, 256)
+      return exact(value, ["type", "requestId", "accountId", "actorId", "sessionId"],
+        ["sessionFamilyId", "deviceId"]) &&
+        text(value.requestId, 128) && text(value.accountId, 256) && text(value.actorId, 256) &&
+        text(value.sessionId, 256) && (value.sessionFamilyId === undefined ||
+          text(value.sessionFamilyId, 256)) && (value.deviceId === undefined || text(value.deviceId, 128))
         ? { type: value.type, requestId: value.requestId, actorId: value.actorId, sessionId: value.sessionId }
         : undefined;
     case "room.governance.ack": {
@@ -256,6 +269,13 @@ export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined
     case "room.repair.page": return isRoomRepairPage(value) ? value : undefined;
     case "room.sync.result": return isDesktopRoomSyncResult(value) ? value : undefined;
     case "snapshot.completed": return isSnapshotCompleted(value) ? value : undefined;
+    case "offline-read-lease.issued":
+      return exact(value, ["type", "requestId", "token", "claims"]) &&
+        text(value.requestId, 128) && text(value.token, 16_384) &&
+        isDesktopOfflineReadLeaseClaims(value.claims)
+        ? { type: value.type, requestId: value.requestId, token: value.token,
+          claims: structuredClone(value.claims) }
+        : undefined;
     case "room.subscribed.v2":
       return exact(value, ["type", "requestId", "roomId", "cursor", "watermark"]) &&
         text(value.requestId, 128) && text(value.roomId, 256) && isRoomCursor(value.cursor) &&
@@ -525,6 +545,13 @@ export function createGovernanceWebSocketAuthority(options: {
   };
 
   return {
+    issueOfflineReadLease(roomId) {
+      const requestId = `offline-read-lease-${++sequence}`;
+      return exactRequest<Extract<ParsedFrame, { type: "offline-read-lease.issued" }>>(
+        { type: "offline-read-lease.issue", requestId, roomId },
+        "offline-read-lease.issued",
+      );
+    },
     bootstrapBegin: (requestId) => exactRequest<WorkspaceBootstrapPage>(
       { type: "workspace.bootstrap.begin", requestId }, "workspace.bootstrap.page"),
     bootstrapPage: (requestId, snapshotId, afterPage) => exactRequest<WorkspaceBootstrapPage>(

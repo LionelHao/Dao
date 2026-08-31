@@ -493,6 +493,7 @@ describe("live closed Governance surface", () => {
     }));
     const unsubscribe = vi.fn();
     const bridge: GovernanceBridge = {
+      clearCache: vi.fn(async () => initial),
       getSurface: vi.fn(async () => initial),
       getDepartureConflicts: vi.fn(),
       submit,
@@ -571,6 +572,10 @@ describe("live closed Governance surface", () => {
     });
     expect(root.querySelector("[data-governance-locked]")?.textContent).toContain("缓存已清除");
     expect(root.textContent).not.toContain("Alpha");
+    expect(document.activeElement).toBe(root.querySelector("[data-governance-locked] h1"));
+    root.querySelector<HTMLButtonElement>("[data-governance-clear-cache]")?.click();
+    await vi.waitFor(() => expect(bridge.clearCache).toHaveBeenCalledWith({ roomId: "room-1" }));
+    await vi.waitFor(() => expect(root.querySelector("[data-archive-room]")).not.toBeNull());
     dispose();
     expect(unsubscribe).toHaveBeenCalledOnce();
     root.remove();

@@ -5,7 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
-import { seedCanonicalAgentProfileFixture } from "../fixtures/agent-authority-fixture.js";
+import {
+  seedCanonicalAgentProfileFixture,
+  seedCanonicalRoomAssignmentFixture,
+} from "../fixtures/agent-authority-fixture.js";
 import {
   migrateAuthorityDatabase,
   migrateAuthorityDatabaseToVersion3ForTest,
@@ -55,6 +58,7 @@ function contextFor(suffix: string, familySuffix = suffix): AuthenticatedSession
   return {
     sessionId: tokenHash(`access-${suffix}`),
     sessionFamilyId: tokenHash(`family-${familySuffix}`),
+    deviceId: "test",
     principal: { accountId: "account-a", actorId: "human-a" },
   };
 }
@@ -613,7 +617,7 @@ describe("durable materialized snapshot worker", () => {
     }
   });
 
-  it("rejects a materialized continuation before hydration when the Room watermark changed", async () => {
+  it("rejects a materialized continuation when a recalled message reference became stale", async () => {
     const fixture = await createDatabaseFixture({
       rooms: [{
         roomId: "room-stale-message-cache",
@@ -656,9 +660,57 @@ describe("durable materialized snapshot worker", () => {
       ).run();
       authority.close();
 
-      await expect(client.readRoomRepairPage(
-        context, "stale-cache-next", page0.snapshotId, 0,
-      )).rejects.toMatchObject({ code: "snapshot_stale" });
+      let page = page0;
+      let stale: unknown;
+      while (page.hasMore && stale === undefined) {
+        try {
+          page = await client.readRoomRepairPage(
+            context, `stale-cache-next-${page.page}`, page0.snapshotId, page.page,
+          );
+        } catch (error: unknown) {
+          stale = error;
+        }
+      }
+      expect(stale).toMatchObject({ code: "snapshot_stale" });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("keeps a fixed-W materialized snapshot readable after an unrelated W+1 append", async () => {
+    const fixture = await createDatabaseFixture({
+      rooms: [{ roomId: "room-fixed-watermark", messageCount: 1 }],
+    });
+    const context = fixture.contexts[0]!;
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: async () => undefined,
+      clock: () => 2_000,
+      limits: { maxRecordsPerPage: 1 },
+    });
+    try {
+      let page = await client.beginRoomRepair(
+        context, "fixed-watermark-begin", "room-fixed-watermark",
+      );
+      if ("kind" in page && page.kind === "fallback") throw new Error("unexpected fallback");
+      const watermark = page.watermark;
+      const authority = new DatabaseSync(fixture.authorityPath);
+      authority.prepare(
+        `UPDATE streams SET head_seq = head_seq + 1
+         WHERE stream_kind = 'room' AND stream_id = 'room-fixed-watermark'`,
+      ).run();
+      authority.close();
+
+      const records = [...page.records];
+      while (page.hasMore) {
+        page = await client.readRoomRepairPage(
+          context, `fixed-watermark-next-${page.page}`, page.snapshotId, page.page,
+        );
+        expect(page.watermark).toBe(watermark);
+        records.push(...page.records);
+      }
+      expect(records.some((record) => record.kind === "timeline-message")).toBe(true);
     } finally {
       await client.close();
     }
@@ -672,10 +724,10 @@ describe("durable materialized snapshot worker", () => {
       `INSERT INTO actors (id, kind, display_name, reachability, readiness, tool_permissions_json)
        VALUES ('agent-a', 'agent', 'Agent', NULL, 'ready', '["tool"]')`,
     ).run();
-    seedCanonicalAgentProfileFixture(database, {
+    const profileId = seedCanonicalAgentProfileFixture(database, {
       actorId: "agent-a",
       displayName: "Agent",
-      status: "disabled",
+      status: "enabled",
     });
     database.prepare(
       `INSERT INTO room_memberships (
@@ -684,6 +736,13 @@ describe("durable materialized snapshot worker", () => {
        ) VALUES ('room-mixed', 'agent-a', 'agent', NULL, 'active', '["tool"]',
          NULL, '2026-08-11T00:00:01.000Z', 0)`,
     ).run();
+    seedCanonicalRoomAssignmentFixture(database, {
+      assignmentId: "assignment-a",
+      roomId: "room-mixed",
+      profileId,
+      actorId: "agent-a",
+      participation: "active",
+    });
     insertLegacyMessageAuthorityRecord(database, {
       id: "message-agent", roomId: "room-mixed", authorId: "agent-a",
       authorKind: "agent", body: "agent answer", sentAt: "2026-08-11T00:00:03.000Z",
@@ -781,7 +840,7 @@ describe("durable materialized snapshot worker", () => {
       "timeline-message", "timeline-message", "message-revision", "attachment", "human-read",
       "agent-judgement", "open-item",
       "open-item-agent-failure", "light-task", "legacy-agent-execution", "calibration",
-      "memory", "project-loop",
+      "memory", "project-loop", "room-agent-assignment",
     ]);
     const timelineMessages = page.records.filter((record) =>
       record.kind === "timeline-message").map((record) => record.value);
@@ -841,6 +900,61 @@ describe("durable materialized snapshot worker", () => {
     expect(cachedPayload).not.toContain("question");
     expect(cachedPayload).not.toContain("repair.txt");
     await client.close();
+
+    const baseLease = {
+      snapshotId: "mixed-streaming-snapshot",
+      principalId: context.principal.actorId,
+      accountId: context.principal.accountId,
+      sessionFamilyId: context.sessionFamilyId,
+      scope: { kind: "room" as const, roomId: "room-mixed" },
+      version: { kind: "room" as const, roomId: "room-mixed", watermark: page.watermark },
+      authorizationRevision: 7,
+      idleExpiresAt: "2026-08-11T00:01:00.000Z",
+    };
+    let registeredLease: StreamingRepairLease = baseLease;
+    const streamingAuthority: StreamingRepairAuthority = {
+      async acquireStreamingRepair() { return baseLease; },
+      async registerStreamingRepair(snapshotId, checksum, pageCount) {
+        registeredLease = { ...baseLease, snapshotId, checksum, pageCount,
+          lastPage: pageCount - 1, highestAuthorizedPage: 0 };
+        return registeredLease;
+      },
+      async authorizeStreamingRepairPage() { return registeredLease; },
+      async completeStreamingRepair(_context, snapshotId, version) {
+        return { type: "snapshot.completed" as const, requestId: "internal",
+          snapshotId, version };
+      },
+      async releaseStreamingRepair() {},
+    };
+    const streaming = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: join(fixture.directory, "room-mixed-streaming-cache.sqlite"),
+      deploymentProviderCredentialReadiness: "noauth",
+      revalidate: async () => undefined,
+      streamingAuthority,
+      clock: () => 2_000,
+      limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 3 },
+    });
+    try {
+      let streamingPage = await streaming.beginRoomRepair(
+        context, "mixed-streaming-zero", "room-mixed",
+      );
+      if ("kind" in streamingPage) throw new Error("expected streaming parity page");
+      const streamingRecords = [...streamingPage.records];
+      while (streamingPage.hasMore) {
+        streamingPage = await streaming.readRoomRepairPage(
+          context,
+          `mixed-streaming-${streamingPage.page + 1}`,
+          streamingPage.snapshotId,
+          streamingPage.page,
+        );
+        streamingRecords.push(...streamingPage.records);
+      }
+      expect(streamingRecords).toEqual(page.records);
+      expect(streamingPage.snapshotChecksum).toBe(page.snapshotChecksum);
+    } finally {
+      await streaming.close();
+    }
   });
 
   it("materializes migrated v3 calibration as explicit legacy unknowns without invented ids", async () => {

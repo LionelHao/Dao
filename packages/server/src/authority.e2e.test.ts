@@ -38,6 +38,12 @@ import {
   type RoomSubscriptionObserver,
   type SyncTransport,
 } from "../../desktop/src/sync/client-sync-replica.js";
+import { createDesktopAuthorityCache } from
+  "../../desktop/src/governance/authority-cache.js";
+import { createEncryptedAuthorityGenerationStore } from
+  "../../desktop/src/governance/encrypted-generation-store.js";
+import type { CredentialEncryption } from
+  "../../desktop/src/identity/credential-vault.js";
 import { createDesktopGovernanceRuntime } from "../../desktop/src/governance/production-runtime.js";
 import { createDesktopAgentSettingsRuntime } from
   "../../desktop/src/agent-profile-routing/production-runtime.js";
@@ -1713,11 +1719,28 @@ describe("authoritative server real-process harness", () => {
       });
       if (externalAck.type !== "ack") throw new TypeError("external Assignment pause was rejected");
       await vi.waitFor(() => {
-        expect(observed).toEqual(expect.arrayContaining([expect.objectContaining({
-          type: "stable-event", eventId: externalAck.eventIds[0],
-          event: expect.objectContaining({ kind: "assignment.upserted",
-            assignment: expect.objectContaining({ paused: true, availability: "paused" }) }),
-        })]));
+        const observedStableEvent = observed.some((message) => {
+          const stableEvent = message as { type?: unknown; eventId?: unknown; event?: {
+            kind?: unknown; assignment?: { assignmentId?: unknown; paused?: unknown;
+              availability?: unknown } } };
+          return stableEvent.type === "stable-event" &&
+            stableEvent.eventId === externalAck.eventIds[0] &&
+            stableEvent.event?.kind === "assignment.upserted" &&
+            stableEvent.event.assignment?.assignmentId === externalAssignment.assignmentId &&
+            stableEvent.event.assignment.paused === true &&
+            stableEvent.event.assignment.availability === "paused";
+        });
+        const observedRepairSnapshot = observed.some((message) => {
+          if ((message as { type?: unknown }).type !== "repair-completed") return false;
+          const snapshot = (message as { snapshot?: {
+            room?: { status?: unknown; assignments?: readonly { assignmentId?: unknown;
+              paused?: unknown; availability?: unknown }[] } } }).snapshot;
+          const repairedAssignment = snapshot?.room?.assignments?.find((assignment) =>
+            assignment.assignmentId === externalAssignment.assignmentId);
+          return snapshot?.room?.status === "available" && repairedAssignment?.paused === true &&
+            repairedAssignment.availability === "paused";
+        });
+        expect(observedStableEvent || observedRepairSnapshot).toBe(true);
         expect(rendererState.snapshot?.room.status).toBe("available");
         expect(rendererState.snapshot?.room.status === "available"
           ? rendererState.snapshot.room.assignments[0] : undefined).toMatchObject({
@@ -4220,7 +4243,7 @@ describe("authoritative server real-process harness", () => {
       expect(serializedRendererBoundary).not.toContain(issued.accessToken);
       expect(root.textContent).not.toContain(issued.accessToken);
       expect(Object.keys(bridge)).toEqual([
-        "getSurface", "getDepartureConflicts", "submit", "onStateChanged",
+        "getSurface", "clearCache", "getDepartureConflicts", "submit", "onStateChanged",
       ]);
     } finally {
       unmountRenderer?.();
@@ -4639,6 +4662,242 @@ describe("authoritative server real-process harness", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("reopens three encrypted Desktop replicas after a real Authority restart and converges past a fixed repair watermark", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-ft13-persistent-replicas-"));
+    const children: ChildProcessWithoutNullStreams[] = [];
+    const clients: JsonWebSocketClient[] = [];
+    const replicas: Array<ReturnType<typeof createClientSyncReplica>> = [];
+    const caches: Array<ReturnType<typeof createDesktopAuthorityCache>> = [];
+    const wrapping: CredentialEncryption = {
+      isEncryptionAvailable: () => true,
+      encryptString: (value) => Uint8Array.from(Buffer.from(value, "utf8")).reverse(),
+      decryptString: (value) => Buffer.from(Uint8Array.from(value).reverse()).toString("utf8"),
+    };
+    const cachePath = (label: string): string =>
+      join(directory, `desktop-${label}`, "authority-cache.sqlite");
+    const containsMessage = (
+      records: readonly RoomRepairRecord[] | undefined,
+      messageId: string,
+    ): boolean => records?.some((record) =>
+      (record.kind === "message" || record.kind === "timeline-message") &&
+      record.value.id === messageId) ?? false;
+    const openCache = async (label: string) => {
+      const cache = createDesktopAuthorityCache(
+        () => "2026-08-31T12:00:00.000Z",
+        undefined,
+        (actorId) => createEncryptedAuthorityGenerationStore({
+          databasePath: cachePath(label),
+          accountId: actorId,
+          encryption: wrapping,
+        }),
+      );
+      caches.push(cache);
+      const restored = await cache.restore("human-a");
+      return { cache, restored };
+    };
+    try {
+      const roomId = await seedDirectory(directory);
+      const seededHead = readRoomHeadSeq(directory, roomId);
+      await compactRoomStream(directory, roomId, seededHead);
+
+      const first = await spawnAuthorityChild({ directory });
+      children.push(first.child);
+      const firstClients = await Promise.all([
+        JsonWebSocketClient.connect(first.url),
+        JsonWebSocketClient.connect(first.url),
+        JsonWebSocketClient.connect(first.url),
+      ]);
+      clients.push(...firstClients);
+      const accessToken = await firstClients[0]!.login("persistent-a-login");
+      await Promise.all([
+        firstClients[1]!.resume(accessToken, "persistent-b-resume"),
+        firstClients[2]!.resume(accessToken, "persistent-c-resume"),
+      ]);
+
+      const opened = await Promise.all([openCache("a"), openCache("b"), openCache("c")]);
+      expect(opened.map((entry) => entry.restored)).toEqual([false, false, false]);
+      const transports = firstClients.map((client) => new WebSocketSyncTransport(client));
+      const firstReplicas = opened.map((entry, index) => {
+        const replica = createClientSyncReplica({
+          transport: transports[index]!,
+          cache: entry.cache,
+        });
+        replicas.push(replica);
+        return replica;
+      });
+      await Promise.all(firstReplicas.map((replica) => replica.restoreWorkspace()));
+      expect(opened.every((entry) => entry.cache.roomCursor(roomId)?.afterSeq === seededHead))
+        .toBe(true);
+
+      // Move the authority head before opening the next snapshot. This also proves the
+      // three live replicas can advance their encrypted generations before one client
+      // deliberately enters a fixed-watermark repair.
+      await firstClients[0]!.request({
+        type: "message.send",
+        requestId: "ft13-before-fixed-repair",
+        message: {
+          id: "ft13-message-before-fixed-repair",
+          roomId,
+          body: "advance the repair snapshot",
+          sentAt: "2026-08-31T12:00:30.000Z",
+        },
+      }, "message.accepted");
+      await waitForRoomAuthorityQuiescence(directory, roomId);
+
+      let releaseFixedWatermark!: () => void;
+      const fixedWatermarkRelease = new Promise<void>((resolve) => {
+        releaseFixedWatermark = resolve;
+      });
+      let observeFixedWatermark!: () => void;
+      const fixedWatermarkObserved = new Promise<void>((resolve) => {
+        observeFixedWatermark = resolve;
+      });
+      let repairWatermark = -1;
+      transports[2]!.beforeMaterializedLastPageReturn = async (page) => {
+        repairWatermark = page.watermark;
+        observeFixedWatermark();
+        await fixedWatermarkRelease;
+      };
+      // Explicit repair must invalidate the existing live observer before the fixed
+      // snapshot starts; W+1 is then consumed only through the post-repair delta path.
+      const fixedRepair = firstReplicas[2]!.repairRoom(roomId);
+      await fixedWatermarkObserved;
+      const duringRepairId = "ft13-message-during-fixed-repair";
+      await firstClients[0]!.request({
+        type: "message.send",
+        requestId: "ft13-during-fixed-repair",
+        message: {
+          id: duringRepairId,
+          roomId,
+          body: "fixed-watermark delta catch-up",
+          sentAt: "2026-08-31T12:01:00.000Z",
+        },
+      }, "message.accepted");
+      releaseFixedWatermark();
+      await fixedRepair;
+      transports[2]!.beforeMaterializedLastPageReturn = undefined;
+      expect(opened[2]!.cache.roomCursor(roomId)!.afterSeq).toBeGreaterThan(repairWatermark);
+      expect(containsMessage(opened[2]!.cache.roomRepairRecords(roomId), duringRepairId))
+        .toBe(true);
+
+      const bCursorBeforeGap = opened[1]!.cache.roomCursor(roomId)!;
+      firstClients[1]!.terminate();
+      const missedByB = ["ft13-message-gap-one", "ft13-message-gap-two"];
+      for (const messageId of missedByB) {
+        await firstClients[0]!.request({
+          type: "message.send",
+          requestId: `ft13-send-${messageId}`,
+          message: {
+            id: messageId,
+            roomId,
+            body: `durable ${messageId}`,
+            sentAt: "2026-08-31T12:02:00.000Z",
+          },
+        }, "message.accepted");
+      }
+      const replacementB = await JsonWebSocketClient.connect(first.url);
+      clients.push(replacementB);
+      await replacementB.resume(accessToken, "persistent-b-gap-resume");
+      transports[1]!.replaceClient(replacementB);
+      await transports[1]!.resume(bCursorBeforeGap);
+      expect(opened[1]!.cache.roomCursor(roomId)!.afterSeq).toBeGreaterThan(
+        bCursorBeforeGap.afterSeq,
+      );
+      for (const messageId of missedByB) {
+        expect(containsMessage(opened[1]!.cache.roomRepairRecords(roomId), messageId)).toBe(true);
+      }
+
+      for (const replica of firstReplicas) replica.close();
+      for (const entry of opened) entry.cache.close();
+      for (const client of clients.splice(0)) client.close();
+      await stopChild(first.child);
+
+      const restarted = await spawnAuthorityChild({ directory });
+      children.push(restarted.child);
+      const restartedClients = await Promise.all([
+        JsonWebSocketClient.connect(restarted.url),
+        JsonWebSocketClient.connect(restarted.url),
+        JsonWebSocketClient.connect(restarted.url),
+      ]);
+      clients.push(...restartedClients);
+      await Promise.all(restartedClients.map((client, index) =>
+        client.resume(accessToken, `persistent-restart-${index}`)));
+      const reopened = await Promise.all([openCache("a"), openCache("b"), openCache("c")]);
+      expect(reopened.map((entry) => entry.restored)).toEqual([true, true, true]);
+      for (const entry of reopened) {
+        expect(containsMessage(entry.cache.roomRepairRecords(roomId), duringRepairId)).toBe(true);
+      }
+
+      const restartedTransports = restartedClients.map(
+        (client) => new WebSocketSyncTransport(client),
+      );
+      const restartedReplicas = reopened.map((entry, index) => {
+        const replica = createClientSyncReplica({
+          transport: restartedTransports[index]!,
+          cache: entry.cache,
+        });
+        replicas.push(replica);
+        return replica;
+      });
+      await Promise.all(restartedReplicas.map((replica) => replica.restoreWorkspace()));
+
+      reopened[2]!.cache.clearRoom(roomId);
+      expect(reopened[2]!.cache.roomRepairRecords(roomId)).toBeUndefined();
+      await restartedReplicas[2]!.repairRoom(roomId);
+      expect(reopened[2]!.cache.roomRepairRecords(roomId)).toBeDefined();
+
+      const finalMessageId = "ft13-message-after-authority-restart";
+      await restartedClients[0]!.request({
+        type: "message.send",
+        requestId: "ft13-after-authority-restart",
+        message: {
+          id: finalMessageId,
+          roomId,
+          body: "all persistent replicas converge",
+          sentAt: "2026-08-31T12:03:00.000Z",
+        },
+      }, "message.accepted");
+      await waitForRoomAuthorityQuiescence(directory, roomId);
+      for (const replica of restartedReplicas) replica.close();
+      const convergenceReplicas = reopened.map((entry, index) => {
+        const replica = createClientSyncReplica({
+          transport: restartedTransports[index]!,
+          cache: entry.cache,
+        });
+        replicas.push(replica);
+        return replica;
+      });
+      await Promise.all(convergenceReplicas.map((replica) => replica.repairRoom(roomId)));
+      const authoritative = await repairRecords(restartedClients[0]!, roomId);
+      const finalHead = readRoomHeadSeq(directory, roomId);
+      for (const entry of reopened) {
+        const records = entry.cache.roomRepairRecords(roomId);
+        expect(records).toBeDefined();
+        expect(authoritySnapshotChecksum("room", records ?? [])).toBe(authoritative.checksum);
+        expect(entry.cache.roomCursor(roomId)?.afterSeq).toBe(finalHead);
+        expect(containsMessage(records, finalMessageId)).toBe(true);
+      }
+      expect(reopened[1]!.cache.roomRepairRecords(roomId))
+        .toEqual(reopened[0]!.cache.roomRepairRecords(roomId));
+      expect(reopened[2]!.cache.roomRepairRecords(roomId))
+        .toEqual(reopened[0]!.cache.roomRepairRecords(roomId));
+
+      convergenceReplicas[2]!.close();
+      reopened[2]!.cache.close();
+      const finalReopen = await openCache("c");
+      expect(finalReopen.restored).toBe(true);
+      expect(finalReopen.cache.roomCursor(roomId)?.afterSeq).toBe(finalHead);
+      expect(finalReopen.cache.roomRepairRecords(roomId))
+        .toEqual(reopened[0]!.cache.roomRepairRecords(roomId));
+    } finally {
+      for (const replica of replicas) replica.close();
+      for (const cache of caches) cache.close();
+      for (const client of clients) client.close();
+      for (const child of children) await stopChild(child).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("restores three independent replicas across live, retained, expired, and clear-cache paths", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-three-replicas-"));

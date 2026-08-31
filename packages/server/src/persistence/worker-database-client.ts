@@ -1,4 +1,5 @@
 import type { BigIntStats } from "node:fs";
+import type { KeyObject } from "node:crypto";
 import { lstat, readdir, readFile, readlink, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -95,6 +96,7 @@ import type {
   CommittedRoomCacheInvalidationIntent,
   RoomCacheInvalidationIntentAuthority,
 } from "../access/room-cache-invalidation-port.js";
+import type { IssuedOfflineReadLease } from "../access/offline-lease-invalidation-port.js";
 import type {
   AttachmentDatabaseOperation,
   AttachmentDatabaseOperationResult,
@@ -111,10 +113,16 @@ export interface CreateWorkerDatabaseClientOptions {
     readonly maxOfflineReadLeaseMs: number;
   };
   readonly deploymentProviderDisclosure?: DeploymentProviderDisclosure;
+  readonly offlineReadLeaseSigning?: {
+    readonly tenantId: string;
+    readonly serverSubject: string;
+    readonly keyId: string;
+    readonly privateKey: KeyObject;
+  };
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 26;
+  readonly version: 27;
 }
 
 export interface WorkerDatabaseClient {
@@ -279,14 +287,39 @@ export interface WorkerDatabaseClient {
     deliveryId: string,
     reason: OutboxDeliveryFailureReason,
   ): Promise<void>;
+  scheduleOutboxRetry(input: Readonly<{
+    deliveryId: string;
+    eventId: string;
+    attempt: number;
+    reason: OutboxDeliveryFailureReason;
+    availableAtMs: number;
+  }>): Promise<void>;
+  deadLetterOutbox(input: Readonly<{
+    deliveryId: string;
+    eventId: string;
+    attempt: number;
+    reason: OutboxDeliveryFailureReason;
+    deadLetteredAtMs: number;
+  }>): Promise<void>;
   listCommittedRoomCacheInvalidations(
     limit: number,
   ): Promise<readonly CommittedRoomCacheInvalidationIntent[]>;
   markRoomCacheInvalidationCompleted(invalidationIntentId: string): Promise<void>;
   markRoomCacheInvalidationFailed(
-    invalidationIntentId: string,
-    errorCode: "purge_failed" | "authority_unavailable",
+    input: Readonly<{
+      invalidationIntentId: string;
+      attempt: number;
+      errorCode: "purge_failed" | "authority_unavailable";
+      availableAtMs?: number;
+      deadLetteredAtMs?: number;
+    }>,
   ): Promise<void>;
+  issueOfflineReadLease(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+    requestedLeaseMs: number,
+    now: number,
+  ): Promise<IssuedOfflineReadLease>;
   executeRuntime(operation: RuntimeAuthorityOperation): Promise<unknown>;
   executeRoute(operation: RouteAuthorityOperation): Promise<unknown>;
   executeBall(operation: BallAuthorityOperation): Promise<unknown>;
@@ -880,6 +913,14 @@ function createAuthorityWorker(
   rollbackFailureForTest = false,
   transactionFaultPoint?: "after-domain-write" | "before-commit",
 ): AuthorityWorkerTransport {
+  const testOnlyAllowMissingSharedAuthorityRecovery =
+    options.sharedAuthorityRecovery === undefined && process.env.NODE_ENV === "test";
+  if (options.sharedAuthorityRecovery === undefined &&
+      !testOnlyAllowMissingSharedAuthorityRecovery) {
+    throw new TypeError(
+      "sharedAuthorityRecovery with a finite maxOfflineReadLeaseMs is required",
+    );
+  }
   return new Worker(authorityWorkerUrl(), {
     workerData: {
       databasePath: options.databasePath,
@@ -887,9 +928,14 @@ function createAuthorityWorker(
         ? {} : { sharedAuthorityRecovery: options.sharedAuthorityRecovery }),
       ...(options.deploymentProviderDisclosure === undefined
         ? {} : { deploymentProviderDisclosure: options.deploymentProviderDisclosure }),
+      ...(options.offlineReadLeaseSigning === undefined
+        ? {} : { offlineReadLeaseSigning: options.offlineReadLeaseSigning }),
       ...(recovery === undefined ? {} : { recovery }),
       ...(rollbackFailureForTest ? { rollbackFailureForTest: true } : {}),
       ...(transactionFaultPoint === undefined ? {} : { transactionFaultPoint }),
+      ...(testOnlyAllowMissingSharedAuthorityRecovery
+        ? { testOnlyAllowMissingSharedAuthorityRecovery: true }
+        : {}),
     },
   });
 }
@@ -938,6 +984,27 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
           `Authority worker exited before close acknowledgement (exit code ${exitCode})`,
         ),
       );
+    });
+  }
+
+  issueOfflineReadLease(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+    requestedLeaseMs: number,
+    now: number,
+  ): Promise<IssuedOfflineReadLease> {
+    return this.#send({
+      type: "authority.offline-read-lease-issue",
+      context,
+      roomId,
+      requestedLeaseMs,
+      now,
+    }).then((response) => {
+      if (response.type !== "authority.offline-read-lease-issued") {
+        this.#failProtocol("Authority worker returned the wrong offline lease response");
+        throw this.#terminalError;
+      }
+      return response.lease;
     });
   }
 
@@ -1877,6 +1944,38 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
       });
   }
 
+  scheduleOutboxRetry(input: Readonly<{
+    deliveryId: string;
+    eventId: string;
+    attempt: number;
+    reason: OutboxDeliveryFailureReason;
+    availableAtMs: number;
+  }>): Promise<void> {
+    return this.#send({ type: "authority.outbox-schedule-retry", ...input })
+      .then((response) => {
+        if (response.type !== "authority.outbox-updated") {
+          this.#failProtocol("Authority worker returned the wrong retry-outbox response");
+          throw this.#terminalError;
+        }
+      });
+  }
+
+  deadLetterOutbox(input: Readonly<{
+    deliveryId: string;
+    eventId: string;
+    attempt: number;
+    reason: OutboxDeliveryFailureReason;
+    deadLetteredAtMs: number;
+  }>): Promise<void> {
+    return this.#send({ type: "authority.outbox-dead-letter", ...input })
+      .then((response) => {
+        if (response.type !== "authority.outbox-updated") {
+          this.#failProtocol("Authority worker returned the wrong dead-letter-outbox response");
+          throw this.#terminalError;
+        }
+      });
+  }
+
   listCommittedRoomCacheInvalidations(
     limit: number,
   ): Promise<readonly CommittedRoomCacheInvalidationIntent[]> {
@@ -1903,13 +2002,17 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
   }
 
   markRoomCacheInvalidationFailed(
-    invalidationIntentId: string,
-    errorCode: "purge_failed" | "authority_unavailable",
+    input: Readonly<{
+      invalidationIntentId: string;
+      attempt: number;
+      errorCode: "purge_failed" | "authority_unavailable";
+      availableAtMs?: number;
+      deadLetteredAtMs?: number;
+    }>,
   ): Promise<void> {
     return this.#send({
       type: "authority.room-cache-invalidation-failed",
-      invalidationIntentId,
-      errorCode,
+      ...input,
     }).then((response) => {
       if (response.type !== "authority.room-cache-invalidation-updated") {
         this.#failProtocol("Authority worker returned the wrong room-cache failure response");
@@ -2199,11 +2302,16 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
         responseType === "authority.outbox-updated") ||
       (requestType === "authority.outbox-failed" &&
         responseType === "authority.outbox-updated") ||
+      ((requestType === "authority.outbox-schedule-retry" ||
+        requestType === "authority.outbox-dead-letter") &&
+        responseType === "authority.outbox-updated") ||
       (requestType === "authority.room-cache-invalidation-list" &&
         responseType === "authority.room-cache-invalidations") ||
       ((requestType === "authority.room-cache-invalidation-completed" ||
         requestType === "authority.room-cache-invalidation-failed") &&
         responseType === "authority.room-cache-invalidation-updated") ||
+      (requestType === "authority.offline-read-lease-issue" &&
+        responseType === "authority.offline-read-lease-issued") ||
       (requestType === "authority.sync-room" &&
         responseType === "authority.room-synced") ||
       (requestType === "authority.snapshot-revalidate" &&
@@ -2281,10 +2389,8 @@ export function createWorkerRoomCacheInvalidationIntentAuthority(
     listCommittedReady: (limit: number) => worker.listCommittedRoomCacheInvalidations(limit),
     markCompleted: (invalidationIntentId: string) =>
       worker.markRoomCacheInvalidationCompleted(invalidationIntentId),
-    markFailed: (
-      invalidationIntentId: string,
-      errorCode: "purge_failed" | "authority_unavailable",
-    ) => worker.markRoomCacheInvalidationFailed(invalidationIntentId, errorCode),
+    markFailed: (input: Parameters<WorkerDatabaseClient["markRoomCacheInvalidationFailed"]>[0]) =>
+      worker.markRoomCacheInvalidationFailed(input),
   });
 }
 

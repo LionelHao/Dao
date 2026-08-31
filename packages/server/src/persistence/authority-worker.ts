@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, KeyObject } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
 import { isRoomGovernanceView, type DepartureConflictList } from "@native-im/core";
@@ -43,8 +43,12 @@ import {
   listCommittedRoomCacheInvalidationIntentsDatabaseQuery,
   markOutboxDispatchedDatabaseCommand,
   markOutboxFailedDatabaseCommand,
+  scheduleOutboxRetryDatabaseCommand,
+  deadLetterOutboxDatabaseCommand,
   markRoomCacheInvalidationCompletedDatabaseCommand,
   markRoomCacheInvalidationFailedDatabaseCommand,
+  settleDeploymentProfileCursorOutboxDatabaseCommand,
+  issueOfflineReadLeaseDatabaseCommand,
   readActorDatabaseQuery,
   readHistoryDatabaseQuery,
   readMessageHistoryDatabaseQuery,
@@ -60,7 +64,9 @@ import {
   runAuthorityParticipantImmediateTransaction,
   syncRoomDatabaseQuery,
   inspectStreamingRepairScopeDatabaseQuery,
+  cleanupExpiredIdempotencyDatabaseCommand,
 } from "./authority-database-handler.js";
+import { IDEMPOTENCY_CLEANUP_BATCH_SIZE } from "./idempotency-lifecycle.js";
 import { ballResultAsJson } from "../ball-runtime/ball-authority-protocol.js";
 import { runtimeResultAsJson } from "../agent-runtime/runtime-authority-protocol.js";
 import { routeResultAsJson } from "../route-runtime/route-authority-protocol.js";
@@ -87,7 +93,10 @@ import { settleToolSafetyPrincipalFenceInTransaction } from
   "../tool-safety/database-authority.js";
 import { assignmentSecurityReductionParticipantRegistration } from "../room-assignment/assignment-security-reduction-participant.js";
 import { roomCacheInvalidationRegistration } from "../access/room-cache-invalidation-port.js";
-import { createOfflineLeaseInvalidationRegistration } from "../access/offline-lease-invalidation-port.js";
+import {
+  createOfflineLeaseInvalidationRegistration,
+  OfflineReadLeaseIssuer,
+} from "../access/offline-lease-invalidation-port.js";
 import { createProductionSharedAuthorityParticipantComposition } from "../room-governance/production-participant-composition.js";
 import {
   AttachmentAuthorityDatabaseError,
@@ -154,9 +163,17 @@ interface AuthorityWorkerData {
     readonly maxOfflineReadLeaseMs: number;
   };
   readonly deploymentProviderDisclosure?: DeploymentProviderDisclosure;
+  readonly offlineReadLeaseSigning?: {
+    readonly tenantId: string;
+    readonly serverSubject: string;
+    readonly keyId: string;
+    readonly privateKey: KeyObject;
+  };
   readonly recovery?: LegacyImportRecovery;
   readonly rollbackFailureForTest?: true;
   readonly transactionFaultPoint?: "after-domain-write" | "before-commit";
+  /** Vitest-only compatibility for focused worker fixtures that cannot issue offline leases. */
+  readonly testOnlyAllowMissingSharedAuthorityRecovery?: true;
 }
 
 function isAuthorityWorkerData(value: unknown): value is AuthorityWorkerData {
@@ -169,11 +186,17 @@ function isAuthorityWorkerData(value: unknown): value is AuthorityWorkerData {
       keys.some((key) =>
         key !== "databasePath" && key !== "recovery" && key !== "rollbackFailureForTest" &&
         key !== "transactionFaultPoint" && key !== "sharedAuthorityRecovery" &&
-        key !== "deploymentProviderDisclosure") ||
+        key !== "deploymentProviderDisclosure" &&
+        key !== "offlineReadLeaseSigning" &&
+        key !== "testOnlyAllowMissingSharedAuthorityRecovery") ||
       (record.rollbackFailureForTest !== undefined && record.rollbackFailureForTest !== true) ||
       (record.transactionFaultPoint !== undefined &&
         record.transactionFaultPoint !== "after-domain-write" &&
-        record.transactionFaultPoint !== "before-commit")) {
+        record.transactionFaultPoint !== "before-commit") ||
+      (record.testOnlyAllowMissingSharedAuthorityRecovery !== undefined &&
+        record.testOnlyAllowMissingSharedAuthorityRecovery !== true) ||
+      (record.sharedAuthorityRecovery === undefined &&
+        record.testOnlyAllowMissingSharedAuthorityRecovery !== true)) {
     return false;
   }
   if (record.sharedAuthorityRecovery !== undefined) {
@@ -208,6 +231,18 @@ function isAuthorityWorkerData(value: unknown): value is AuthorityWorkerData {
          (disclosure as Record<string, unknown>).credentialReadiness !== "noauth")) {
       return false;
     }
+  }
+  if (record.offlineReadLeaseSigning !== undefined) {
+    const signing = record.offlineReadLeaseSigning;
+    if (typeof signing !== "object" || signing === null || Array.isArray(signing)) return false;
+    const candidate = signing as Record<string, unknown>;
+    if (Object.keys(candidate).sort().join("\0") !==
+        ["tenantId", "serverSubject", "keyId", "privateKey"].sort().join("\0") ||
+        typeof candidate.tenantId !== "string" || candidate.tenantId.length === 0 ||
+        typeof candidate.serverSubject !== "string" || candidate.serverSubject.length === 0 ||
+        typeof candidate.keyId !== "string" || candidate.keyId.length === 0 ||
+        !(candidate.privateKey instanceof KeyObject) || candidate.privateKey.type !== "private" ||
+        candidate.privateKey.asymmetricKeyType !== "ed25519") return false;
   }
   if (record.recovery === undefined) {
     return true;
@@ -257,20 +292,130 @@ let processing = false;
 let database: DatabaseSync | undefined;
 let workerInitialized = false;
 let workerClosed = false;
+const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 60 * 60 * 1_000;
+let idempotencyCleanupInterval: ReturnType<typeof setInterval> | undefined;
+let idempotencyCleanupScheduled = false;
+const DEPLOYMENT_PROFILE_OUTBOX_INTERVAL_MS = 250;
+let deploymentProfileOutboxInterval: ReturnType<typeof setInterval> | undefined;
+let deploymentProfileOutboxScheduled = false;
 let rollbackFailureForTestAvailable =
   isAuthorityWorkerData(workerData) && workerData.rollbackFailureForTest === true;
 const repairs = new FallbackRepairCoordinator();
 const workerAuthorityPolicy = isAuthorityWorkerData(workerData)
   ? workerData.sharedAuthorityRecovery
   : undefined;
-const governanceParticipantComposition = createProductionSharedAuthorityParticipantComposition({
-  ballPolicy: workerAuthorityPolicy?.ballPolicy ?? {
-    openItemDeadlineMs: 24 * 60 * 60 * 1_000,
-    lightTaskDeadlineMs: 24 * 60 * 60 * 1_000,
-  },
-  maxOfflineReadLeaseMs:
-    workerAuthorityPolicy?.maxOfflineReadLeaseMs ?? 24 * 60 * 60 * 1_000,
+const offlineReadLeaseIssuer = isAuthorityWorkerData(workerData) &&
+    workerData.offlineReadLeaseSigning !== undefined && workerAuthorityPolicy !== undefined
+  ? new OfflineReadLeaseIssuer({
+      ...workerData.offlineReadLeaseSigning,
+      maxOfflineReadLeaseMs: workerAuthorityPolicy.maxOfflineReadLeaseMs,
+    })
+  : undefined;
+const testOnlySharedAuthorityPolicy = Object.freeze({
+  ballPolicy: Object.freeze({ openItemDeadlineMs: 1, lightTaskDeadlineMs: 1 }),
+  maxOfflineReadLeaseMs: 1,
 });
+const governanceParticipantComposition = createProductionSharedAuthorityParticipantComposition({
+  ...(workerAuthorityPolicy ?? testOnlySharedAuthorityPolicy),
+});
+
+function reportIdempotencyCleanupFailure(): void {
+  process.stderr.write(JSON.stringify({
+    severity: "critical",
+    code: "idempotency_cleanup_storage_unavailable",
+  }) + "\n");
+}
+
+function scheduleIdempotencyCleanupBatch(): void {
+  if (idempotencyCleanupScheduled || workerClosed || !workerInitialized) return;
+  idempotencyCleanupScheduled = true;
+  setImmediate(() => {
+    idempotencyCleanupScheduled = false;
+    if (workerClosed || !workerInitialized) return;
+    if (processing) {
+      setTimeout(scheduleIdempotencyCleanupBatch, 25).unref();
+      return;
+    }
+    try {
+      database ??= openAuthorityDatabase();
+      const result = cleanupExpiredIdempotencyDatabaseCommand(
+        database,
+        Date.now(),
+        IDEMPOTENCY_CLEANUP_BATCH_SIZE,
+      );
+      if (result.hasMore) scheduleIdempotencyCleanupBatch();
+    } catch {
+      reportIdempotencyCleanupFailure();
+    }
+  });
+}
+
+function scheduleDeploymentProfileOutboxBatch(): void {
+  if (deploymentProfileOutboxScheduled || workerClosed || !workerInitialized) return;
+  deploymentProfileOutboxScheduled = true;
+  setImmediate(() => {
+    deploymentProfileOutboxScheduled = false;
+    if (workerClosed || !workerInitialized) return;
+    if (processing) {
+      setTimeout(scheduleDeploymentProfileOutboxBatch, 25).unref();
+      return;
+    }
+    try {
+      database ??= openAuthorityDatabase();
+      const result = settleDeploymentProfileCursorOutboxDatabaseCommand(database, Date.now(), 100);
+      if (result.hasMore) scheduleDeploymentProfileOutboxBatch();
+    } catch {
+      process.stderr.write(JSON.stringify({
+        severity: "critical",
+        code: "outbox_dispatcher_failure",
+        family: "deployment-profile",
+        reason: "storage_unavailable",
+      }) + "\n");
+    }
+  });
+}
+
+function startDeploymentProfileOutbox(): void {
+  scheduleDeploymentProfileOutboxBatch();
+  deploymentProfileOutboxInterval ??= setInterval(
+    scheduleDeploymentProfileOutboxBatch,
+    DEPLOYMENT_PROFILE_OUTBOX_INTERVAL_MS,
+  );
+  deploymentProfileOutboxInterval.unref();
+}
+
+function stopDeploymentProfileOutbox(): void {
+  if (deploymentProfileOutboxInterval !== undefined) {
+    clearInterval(deploymentProfileOutboxInterval);
+    deploymentProfileOutboxInterval = undefined;
+  }
+}
+
+function startIdempotencyCleanup(): void {
+  scheduleIdempotencyCleanupBatch();
+  idempotencyCleanupInterval ??= setInterval(
+    scheduleIdempotencyCleanupBatch,
+    IDEMPOTENCY_CLEANUP_INTERVAL_MS,
+  );
+  idempotencyCleanupInterval.unref();
+}
+
+function stopIdempotencyCleanup(): void {
+  if (idempotencyCleanupInterval !== undefined) {
+    clearInterval(idempotencyCleanupInterval);
+    idempotencyCleanupInterval = undefined;
+  }
+}
+
+function startBackgroundMaintenance(): void {
+  if (!isAuthorityWorkerData(workerData)) return;
+  // Direct Vitest worker fixtures intentionally use tiny epoch-relative clocks. They omit the
+  // required production recovery policy and therefore must not compare those receipts with the
+  // host wall clock. Every production worker has sharedAuthorityRecovery and starts maintenance.
+  if (workerData.testOnlyAllowMissingSharedAuthorityRecovery === true) return;
+  startIdempotencyCleanup();
+  startDeploymentProfileOutbox();
+}
 
 function respond(response: AuthorityWorkerResponse): void {
   authorityPort.postMessage(response);
@@ -449,6 +594,9 @@ function initialize(request: AuthorityWorkerRequest): void {
       database = openAuthorityDatabase();
     }
     workerInitialized = true;
+    // Do not create an empty authority file here: legacy import owns activation. Maintenance starts
+    // as soon as an existing, imported, or first-command database is actually opened.
+    if (database !== undefined) startBackgroundMaintenance();
     respond({
       type: "authority.ready",
       requestId: request.requestId,
@@ -520,6 +668,7 @@ async function importLegacy(request: AuthorityWorkerRequest): Promise<void> {
   try {
     if (database !== undefined || existsSync(workerData.databasePath)) {
       database ??= openAuthorityDatabase();
+      startBackgroundMaintenance();
       const existing = replayLegacyImport(database);
       respond({
         type: "authority.legacy-imported",
@@ -536,6 +685,7 @@ async function importLegacy(request: AuthorityWorkerRequest): Promise<void> {
       messageFilePath: request.messageFilePath,
     });
     database = openAuthorityDatabase();
+    startBackgroundMaintenance();
     respond({
       type: "authority.legacy-imported",
       requestId: request.requestId,
@@ -585,6 +735,7 @@ function requireAuthorityDatabase(): DatabaseSync {
     );
   }
   database ??= openAuthorityDatabase();
+  startBackgroundMaintenance();
   return database;
 }
 
@@ -616,6 +767,8 @@ function poisonAuthorityStorage(requestId: string): void {
   const poisonedDatabase = database;
   database = undefined;
   workerClosed = true;
+  stopIdempotencyCleanup();
+  stopDeploymentProfileOutbox();
   requests.length = 0;
   if (poisonedDatabase !== undefined) {
     try {
@@ -889,6 +1042,7 @@ function issueSession(request: AuthorityWorkerRequest): void {
           publicSessionId: request.input.publicSessionId,
           accountId: request.input.accountId,
           actorId: request.input.actorId,
+          deviceId: request.input.device.id,
           accessExpiresAt: request.input.accessExpiresAt,
           refreshExpiresAt: request.input.refreshExpiresAt,
         },
@@ -945,6 +1099,7 @@ function authenticateSession(request: AuthorityWorkerRequest): void {
            session.family_id AS familyId,
            session.account_id AS accountId,
            session.actor_id AS actorId,
+           family.device_id AS deviceId,
            session.access_expires_at AS accessExpiresAt,
            session.revoked_at AS revokedAt,
            family.revoked_at AS familyRevokedAt,
@@ -992,7 +1147,8 @@ function authenticateSession(request: AuthorityWorkerRequest): void {
       typeof session.sessionId !== "string" ||
       typeof session.familyId !== "string" ||
       typeof session.accountId !== "string" ||
-      typeof session.actorId !== "string"
+      typeof session.actorId !== "string" ||
+      typeof session.deviceId !== "string"
     ) {
       throw new Error("session_corrupt");
     }
@@ -1002,6 +1158,7 @@ function authenticateSession(request: AuthorityWorkerRequest): void {
       context: {
         sessionId: session.sessionId,
         sessionFamilyId: session.familyId,
+        deviceId: session.deviceId,
         principal: {
           accountId: session.accountId,
           actorId: session.actorId,
@@ -1024,6 +1181,7 @@ interface SessionAuthorityRow {
   readonly publicSessionId: string;
   readonly accountId: string;
   readonly actorId: string;
+  readonly deviceId?: string;
   readonly accessExpiresAt: number;
   readonly refreshExpiresAt: number;
   readonly revokedAt: number | null;
@@ -1083,6 +1241,7 @@ function readSessionByRefreshHash(
          family.public_id AS publicSessionId,
          session.account_id AS accountId,
          session.actor_id AS actorId,
+         family.device_id AS deviceId,
          session.access_expires_at AS accessExpiresAt,
          session.refresh_expires_at AS refreshExpiresAt,
          session.revoked_at AS revokedAt,
@@ -1104,6 +1263,7 @@ function readSessionByRefreshHash(
     typeof row.publicSessionId !== "string" ||
     typeof row.accountId !== "string" ||
     typeof row.actorId !== "string" ||
+    typeof row.deviceId !== "string" ||
     typeof row.accessExpiresAt !== "number" ||
     typeof row.refreshExpiresAt !== "number" ||
     (row.revokedAt !== null && typeof row.revokedAt !== "number") ||
@@ -1405,6 +1565,7 @@ function rotateSession(request: AuthorityWorkerRequest): void {
           publicSessionId: current.publicSessionId,
           accountId: current.accountId,
           actorId: current.actorId,
+          ...(current.deviceId === undefined ? {} : { deviceId: current.deviceId }),
           accessExpiresAt: request.input.accessExpiresAt,
           refreshExpiresAt: request.input.refreshExpiresAt,
         },
@@ -2805,6 +2966,30 @@ function markOutboxFailed(request: AuthorityWorkerRequest): void {
   }
 }
 
+function scheduleOutboxRetry(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.outbox-schedule-retry") {
+    throw new TypeError("scheduleOutboxRetry received the wrong request type");
+  }
+  try {
+    scheduleOutboxRetryDatabaseCommand(requireAuthorityTransactionDatabase(), request);
+    respond({ type: "authority.outbox-updated", requestId: request.requestId });
+  } catch (error: unknown) {
+    respondWithStorageFailure(request.requestId, error, "Authority outbox retry update failed");
+  }
+}
+
+function deadLetterOutbox(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.outbox-dead-letter") {
+    throw new TypeError("deadLetterOutbox received the wrong request type");
+  }
+  try {
+    deadLetterOutboxDatabaseCommand(requireAuthorityTransactionDatabase(), request);
+    respond({ type: "authority.outbox-updated", requestId: request.requestId });
+  } catch (error: unknown) {
+    respondWithStorageFailure(request.requestId, error, "Authority outbox dead-letter update failed");
+  }
+}
+
 function listRoomCacheInvalidations(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.room-cache-invalidation-list") {
     throw new TypeError("listRoomCacheInvalidations received the wrong request type");
@@ -2861,8 +3046,7 @@ function markRoomCacheInvalidationFailed(request: AuthorityWorkerRequest): void 
   try {
     markRoomCacheInvalidationFailedDatabaseCommand(
       requireAuthorityTransactionDatabase(),
-      request.invalidationIntentId,
-      request.errorCode,
+      request,
     );
     respond({
       type: "authority.room-cache-invalidation-updated",
@@ -2874,6 +3058,35 @@ function markRoomCacheInvalidationFailed(request: AuthorityWorkerRequest): void 
       error,
       "Authority room cache invalidation update failed",
     );
+  }
+}
+
+function issueOfflineReadLease(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.offline-read-lease-issue") {
+    throw new TypeError("issueOfflineReadLease received the wrong request type");
+  }
+  if (offlineReadLeaseIssuer === undefined) {
+    respondWithError(
+      request.requestId,
+      "dependency_unavailable",
+      "Offline read lease signing authority is unavailable",
+    );
+    return;
+  }
+  try {
+    const lease = issueOfflineReadLeaseDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      offlineReadLeaseIssuer,
+      request.context,
+      { roomId: request.roomId, requestedLeaseMs: request.requestedLeaseMs, now: request.now },
+    );
+    respond({ type: "authority.offline-read-lease-issued", requestId: request.requestId, lease });
+  } catch (error: unknown) {
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithStorageFailure(request.requestId, error, "Offline read lease issue failed");
   }
 }
 
@@ -2977,6 +3190,8 @@ function closeAuthority(request: AuthorityWorkerRequest): void {
 
   try {
     repairs.releaseAll();
+    stopIdempotencyCleanup();
+    stopDeploymentProfileOutbox();
     if (database !== undefined) {
       database.close();
       database = undefined;
@@ -3130,6 +3345,12 @@ async function dispatch(value: unknown): Promise<void> {
     case "authority.outbox-failed":
       markOutboxFailed(value);
       return;
+    case "authority.outbox-schedule-retry":
+      scheduleOutboxRetry(value);
+      return;
+    case "authority.outbox-dead-letter":
+      deadLetterOutbox(value);
+      return;
     case "authority.room-cache-invalidation-list":
       listRoomCacheInvalidations(value);
       return;
@@ -3138,6 +3359,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.room-cache-invalidation-failed":
       markRoomCacheInvalidationFailed(value);
+      return;
+    case "authority.offline-read-lease-issue":
+      issueOfflineReadLease(value);
       return;
     case "authority.sync-room":
       syncRoom(value);

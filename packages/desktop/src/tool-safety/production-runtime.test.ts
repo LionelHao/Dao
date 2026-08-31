@@ -51,7 +51,9 @@ describe("Tool Safety production bridge", () => {
       onConnectionFailure: () => () => undefined,
     } as unknown as MessageAuthorityWireTransport;
     const repairRoom = vi.fn(async () => {
-      records = [call, { ...pending, value: { ...pending.value, state: "confirmed" as const, version: 2 } }];
+      if (commands.length > 0) {
+        records = [call, { ...pending, value: { ...pending.value, state: "confirmed" as const, version: 2 } }];
+      }
       for (const listener of cacheListeners) listener("room-1", records as readonly never[]);
     });
     const runtime = createDesktopToolSafetyRuntime({
@@ -101,7 +103,7 @@ describe("Tool Safety production bridge", () => {
       type: "tool.confirmation.decide", requestId: "tool-request-1", confirmationId: "confirmation-1",
       expectedVersion: 1, decision: "confirm",
     }]);
-    expect(repairRoom).toHaveBeenCalledOnce();
+    expect(repairRoom).toHaveBeenCalledTimes(2);
     expect(root.textContent).not.toContain("工具结果已知成功");
 
     records = [...records, { kind: "tool-dispatch", value: { dispatchId: "dispatch-1", toolCallId: "call-1",
@@ -121,6 +123,7 @@ describe("Tool Safety production bridge", () => {
     const command = vi.fn();
     const cache = { roomRepairRecords: () => [call, pending],
       governanceProjection: () => ({ lifecycle: "active" }), roomIds: () => ["room-1"],
+      isOfflineReadAuthorized: () => true,
       subscribeRoomRecords: () => () => undefined, clear: vi.fn(), clearRoom: vi.fn() } as unknown as DesktopAuthorityCache;
     const transport = { toolSafetyCommand: command, onTerminalRevoked: () => () => undefined,
       onRoomAccessChanged: () => () => undefined,
@@ -138,6 +141,63 @@ describe("Tool Safety production bridge", () => {
     expect(failed.operation).toMatchObject({ status: "error", statusCode: 503 });
     expect(failed.cards).toHaveLength(1);
     expect(failed.cards[0]?.safeTarget).toBe("notes/release.txt");
+    runtime.close();
+  });
+
+  it("repairs instead of presenting legacy confirmation-required cache notifications", async () => {
+    let cacheListener: ((roomId: string) => void) | undefined;
+    let repairRequired = true;
+    const cache = {
+      roomRepairRecords: () => repairRequired ? [] : [call, pending],
+      governanceProjection: () => ({ lifecycle: "active" }), roomIds: () => ["room-1"],
+      toolSafetyRepairRequired: () => repairRequired,
+      subscribeRoomRecords(listener: (roomId: string) => void) {
+        cacheListener = listener;
+        return () => { cacheListener = undefined; };
+      },
+      clear: vi.fn(), clearRoom: vi.fn(),
+    } as unknown as DesktopAuthorityCache;
+    const repairRoom = vi.fn(async () => { repairRequired = false; });
+    const runtime = createDesktopToolSafetyRuntime({
+      session: () => ({ actorId: "human-1" }) as never,
+      transport: { toolSafetyCommand: vi.fn(), onTerminalRevoked: () => () => undefined,
+        onRoomAccessChanged: () => () => undefined,
+        onConnectionFailure: () => () => undefined } as unknown as MessageAuthorityWireTransport,
+      authorityCache: cache, repairRoom, createRequestId: () => "request-repair-legacy",
+    });
+    runtime.start();
+    cacheListener?.("room-1");
+    await vi.waitFor(() => expect(repairRoom).toHaveBeenCalledOnce());
+    await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      connection: { status: "online" },
+      cards: [expect.objectContaining({ confirmationId: "confirmation-1" })],
+    });
+    runtime.close();
+  });
+
+  it("hides cached Tool Safety cards offline without a verified read capability", async () => {
+    let failure: (() => void) | undefined;
+    const cache = { roomRepairRecords: () => [call, pending],
+      governanceProjection: () => ({ lifecycle: "active" }), roomIds: () => ["room-1"],
+      isOfflineReadAuthorized: () => false,
+      subscribeRoomRecords: () => () => undefined, clear: vi.fn(), clearRoom: vi.fn() } as unknown as DesktopAuthorityCache;
+    const command = vi.fn();
+    const transport = { toolSafetyCommand: command, onTerminalRevoked: () => () => undefined,
+      onRoomAccessChanged: () => () => undefined,
+      onConnectionFailure(listener: () => void) { failure = listener; return () => undefined; } } as unknown as MessageAuthorityWireTransport;
+    const runtime = createDesktopToolSafetyRuntime({ session: () => ({ actorId: "human-1" }) as never,
+      transport, authorityCache: cache, repairRoom: async () => undefined,
+      createRequestId: () => "request-locked" });
+    runtime.start();
+    await runtime.getSurface({ roomId: "room-1" });
+    failure?.();
+    const state = await runtime.submit({ roomId: "room-1", command: {
+      type: "tool.confirmation.decide", confirmationId: "confirmation-1",
+      expectedVersion: 1, decision: "confirm",
+    } });
+    expect(state.connection.status).toBe("offline");
+    expect(state.cards).toEqual([]);
+    expect(command).not.toHaveBeenCalled();
     runtime.close();
   });
 
@@ -187,17 +247,20 @@ describe("Tool Safety production bridge", () => {
   it("maps principal revoke, parameter changes, and duplicate 409 without treating permission_denied as Room revoke", async () => {
     let records: readonly unknown[] = [call, pending];
     let mode: "principal" | "params" | "duplicate" = "principal";
+    let commandAttempted = false;
     const clearRoom = vi.fn();
     const cache = { roomRepairRecords: () => records,
       governanceProjection: () => ({ lifecycle: "active" }), roomIds: () => ["room-1"],
       subscribeRoomRecords: () => () => undefined, clear: vi.fn(), clearRoom } as unknown as DesktopAuthorityCache;
     const transport = { async toolSafetyCommand() {
+      commandAttempted = true;
       const error = mode === "principal" ? { status: 403 as const, code: "permission_denied" }
         : { status: 409 as const, code: mode === "params" ? "tool_parameters_changed" : "tool_already_terminal" };
       throw new MessageAuthorityTransportError("protocol_error", undefined, undefined, undefined, undefined, error);
     }, onTerminalRevoked: () => () => undefined, onRoomAccessChanged: () => () => undefined,
     onConnectionFailure: () => () => undefined } as unknown as MessageAuthorityWireTransport;
     const repairRoom = vi.fn(async () => {
+      if (!commandAttempted) return;
       if (mode === "principal") records = [call, { ...pending, value: { ...pending.value,
         state: "rejected" as const, reasonCode: "principal_revoked", version: 2 } }];
       if (mode === "params") records = [call, { ...pending, value: { ...pending.value,
@@ -206,6 +269,7 @@ describe("Tool Safety production bridge", () => {
     const runtime = createDesktopToolSafetyRuntime({ session: () => ({ actorId: "human-1" }) as never,
       transport, authorityCache: cache, repairRoom, createRequestId: () => `request-${mode}` });
     runtime.start();
+    await runtime.getSurface({ roomId: "room-1" });
     const submit = () => runtime.submit({ roomId: "room-1", command: { type: "tool.confirmation.decide" as const,
       confirmationId: "confirmation-1", expectedVersion: 1, decision: "confirm" as const } });
     expect((await submit()).cards[0]?.state).toBe("principal-revoked");

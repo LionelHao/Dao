@@ -254,6 +254,7 @@ export type RoomRepairRecord =
   | { readonly kind: "room"; readonly value: Omit<ManagedRoom, "members"> }
   | { readonly kind: "governance"; readonly value: RoomGovernanceView }
   | { readonly kind: "membership"; readonly value: HumanRoomMembership | AgentRoomMembership }
+  | { readonly kind: "room-agent-assignment"; readonly value: RoomAgentAssignmentProjection }
   | { readonly kind: "message"; readonly value: Message }
   | { readonly kind: "human-read"; readonly value: HumanReadReceipt }
   | { readonly kind: "agent-judgement"; readonly value: AgentJudgement }
@@ -762,6 +763,9 @@ function isRepairRecord(value: unknown, expectedRoomId?: string): value is RoomR
   if (value.kind === "room") return isRoomMetadata(value.value);
   if (value.kind === "governance") return isRoomGovernanceView(value.value);
   if (value.kind === "membership") return isHumanMembershipValue(value.value) || isAgentMembershipValue(value.value);
+  if (value.kind === "room-agent-assignment") {
+    return isRoomAgentAssignmentProjection(value.value, expectedRoomId);
+  }
   return value.kind === "message" && isMessageValue(value.value);
 }
 

@@ -26,6 +26,7 @@ type ProjectAuthorityCache = Readonly<{
   ) => void): () => void;
   clearRoom(roomId: string): void;
   clear(): void;
+  isOfflineReadAuthorized(roomId: string, nowMs?: number): boolean;
 }>;
 
 export interface DesktopProjectLoopRuntime {
@@ -138,7 +139,10 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
     options.authorityCache.clear();
   };
 
-  const readCachedSnapshot = (state: RoomState): ProjectLoopRemoteState => {
+  const readCachedSnapshot = (
+    state: RoomState,
+    source: "online" | "cache" = "cache",
+  ): ProjectLoopRemoteState => {
     const records = options.authorityCache.roomRepairRecords(state.roomId);
     const record = records?.find(
       (candidate): candidate is Extract<RoomRepairRecord, { kind: "project-loop" }> =>
@@ -153,7 +157,11 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
     }
     state.remote = {
       status: "ready", roomId: state.roomId, snapshot, viewerActorId: session.actorId,
-      connection: { status: "online" },
+      connection: source === "online"
+        ? { status: "online" }
+        : options.authorityCache.isOfflineReadAuthorized(state.roomId, Date.parse(now()))
+          ? { status: "offline", asOf: now() }
+          : { status: "repairing" },
       operation: records?.some((candidate) => candidate.kind === "room" &&
         candidate.value.id === state.roomId && candidate.value.status === "archived")
         ? { status: "failed", intentId: `lifecycle:${state.roomId}`,
@@ -191,7 +199,7 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
       if (!stillAuthorized()) return discardLateRepair();
       await options.repairRoom(state.roomId);
       if (!stillAuthorized()) return discardLateRepair();
-      return readCachedSnapshot(state);
+      return readCachedSnapshot(state, "online");
     })().catch((error: unknown) => {
       if (!stillAuthorized()) return discardLateRepair();
       const normalized = errorStatus(error);
@@ -201,6 +209,10 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
       else if (normalized.status === 410 && normalized.code !== "room_archived") {
         revokeRoom(state, normalized.code);
       } else if (state.remote.status === "ready") {
+        if (!options.authorityCache.isOfflineReadAuthorized(state.roomId, Date.parse(now()))) {
+          lock(state, 503, "offline_lease_required");
+          return state.remote;
+        }
         state.remote = { ...state.remote,
           connection: source === "repair"
             ? { status: "repair_failed", code: normalized.code }
@@ -210,6 +222,9 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
         publish(state);
       } else {
         try {
+          if (!options.authorityCache.isOfflineReadAuthorized(state.roomId, Date.parse(now()))) {
+            throw new TypeError("Offline read lease is unavailable");
+          }
           const cached = readCachedSnapshot(state);
           if (cached.status === "ready") {
             state.remote = { ...cached, connection: { status: "offline", asOf: now() } };
@@ -401,8 +416,12 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
   const stopFailure = options.transport.onConnectionFailure(() => {
     for (const state of rooms.values()) {
       if (state.remote.status === "ready") {
-        state.remote = { ...state.remote, connection: { status: "offline", asOf: now() } };
-        publish(state);
+        if (options.authorityCache.isOfflineReadAuthorized(state.roomId, Date.parse(now()))) {
+          state.remote = { ...state.remote, connection: { status: "offline", asOf: now() } };
+          publish(state);
+        } else {
+          lock(state, 503, "offline_lease_required");
+        }
       }
     }
   });

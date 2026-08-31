@@ -120,12 +120,18 @@ export function createInvocationController(options: {
   const operations = new Map<string, InvocationOperationState>();
   const operationRooms = new Map<string, string>();
   let closed = false;
-  const state = (roomId: string): InvocationSurfaceState => recordsState(
-    roomId,
-    options.cache.roomRepairRecords(roomId),
-    connections.get(roomId) ?? { status: "repairing" },
-    operations,
-  );
+  const state = (roomId: string): InvocationSurfaceState => {
+    const connection = connections.get(roomId) ?? { status: "repairing" as const };
+    const offlineAuthorized = options.cache.isOfflineReadAuthorized(roomId);
+    const mayRead = connection.status === "online" ||
+      ((connection.status === "offline" || connection.status === "repair_failed") && offlineAuthorized);
+    return recordsState(
+      roomId,
+      mayRead ? options.cache.roomRepairRecords(roomId) : undefined,
+      connection,
+      operations,
+    );
+  };
   const publish = (roomId: string): void => {
     const envelope = { roomId, state: state(roomId) };
     for (const listener of [...listeners]) {
@@ -152,7 +158,12 @@ export function createInvocationController(options: {
         operations.delete(executionId); operationRooms.delete(executionId);
       }
     }
-    connections.set(roomId, { status: "online" });
+    const prior = connections.get(roomId);
+    if (prior?.status !== "online") {
+      connections.set(roomId, options.cache.isOfflineReadAuthorized(roomId)
+        ? { status: "offline", asOf: now() }
+        : { status: "repairing" });
+    }
     publish(roomId);
   };
   const unsubscribeCache = options.cache.subscribeRoomRecords(reconcile);

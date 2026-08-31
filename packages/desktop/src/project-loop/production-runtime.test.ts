@@ -13,6 +13,7 @@ function createCacheHarness(snapshots: readonly ProjectSnapshot[]) {
   const listeners = new Set<RecordsListener>();
   const records = new Map<string, readonly RoomRepairRecord[]>();
   let repairCount = 0;
+  let offlineAuthorized = true;
   const publish = (roomId: string) => {
     for (const listener of listeners) listener(roomId, records.get(roomId));
   };
@@ -28,6 +29,7 @@ function createCacheHarness(snapshots: readonly ProjectSnapshot[]) {
         const roomIds = [...records.keys()]; records.clear();
         for (const roomId of roomIds) publish(roomId);
       },
+      isOfflineReadAuthorized: () => offlineAuthorized,
     },
     async repairRoom(roomId: string) {
       const snapshot = snapshots[Math.min(repairCount, snapshots.length - 1)];
@@ -43,6 +45,7 @@ function createCacheHarness(snapshots: readonly ProjectSnapshot[]) {
     },
     seedRecords(roomId: string, value: readonly RoomRepairRecord[]) { records.set(roomId, value); publish(roomId); },
     get repairCount() { return repairCount; },
+    setOfflineAuthorized(value: boolean) { offlineAuthorized = value; },
   };
 }
 
@@ -156,6 +159,22 @@ describe("FT-09 Desktop Project Loop production runtime", () => {
     await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
       status: "ready", snapshot: { watermark: 7 }, connection: { status: "offline",
         asOf: "2026-08-25T05:00:00.000Z" },
+    });
+    runtime.close();
+  });
+
+  it("locks a restored Project snapshot when no signed offline capability is active", async () => {
+    const wire = createTransport(async () => { throw new Error("unexpected mutation"); });
+    const cache = createCacheHarness([]);
+    cache.seed("room-1", projectSnapshot());
+    cache.setOfflineAuthorized(false);
+    const runtime = createDesktopProjectLoopRuntime({ session, transport: wire.transport,
+      authorityCache: cache.cache, repairRoom: async () => { throw new Error("offline"); },
+      restoreAuthorityCache: async () => true,
+      createRequestIdentity: () => ({ requestId: "request-locked", idempotencyKey: "idem-locked" }),
+      now: () => "2026-08-25T05:00:00.000Z" });
+    await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "locked", error: { status: 503, code: "project_dependency_unavailable" },
     });
     runtime.close();
   });
@@ -612,7 +631,8 @@ describe("FT-09 Desktop Project Loop production runtime", () => {
       status: "active", createdAt: "2026-08-25T01:00:00.000Z" } },
     { kind: "project-loop", roomId: "room-1", value: projectSnapshot({ watermark: 9 }) }]);
     await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
-      status: "ready", snapshot: { watermark: 9 }, operation: { status: "idle" },
+      status: "ready", snapshot: { watermark: 9 }, connection: { status: "repair_failed" },
+      operation: { status: "failed", error: { status: 503 } },
     });
     repairEnabled = true;
     cache.clear("room-1");

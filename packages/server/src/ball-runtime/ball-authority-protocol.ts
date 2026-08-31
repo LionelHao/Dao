@@ -65,8 +65,10 @@ const tokenHash = (value: unknown): value is string => {
   return decoded.byteLength === 32 && decoded.toString("base64url") === value;
 };
 const sessionContext = (value: unknown): value is AuthenticatedSessionContext =>
-  record(value) && exact(value, ["sessionId", "sessionFamilyId", "principal"]) &&
+  record(value) && exact(value, ["sessionId", "sessionFamilyId", "principal",
+    ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : [])]) &&
   tokenHash(value.sessionId) && tokenHash(value.sessionFamilyId) && record(value.principal) &&
+  (!Object.hasOwn(value, "deviceId") || text(value.deviceId)) &&
   exact(value.principal, ["accountId", "actorId"]) && text(value.principal.accountId) &&
   text(value.principal.actorId);
 

@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { generateKeyPairSync } from "node:crypto";
 import { AUTHORITY_PARTICIPANT_FEATURES } from "./room-governance/private-participant-contracts.js";
 import {
   assertAgentRuntimeModelContextCapability,
@@ -45,10 +46,19 @@ describe("production shared-authority participant composition", () => {
     const closedStages: string[] = [];
     let rejectRuntimeStage = true;
     try {
+      const leaseKeys = generateKeyPairSync("ed25519");
       const server = await startAuthoritativeServerForTest({
         databasePath: join(directory, "authority.sqlite"),
         snapshotCachePath: join(directory, "snapshot-cache.sqlite"),
-        sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
+        sharedAuthority: {
+          maxOfflineReadLeaseMs: 60_000,
+          offlineReadLeaseSigning: {
+            tenantId: "test-tenant",
+            serverSubject: "test-server",
+            keyId: "test-key-1",
+            privateKey: leaseKeys.privateKey,
+          },
+        },
         listen: { host: "127.0.0.1", port: 0 },
         actors: [
           { id: "human-a", kind: "human", displayName: "Human A", reachability: "online" },

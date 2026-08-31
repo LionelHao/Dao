@@ -99,7 +99,7 @@ export interface RoomAssignmentRepository {
   readAssignment(roomId: string, assignmentId: string): SqliteAssignmentRecord | undefined;
   readCurrentAssignmentForActor(roomId: string, actorId: string): SqliteAssignmentRecord | undefined;
   listAssignments(roomId: string): readonly SqliteAssignmentRecord[];
-  readReceipt(scope: string, key: string): AssignmentIdempotencyReceipt | undefined;
+  readReceipt(scope: string, key: string, now: number): AssignmentIdempotencyReceipt | undefined;
   insertReceipt(input: Readonly<{
     scope: string;
     key: string;
@@ -336,12 +336,21 @@ function createRepository(database: DatabaseSync): RoomAssignmentRepository {
          AND assignment.status = 'current' ORDER BY assignment.id`,
       ).all(roomId) as unknown as UnknownRow[]).map((row) => assignment(row)!));
     },
-    readReceipt(scope, key) {
+    readReceipt(scope, key, now) {
+      if (!Number.isSafeInteger(now) || now < 0) {
+        throw new TypeError("Room Assignment idempotency clock is invalid");
+      }
+      const nowIso = new Date(now).toISOString();
+      database.prepare(
+        `DELETE FROM idempotency_records
+         WHERE scope = ? AND key = ? AND expires_at <= ?`,
+      ).run(scope, key, nowIso);
       const row = database.prepare(
         `SELECT request_hash AS requestHash, response_json AS responseJson,
                 status_code AS statusCode
-         FROM idempotency_records WHERE scope = ? AND key = ?`,
-      ).get(scope, key) as UnknownRow | undefined;
+         FROM idempotency_records
+         WHERE scope = ? AND key = ? AND expires_at > ?`,
+      ).get(scope, key, nowIso) as UnknownRow | undefined;
       if (row === undefined) return undefined;
       if (!text(row.requestHash) || !text(row.responseJson) || !nonnegative(row.statusCode)) {
         throw new Error("Room Assignment idempotency receipt is corrupt");

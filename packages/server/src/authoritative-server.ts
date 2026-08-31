@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, generateKeyPairSync, type KeyObject } from "node:crypto";
 import {
   ATTACHMENT_AUTHORITY_LIMITS,
   CONTEXT_COMPILER_LIMITS,
@@ -113,6 +113,106 @@ export interface AuthoritativeServer {
   close(): Promise<void>;
 }
 
+export class DetachedRecoveryTerminalError extends Error {
+  readonly code = "detached_recovery_shutdown_failed";
+  readonly state = "closed";
+
+  constructor(
+    readonly family: string,
+    readonly reason: "active_batch_failed" | "shutdown_timeout",
+    readonly terminalCause?: unknown,
+  ) {
+    super(`Detached ${family} recovery closed with ${reason}`);
+    this.name = "DetachedRecoveryTerminalError";
+  }
+}
+
+export interface BoundedDetachedRecovery {
+  kick(): Promise<void>;
+  start(): void;
+  close(): Promise<void>;
+}
+
+/**
+ * Owns a detached post-commit batch so shutdown cannot close its backing worker
+ * while the batch is still using it. Once close begins no new batch is accepted.
+ */
+export function createBoundedDetachedRecovery(options: Readonly<{
+  family: string;
+  intervalMs: number;
+  shutdownTimeoutMs: number;
+  runBatch: () => Promise<void>;
+  onBackgroundFailure: (error: unknown) => void;
+}>): BoundedDetachedRecovery {
+  if (!Number.isSafeInteger(options.intervalMs) || options.intervalMs <= 0 ||
+      !Number.isSafeInteger(options.shutdownTimeoutMs) || options.shutdownTimeoutMs <= 0) {
+    throw new TypeError("Detached recovery timing limits must be positive safe integers");
+  }
+  let accepting = true;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let active: Promise<void> | undefined;
+  let closePromise: Promise<void> | undefined;
+
+  const kick = (): Promise<void> => {
+    if (!accepting) return Promise.resolve();
+    if (active !== undefined) return active;
+    const attempt = Promise.resolve().then(options.runBatch);
+    const tracked = attempt.finally(() => {
+      if (active === tracked) active = undefined;
+    });
+    active = tracked;
+    return tracked;
+  };
+
+  const stop = (): void => {
+    accepting = false;
+    if (timer !== undefined) {
+      clearInterval(timer);
+      timer = undefined;
+    }
+  };
+
+  return Object.freeze({
+    kick,
+    start() {
+      if (!accepting || timer !== undefined) return;
+      timer = setInterval(() => {
+        void kick().catch(options.onBackgroundFailure);
+      }, options.intervalMs);
+      timer.unref();
+    },
+    close() {
+      if (closePromise !== undefined) return closePromise;
+      stop();
+      const draining = active;
+      closePromise = draining === undefined
+        ? Promise.resolve()
+        : new Promise<void>((resolveClose, rejectClose) => {
+            const timeout = setTimeout(() => rejectClose(new DetachedRecoveryTerminalError(
+              options.family,
+              "shutdown_timeout",
+            )), options.shutdownTimeoutMs);
+            timeout.unref();
+            void draining.then(
+              () => {
+                clearTimeout(timeout);
+                resolveClose();
+              },
+              (error: unknown) => {
+                clearTimeout(timeout);
+                rejectClose(new DetachedRecoveryTerminalError(
+                  options.family,
+                  "active_batch_failed",
+                  error,
+                ));
+              },
+            );
+          });
+      return closePromise;
+    },
+  });
+}
+
 export interface StartAuthoritativeServerOptions {
   readonly databasePath: string;
   readonly snapshotCachePath: string;
@@ -130,6 +230,12 @@ export interface StartAuthoritativeServerOptions {
   readonly invitationSecretKey: Uint8Array;
   readonly sharedAuthority: {
     readonly maxOfflineReadLeaseMs: number;
+    readonly offlineReadLeaseSigning?: {
+      readonly tenantId: string;
+      readonly serverSubject: string;
+      readonly keyId: string;
+      readonly privateKey: KeyObject;
+    };
   };
   /**
    * Owner-controlled deployment bootstrap. The first successful startup seals
@@ -184,6 +290,7 @@ interface AuthoritativeServerTestOptions {
   readonly initialize?: (facades: AuthoritativeServerTestFacades) => Promise<void>;
   readonly registerMissingActors?: false;
   readonly afterCloseForTest?: Partial<Record<
+    | "cache-invalidation-recovery"
     | "transport"
     | "attachment-authority"
     | "attachment-processing"
@@ -200,6 +307,7 @@ interface AuthoritativeServerTestOptions {
   readonly agentRuntimeProviderForTest?: ProviderAdapter;
   /** Test-only cross-platform seam; production startup remains descriptor fail-closed. */
   readonly toolAdapterPathFallbackForTest?: true;
+  readonly cacheInvalidationShutdownTimeoutMs?: number;
 }
 
 export interface AuthoritativeServerTestFacades {
@@ -242,7 +350,7 @@ export function assertAgentRuntimeModelContextCapability(input: Readonly<{
 export function startAuthoritativeServer(
   options: StartAuthoritativeServerOptions,
 ): Promise<AuthoritativeServer> {
-  return start(options, {});
+  return start(options, {}, false);
 }
 
 /** Deep-import-only constructor for the compiled child-process harness. */
@@ -250,13 +358,28 @@ export function startAuthoritativeServerForTest(
   options: StartAuthoritativeServerOptions,
   testOptions: AuthoritativeServerTestOptions,
 ): Promise<AuthoritativeServer> {
-  return start(options, testOptions);
+  return start(options, testOptions, true);
 }
 
 async function start(
   options: StartAuthoritativeServerOptions,
   testOptions: AuthoritativeServerTestOptions,
+  testOnlyAllowEphemeralOfflineLeaseSigning: boolean,
 ): Promise<AuthoritativeServer> {
+  const ephemeralLeaseKey = options.sharedAuthority.offlineReadLeaseSigning === undefined &&
+      testOnlyAllowEphemeralOfflineLeaseSigning
+    ? generateKeyPairSync("ed25519").privateKey
+    : undefined;
+  const offlineReadLeaseSigning = options.sharedAuthority.offlineReadLeaseSigning ??
+    (ephemeralLeaseKey === undefined ? undefined : {
+      tenantId: "dao-test-tenant",
+      serverSubject: "dao-test-authority",
+      keyId: "dao-test-ephemeral-key",
+      privateKey: ephemeralLeaseKey,
+    });
+  if (offlineReadLeaseSigning === undefined) {
+    throw new TypeError("offlineReadLeaseSigning is required for production composition");
+  }
   const runtimeModel = options.agentRuntime?.model ?? "gpt-5-mini";
   assertAgentRuntimeModelContextCapability({
     model: runtimeModel,
@@ -304,7 +427,7 @@ async function start(
   let sourceScopedRuntimeBoundary: SourceScopedRuntimeBoundary | undefined;
   let routeRuntime: RouteRuntimeService | undefined;
   let ballRuntime: BallRuntimeService | undefined;
-  let stopCacheInvalidationRecovery: (() => void) | undefined;
+  let cacheInvalidationRecovery: BoundedDetachedRecovery | undefined;
   let attachmentAuthority: AttachmentAuthorityCommandPort | undefined;
   let attachmentProcessing: AttachmentProcessingRuntime | undefined;
   let stopAttachmentRecovery: (() => void) | undefined;
@@ -332,6 +455,7 @@ async function start(
             maxOfflineReadLeaseMs: options.sharedAuthority.maxOfflineReadLeaseMs,
           },
           deploymentProviderDisclosure,
+          offlineReadLeaseSigning,
         })
       : await createWorkerDatabaseClientWithTransactionFaultForTest(
           {
@@ -341,6 +465,7 @@ async function start(
               maxOfflineReadLeaseMs: options.sharedAuthority.maxOfflineReadLeaseMs,
             },
             deploymentProviderDisclosure,
+            offlineReadLeaseSigning,
           },
           transactionFault,
         );
@@ -409,6 +534,8 @@ async function start(
       cachePath: options.snapshotCachePath,
       revalidate: (request) => authority.revalidateSnapshot(request),
       streamingAuthority: worker,
+      deploymentProviderCredentialReadiness:
+        deploymentProviderDisclosure.credentialReadiness,
       ...(testOptions.snapshotCacheQuotaBytes === undefined &&
           testOptions.snapshotMaxRecordsPerPage === undefined
         ? {}
@@ -428,23 +555,30 @@ async function start(
       authority: createWorkerRoomCacheInvalidationIntentAuthority(worker),
       purge: snapshotClient,
       batchLimit: 64,
+      alertSink: {
+        emit(alert) {
+          process.stderr.write(`${JSON.stringify({ source: "authority-outbox", ...alert })}\n`);
+        },
+      },
     });
-    let cacheInvalidationDispatchRunning = false;
-    const dispatchCacheInvalidations = async (): Promise<void> => {
-      if (cacheInvalidationDispatchRunning) return;
-      cacheInvalidationDispatchRunning = true;
-      try {
+    cacheInvalidationRecovery = createBoundedDetachedRecovery({
+      family: "room-cache-invalidation",
+      intervalMs: 1_000,
+      shutdownTimeoutMs: testOptions.cacheInvalidationShutdownTimeoutMs ?? 5_000,
+      runBatch: async () => {
         await cacheInvalidationDispatcher.dispatchReadyBatch();
-      } finally {
-        cacheInvalidationDispatchRunning = false;
-      }
-    };
-    await dispatchCacheInvalidations();
-    const cacheInvalidationTimer = setInterval(() => {
-      void dispatchCacheInvalidations().catch(() => undefined);
-    }, 1_000);
-    cacheInvalidationTimer.unref();
-    stopCacheInvalidationRecovery = () => clearInterval(cacheInvalidationTimer);
+      },
+      onBackgroundFailure: () => {
+        process.stderr.write(`${JSON.stringify({
+          severity: "critical",
+          code: "outbox_dispatcher_failure",
+          family: "room-cache-invalidation",
+          reason: "storage_unavailable",
+        })}\n`);
+      },
+    });
+    await cacheInvalidationRecovery.kick();
+    cacheInvalidationRecovery.start();
     const materializedSnapshots = {
       async beginRoomRepair(...args: Parameters<typeof snapshotClient.beginRoomRepair>) {
         const result = await snapshotClient.beginRoomRepair(...args);
@@ -1160,6 +1294,23 @@ async function start(
       port: options.listen?.port ?? AUTHORITATIVE_SERVER_DEFAULT_PORT,
       outboxStore,
       outboxPollIntervalMs: 10,
+      outboxFailureLifecycle: {
+        scheduleRetry: (input) => authorityWorker.scheduleOutboxRetry(input),
+        deadLetter: (input) => authorityWorker.deadLetterOutbox(input),
+      },
+      outboxAlertSink: {
+        emit(alert) {
+          process.stderr.write(`${JSON.stringify({ source: "authority-outbox", ...alert })}\n`);
+        },
+      },
+      offlineReadLeaseAuthority: {
+        issue: (context, roomId) => authorityWorker.issueOfflineReadLease(
+          context,
+          roomId,
+          options.sharedAuthority.maxOfflineReadLeaseMs,
+          Date.now(),
+        ),
+      },
       agentRuntime: runtime,
       toolSafetyAuthority: publicToolSafetyAuthority,
       previewAuthority: {
@@ -1210,7 +1361,7 @@ async function start(
     });
   } catch (error: unknown) {
     settleAttachmentReader(undefined);
-    stopCacheInvalidationRecovery?.();
+    await cacheInvalidationRecovery?.close().catch(() => undefined);
     stopRuntimeRecovery?.();
     stopAttachmentRecovery?.();
     stopMemoryRecovery?.();
@@ -1234,13 +1385,13 @@ async function start(
     close() {
       if (closePromise !== undefined) return closePromise;
       const attempt = (async () => {
-        stopCacheInvalidationRecovery?.();
         stopRuntimeRecovery?.();
         stopAttachmentRecovery?.();
         stopMemoryRecovery?.();
         const failures: unknown[] = [];
         let runtimeSafetySettled = true;
         for (const [stage, close] of [
+          ["cache-invalidation-recovery", () => cacheInvalidationRecovery!.close()],
           ["transport", () => transport.close()],
           ["attachment-authority", async () => attachmentAuthority?.close()],
           ["attachment-processing", async () => attachmentProcessing?.close()],

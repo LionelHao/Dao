@@ -72,6 +72,8 @@ export interface IssuedSession {
   readonly sessionId: string;
   readonly accountId: string;
   readonly actorId: string;
+  readonly sessionFamilyId?: string;
+  readonly deviceId?: string;
   readonly accessToken: string;
   readonly refreshToken: string;
   readonly expiresAt: string;
@@ -625,6 +627,8 @@ export function createAuthenticationService(
         sessionId: nextPublicSessionId,
         accountId,
         actorId,
+        sessionFamilyId: record.familyId,
+        deviceId: record.deviceId ?? DEFAULT_SESSION_DEVICE.id,
         accessToken,
         refreshToken,
         expiresAt: new Date(accessExpiresAt).toISOString(),
@@ -708,8 +712,12 @@ export function createAuthenticationService(
           now,
         );
         try {
-          await options.authority.issue(authorityIssue.input);
-          return authorityIssue.issued;
+          const record = await options.authority.issue(authorityIssue.input);
+          return {
+            ...authorityIssue.issued,
+            sessionFamilyId: record.familyId,
+            deviceId: validatedDevice.id,
+          };
         } catch (error: unknown) {
           return translateAuthorityError(error);
         }
@@ -880,6 +888,8 @@ export function createAuthenticationService(
             sessionId: record.publicSessionId,
             accountId: record.accountId,
             actorId: record.actorId,
+            sessionFamilyId: record.familyId,
+            ...(record.deviceId === undefined ? {} : { deviceId: record.deviceId }),
             accessToken,
             refreshToken: nextRefreshToken,
             expiresAt: new Date(record.accessExpiresAt).toISOString(),

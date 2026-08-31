@@ -471,15 +471,19 @@ function count(value: unknown, minimum = 0): value is number {
 }
 
 function humanContext(value: unknown): value is AuthenticatedCommandContext {
-  if (!record(value) || !exact(value, ["kind", "sessionId", "sessionFamilyId", "principal", "requestId", "idempotencyKey"]) ||
+  if (!record(value) || !exact(value, ["kind", "sessionId", "sessionFamilyId", "principal", "requestId", "idempotencyKey",
+    ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : [])]) ||
       value.kind !== "human" || !text(value.sessionId) || !text(value.sessionFamilyId) || !text(value.requestId) || !text(value.idempotencyKey) ||
+      (Object.hasOwn(value, "deviceId") && !text(value.deviceId)) ||
       !record(value.principal) || !exact(value.principal, ["accountId", "actorId"]) || !text(value.principal.accountId) || !text(value.principal.actorId)) return false;
   return true;
 }
 
 function sessionContext(value: unknown): value is AuthenticatedSessionContext {
-  return record(value) && exact(value, ["sessionId", "sessionFamilyId", "principal"]) &&
+  return record(value) && exact(value, ["sessionId", "sessionFamilyId", "principal",
+    ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : [])]) &&
     text(value.sessionId) && text(value.sessionFamilyId) && record(value.principal) &&
+    (!Object.hasOwn(value, "deviceId") || text(value.deviceId)) &&
     exact(value.principal, ["accountId", "actorId"]) &&
     text(value.principal.accountId) && text(value.principal.actorId);
 }

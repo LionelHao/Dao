@@ -15,6 +15,8 @@ import type {
 import { TenantAdministrationError } from "./authority-service.js";
 import { commitInternalScopedProducerInTransaction } from
   "../agent-runtime/internal-scoped-producer-authority.js";
+import { IDEMPOTENCY_RECEIPT_TTL_MS } from
+  "../persistence/idempotency-lifecycle.js";
 
 export interface SqliteTenantAdministrationRepositoryOptions {
   readonly database: DatabaseSync;
@@ -42,7 +44,7 @@ interface ProfileRow {
   readonly updatedAt: unknown;
 }
 
-const DEFAULT_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
+const DEFAULT_IDEMPOTENCY_TTL_MS = IDEMPOTENCY_RECEIPT_TTL_MS;
 export const DEFAULT_PROFILE_ASSIGNMENT_FANOUT_LIMIT = 64;
 
 interface AssignmentFanoutTarget {
@@ -411,8 +413,8 @@ export function createSqliteTenantAdministrationRepository(
   const idempotencyTtlMs = options.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS;
   const profileAssignmentFanoutLimit = options.profileAssignmentFanoutLimit ??
     DEFAULT_PROFILE_ASSIGNMENT_FANOUT_LIMIT;
-  if (!Number.isSafeInteger(idempotencyTtlMs) || idempotencyTtlMs <= 0) {
-    throw new TypeError("deployment idempotency TTL must be positive");
+  if (idempotencyTtlMs !== IDEMPOTENCY_RECEIPT_TTL_MS) {
+    throw new TypeError("deployment idempotency TTL must be exactly 30 days");
   }
   if (!Number.isSafeInteger(profileAssignmentFanoutLimit) ||
       profileAssignmentFanoutLimit <= 0 || profileAssignmentFanoutLimit > 256) {

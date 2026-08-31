@@ -235,8 +235,10 @@ function wasDeploymentReplay(database: DatabaseSync, operation: TenantAdministra
     : operation.type === "agent-profile.enable" ? "profile.enable" : "profile.disable";
   return database.prepare(
     `SELECT 1 FROM deployment_idempotency_records
-     WHERE scope = ? AND idempotency_key = ? AND principal_actor_id = ?`,
-  ).get(scope, operation.context.idempotencyKey, operation.context.principal.actorId) !== undefined;
+     WHERE scope = ? AND idempotency_key = ? AND principal_actor_id = ?
+       AND expires_at_ms > ?`,
+  ).get(scope, operation.context.idempotencyKey, operation.context.principal.actorId,
+    operation.now) !== undefined;
 }
 
 function deploymentEventId(database: DatabaseSync, type: Ft07AgentSettingsMutationType,
@@ -357,8 +359,10 @@ export async function executeAgentSettingsWorkerOperation(
     const request = assignmentRequest(mutationFrame);
     const scope = ["room-assignment", context.principal.actorId,
       mutationFrame.roomId, request.kind].join("\0");
-    const replayed = database.prepare("SELECT 1 FROM idempotency_records WHERE scope = ? AND key = ?")
-      .get(scope, mutationFrame.idempotencyKey) !== undefined;
+    const replayed = database.prepare(
+      `SELECT 1 FROM idempotency_records
+       WHERE scope = ? AND key = ? AND expires_at > ?`,
+    ).get(scope, mutationFrame.idempotencyKey, new Date(now).toISOString()) !== undefined;
     const result = executeRoomAssignmentAuthorityOperation(database, { version: 1,
       type: "room-assignment.mutate", context, request, now }, disclosure.credentialReadiness);
     if (result.kind !== "room-assignment-command") return fail("FT-07 Assignment ACK is unavailable");

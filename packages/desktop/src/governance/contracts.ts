@@ -10,6 +10,7 @@ import type {
 
 export const GOVERNANCE_IPC_CHANNELS = Object.freeze({
   getSurface: "governance:get-surface",
+  clearCache: "governance:clear-cache",
   getDepartureConflicts: "governance:get-departure-conflicts",
   submit: "governance:submit",
   stateChanged: "governance:state-changed",
@@ -83,6 +84,7 @@ export interface GovernanceAuthorityCommand extends GovernanceMutationRequest {
 
 export interface GovernanceBridge {
   getSurface(query: GovernanceSurfaceQuery): Promise<GovernanceRemoteState>;
+  clearCache(query: GovernanceSurfaceQuery): Promise<GovernanceRemoteState>;
   getDepartureConflicts(query: GovernanceDepartureQuery): Promise<DepartureConflictList>;
   submit(request: GovernanceMutationRequest): Promise<GovernanceSubmitResult>;
   onStateChanged(listener: (state: GovernanceStateEnvelope) => void): () => void;
@@ -182,7 +184,9 @@ function isClosedError(value: unknown): value is GovernanceClosedError {
     401: new Set(["authentication_required", "session_revoked"]),
     403: new Set(["role_forbidden", "access_revoked"]),
     404: new Set(["member_not_found", "room_not_found"]),
-    409: new Set(["room_revision_conflict", "ownership_transfer_required", "room_archived"]),
+    409: new Set([
+      "room_revision_conflict", "ownership_transfer_required", "room_archived", "room_read_only",
+    ]),
     410: new Set(["snapshot_expired"]),
     429: new Set(["rate_limited"]),
     503: new Set(["dependency_unavailable", "service_unavailable", "repair_unavailable"]),

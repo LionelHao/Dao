@@ -61,6 +61,7 @@ import type { InternalAgentMessageCommitContext } from "../message-authority/int
 export interface AuthenticatedSessionContext {
   readonly sessionId: string;
   readonly sessionFamilyId: string;
+  readonly deviceId?: string;
   readonly principal: AuthenticatedPrincipal;
 }
 
@@ -296,6 +297,7 @@ export interface IssuedSessionRecord {
   readonly publicSessionId: string;
   readonly accountId: string;
   readonly actorId: string;
+  readonly deviceId?: string;
   readonly accessExpiresAt: number;
   readonly refreshExpiresAt: number;
 }

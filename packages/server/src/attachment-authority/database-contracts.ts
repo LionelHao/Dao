@@ -427,8 +427,10 @@ function resultNonnegative(value: unknown): value is number {
 function isAttachmentHumanContextValue(value: unknown): value is AttachmentHumanContext {
   return resultRecord(value) && resultExact(value, [
     "kind", "sessionId", "sessionFamilyId", "principal",
+    ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : []),
   ]) && value.kind === "human" && resultId(value.sessionId) &&
     resultId(value.sessionFamilyId) && resultRecord(value.principal) &&
+    (!Object.hasOwn(value, "deviceId") || resultId(value.deviceId)) &&
     resultExact(value.principal, ["accountId", "actorId"]) &&
     resultId(value.principal.accountId) && resultId(value.principal.actorId);
 }

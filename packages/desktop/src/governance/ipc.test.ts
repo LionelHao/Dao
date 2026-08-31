@@ -16,10 +16,13 @@ describe("Governance main IPC allowlist", () => {
       getSurface: vi.fn(async () => ({ status: "locked", roomId: "room-1", connection: { status: "fatal", errorCode: "unavailable" } })),
       getDepartureConflicts: vi.fn(), submit: vi.fn(), subscribe: vi.fn(() => unsubscribe),
     };
-    const dispose = registerGovernanceIpc({ ipcMain, webContents, controller });
+    const clearCache = vi.fn(async () => ({ status: "locked" as const, roomId: "room-1",
+      connection: { status: "fatal" as const, errorCode: "unavailable" } }));
+    const dispose = registerGovernanceIpc({ ipcMain, webContents, controller, clearCache });
     expect([...handlers.keys()].sort()).toEqual([
       GOVERNANCE_IPC_CHANNELS.getDepartureConflicts,
       GOVERNANCE_IPC_CHANNELS.getSurface,
+      GOVERNANCE_IPC_CHANNELS.clearCache,
       GOVERNANCE_IPC_CHANNELS.submit,
     ].sort());
     const get = handlers.get(GOVERNANCE_IPC_CHANNELS.getSurface)!;
@@ -29,8 +32,12 @@ describe("Governance main IPC allowlist", () => {
       .rejects.toThrow("trusted main frame");
     await expect(get({ sender: webContents, senderFrame: frame }, { roomId: "room-1" }))
       .resolves.toMatchObject({ status: "locked" });
+    const clear = handlers.get(GOVERNANCE_IPC_CHANNELS.clearCache)!;
+    await expect(clear({ sender: webContents, senderFrame: frame }, { roomId: "room-1" }))
+      .resolves.toMatchObject({ status: "locked" });
+    expect(clearCache).toHaveBeenCalledWith("room-1");
     dispose();
     expect(unsubscribe).toHaveBeenCalledOnce();
-    expect(ipcMain.removeHandler).toHaveBeenCalledTimes(3);
+    expect(ipcMain.removeHandler).toHaveBeenCalledTimes(4);
   });
 });

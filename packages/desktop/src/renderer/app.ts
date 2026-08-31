@@ -59,12 +59,17 @@ export {
   type ToolSafetySurfaceState,
 } from "./tool-safety/surface.js";
 
-function renderLockedGovernance(root: HTMLElement, state: Extract<GovernanceRemoteState, { status: "locked" }>): void {
+function renderLockedGovernance(
+  root: HTMLElement,
+  state: Extract<GovernanceRemoteState, { status: "locked" }>,
+  actions: Readonly<{ retry: () => void; clearCache: () => void }>,
+): void {
   const locked = document.createElement("section");
   locked.className = "governance-locked";
   locked.dataset.governanceLocked = "true";
   locked.setAttribute("role", "alert");
   const heading = document.createElement("h1");
+  heading.tabIndex = -1;
   heading.textContent = state.connection.status === "revoked" ? "Room 访问已撤销"
     : state.connection.status === "offline" ? "Room 离线且无有效读取 lease" : "治理服务不可用";
   const explanation = document.createElement("p");
@@ -72,8 +77,21 @@ function renderLockedGovernance(root: HTMLElement, state: Extract<GovernanceRemo
     ? state.connection.purgeCompleted ? "缓存已清除" : "正在清除缓存"
     : state.connection.status === "offline" ? `缓存不能作为权威来源 · 离线于 ${state.connection.asOf}`
     : `无法安全显示 Room · ${state.connection.errorCode}`;
-  locked.append(heading, explanation);
+  const controls = document.createElement("div");
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.dataset.governanceRetry = "true";
+  retry.textContent = "重试";
+  retry.addEventListener("click", actions.retry);
+  const clearCache = document.createElement("button");
+  clearCache.type = "button";
+  clearCache.dataset.governanceClearCache = "true";
+  clearCache.textContent = "清除缓存并重新同步";
+  clearCache.addEventListener("click", actions.clearCache);
+  controls.append(retry, clearCache);
+  locked.append(heading, explanation, controls);
   root.replaceChildren(locked);
+  heading.focus();
 }
 
 export function mountGovernanceSurface(
@@ -152,7 +170,16 @@ export function mountGovernanceSurface(
     if (state.status === "locked") {
       remote = undefined;
       dialog = null;
-      renderLockedGovernance(root, state);
+      renderLockedGovernance(root, state, {
+        retry: () => { void refresh(); },
+        clearCache: () => {
+          void bridge.clearCache({ roomId: options.roomId }).then((next) => {
+            if (active) applyRemote(next);
+          }).catch(() => {
+            if (active) void refresh();
+          });
+        },
+      });
       return;
     }
     if (state.projection.roomId !== options.roomId) return;

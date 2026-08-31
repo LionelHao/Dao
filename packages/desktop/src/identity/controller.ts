@@ -59,7 +59,11 @@ export interface IdentitySessionController {
 
 /** Main-process-only authority material. This is never part of IdentityPublicState or preload. */
 export interface IdentityAuthoritySession {
+  readonly accountId: string;
   readonly actorId: string;
+  readonly sessionFamilyId?: string;
+  readonly deviceId?: string;
+  readonly installationId?: string;
   readonly sessionId: string;
   readonly accessToken: string;
   readonly expiresAt: string;
@@ -140,9 +144,18 @@ export function createIdentitySessionController(options: {
   const getState = (): IdentityPublicState => cloneIdentityPublicState(state);
   const getCurrentAuthoritySession = (): IdentityAuthoritySession | undefined => {
     const credentials = activeCredentials;
-    if (state.status !== "authenticated" || credentials === undefined) return undefined;
+    if ((state.status !== "authenticated" && state.status !== "unavailable") ||
+        credentials === undefined) return undefined;
     return Object.freeze({
+      accountId: credentials.accountId,
       actorId: credentials.actorId,
+      ...(credentials.sessionFamilyId === undefined ? {} : {
+        sessionFamilyId: credentials.sessionFamilyId,
+      }),
+      ...(credentials.deviceId === undefined ? {} : {
+        deviceId: credentials.deviceId,
+        installationId: credentials.deviceId,
+      }),
       sessionId: credentials.sessionId,
       accessToken: credentials.accessToken,
       expiresAt: credentials.expiresAt,

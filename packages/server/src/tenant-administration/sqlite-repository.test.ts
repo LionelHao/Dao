@@ -175,6 +175,15 @@ const context = (idempotencyKey: string, accessToken = "owner-token") => ({
 });
 
 describe("SQLite Tenant Administrator and Global Profile repository", () => {
+  it("rejects a feature-local deployment receipt TTL override", () => {
+    const { database } = fixture();
+    expect(() => createSqliteTenantAdministrationRepository({
+      database,
+      nowMs: () => NOW_MS,
+      idempotencyTtlMs: 24 * 60 * 60 * 1_000,
+    })).toThrow("deployment idempotency TTL must be exactly 30 days");
+  });
+
   it("persists bootstrap/add/remove CAS with immutable revisions and blocks non-admin and last-admin removal", async () => {
     const { authority, database } = fixture();
     await authority.bootstrapFromOwnerConfiguration({
@@ -217,6 +226,11 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
       toolCeiling: ["repository.git-status"],
     };
     const created = await authority.createProfile(context("create"), input);
+    expect(database.prepare(
+      `SELECT expires_at_ms - created_at_ms AS ttlMs
+       FROM deployment_idempotency_records
+       WHERE scope = 'profile.create' AND idempotency_key = 'create'`,
+    ).get()).toEqual({ ttlMs: 30 * 24 * 60 * 60 * 1_000 });
     const replay = await authority.createProfile(context("create"), input);
     expect(replay).toEqual(created);
     const updated = await authority.updateProfile(context("update"), {

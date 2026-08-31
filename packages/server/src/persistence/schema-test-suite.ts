@@ -633,7 +633,7 @@ describe("authority SQLite schema — recent migrations", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(database.prepare(
         `SELECT room_id AS roomId, gate_generation AS gateGeneration,
                 blocked_at AS blockedAt
@@ -689,16 +689,16 @@ describe("authority SQLite schema — recent migrations", () => {
     });
   });
 
-  it("upgrades every historical v13-v25 contract to v26 without rewriting its history", () => {
-    expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
-    for (let version = 13; version <= 25; version += 1) {
+  it("upgrades every historical v13-v26 contract to v27 without rewriting its history", () => {
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(27);
+    for (let version = 13; version <= 26; version += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
         const history = database.prepare(
           "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
         ).all();
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(26);
+        expect(readSchemaVersion(database)).toBe(27);
         expect(database.prepare(
           `SELECT version, name, checksum FROM schema_migrations
            WHERE version <= ? ORDER BY version`,
@@ -971,7 +971,7 @@ describe("authority SQLite schema — recent migrations", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(database.prepare(
         `SELECT id, owner_actor_id AS ownerActorId, governance_revision AS governanceRevision,
                 archive_generation AS archiveGeneration, archived_at AS archivedAt
@@ -1094,8 +1094,8 @@ describe("authority SQLite schema — recent migrations", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(27);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(tableColumns(database, "session_families")).toEqual([
         "family_id", "public_id", "account_id", "actor_id", "device_id",
         "device_label", "platform", "created_at", "refresh_expires_at", "revoked_at",
@@ -1161,7 +1161,7 @@ describe("authority SQLite schema — recent migrations", () => {
       seedV11SessionCapacity(database, 97, 0);
 
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(database.prepare("SELECT COUNT(*) AS count FROM session_families").get())
         .toEqual({ count: 97 });
     });
@@ -1247,8 +1247,8 @@ describe("authority SQLite schema — foundations", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(27);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(listAuthorityTables(database)).toEqual(AUTHORITY_TABLES);
       expect(
         database
@@ -1413,6 +1413,12 @@ describe("authority SQLite schema — foundations", () => {
           checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
+        {
+          version: 27,
+          name: "sync-reliability-lifecycle",
+          checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
       ]);
       expect(tableColumns(database, "actors")).toContain("catalog_revision");
       expect(tableColumns(database, "room_memberships")).toContain(
@@ -1456,6 +1462,7 @@ describe("authority SQLite schema — foundations", () => {
         "available_at",
         "delivered_at",
         "last_error",
+        "dead_lettered_at",
       ]);
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
     });
@@ -1467,8 +1474,8 @@ describe("authority SQLite schema — foundations", () => {
       expect(readSchemaVersion(database)).toBe(4);
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(27);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(
         database
           .prepare(
@@ -1592,7 +1599,7 @@ describe("authority SQLite schema — foundations", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(database.prepare(
         `SELECT id, status, action_category AS actionCategory,
                 tool_dispatch_phase AS toolDispatchPhase,
@@ -1669,7 +1676,7 @@ describe("authority SQLite schema — foundations", () => {
       expect(snapshot(database)).toEqual(before);
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(tableColumns(database, "route_jobs")).toEqual([
         "id", "room_id", "source_message_id", "status", "current_attempt", "topic_key",
         "embedding_model_version", "window_size", "cosine_threshold", "room_phase",
@@ -1727,7 +1734,7 @@ describe("authority SQLite schema — foundations", () => {
       expect(snapshot(database)).toEqual(before);
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(database.prepare(
         `SELECT id, current_owner_actor_id AS currentOwnerId, status,
                 requester_actor_id AS requesterId, origin_kind AS originKind,
@@ -1866,7 +1873,7 @@ describe("authority SQLite schema — foundations", () => {
       expect(listAuthorityTables(database)).not.toContain("ball_boundary_claims");
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(tableColumns(database, "ball_boundary_claims")).toEqual([
         "id", "room_id", "source_kind", "source_id", "holder_actor_id", "holder_kind",
         "reason", "since_at", "deadline_at", "boundary_kind", "claimed_at", "route_consumed_at",
@@ -1931,7 +1938,7 @@ describe("authority SQLite schema — foundations", () => {
       expect(tableColumns(database, "agent_executions")).not.toContain("supersedes_execution_ids_json");
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(tableColumns(database, "human_preemption_fences")).toEqual([
         "source_human_message_id", "room_id", "human_actor_id", "accepted_at",
         "cancelled_count", "cancel_committed_at", "route_job_id", "route_created_at",
@@ -1958,7 +1965,7 @@ describe("authority SQLite schema — foundations", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(tableColumns(database, "open_items")).toEqual(
         expect.arrayContaining([
           "requester_actor_id",
@@ -1998,7 +2005,7 @@ describe("authority SQLite schema — foundations", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(database.prepare(
         `SELECT source_message_id AS sourceMessageId, actor_id AS actorId
          FROM calibration_signals WHERE id = 'signal-v3'`,
@@ -2051,7 +2058,7 @@ describe("authority SQLite schema — foundations", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(
         database.prepare("SELECT id, catalog_revision FROM actors ORDER BY id").all(),
       ).toEqual([
@@ -2131,7 +2138,7 @@ describe("authority SQLite schema — foundations", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
       expect(
         database
           .prepare(
@@ -2155,7 +2162,7 @@ describe("authority SQLite schema — foundations", () => {
         streamSeq: 1,
         status: "pending",
         attempts: 2,
-        lastError: "retry",
+        lastError: "send_rejected",
       });
     });
   });
@@ -2726,9 +2733,9 @@ describe("authority SQLite schema — integrity", () => {
     });
 
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 27");
+      database.exec("PRAGMA user_version = 28");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(27);
+      expect(readSchemaVersion(database)).toBe(28);
     });
   });
 
@@ -2751,7 +2758,11 @@ describe("authority SQLite schema — integrity", () => {
   it("refuses v3 tables that are missing required contract columns", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
-      database.exec("ALTER TABLE outbox_deliveries DROP COLUMN last_error");
+      database.exec("PRAGMA writable_schema = ON");
+      database.prepare(
+        "UPDATE sqlite_schema SET sql = replace(sql, 'last_error TEXT', 'removed_last_error TEXT') WHERE name = 'outbox_deliveries'",
+      ).run();
+      database.exec("PRAGMA writable_schema = OFF");
 
       expect(() => migrateAuthorityDatabase(database)).toThrow(/unknown schema/i);
     });
@@ -2802,7 +2813,7 @@ describe("derived snapshot cache schema", () => {
         .toBe(SNAPSHOT_CACHE_BUSY_TIMEOUT_MS);
       expect(() => validateSnapshotCacheSchema(database)).not.toThrow();
     });
-    expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(27);
   });
 
   it("fails closed on version-two corruption and refuses future versions", () => {

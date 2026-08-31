@@ -267,14 +267,18 @@ function isPrincipal(value: unknown): boolean {
 }
 
 function isSessionContext(value: unknown): boolean {
-  return isRecord(value) && exact(value, ["sessionId", "sessionFamilyId", "principal"]) &&
-    text(value.sessionId, 256) && text(value.sessionFamilyId, 256) && isPrincipal(value.principal);
+  return isRecord(value) && exact(value, ["sessionId", "sessionFamilyId", "principal",
+    ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : [])]) &&
+    text(value.sessionId, 256) && text(value.sessionFamilyId, 256) &&
+    (!Object.hasOwn(value, "deviceId") || text(value.deviceId, 256)) && isPrincipal(value.principal);
 }
 
 function isHumanContext(value: unknown): boolean {
   return isRecord(value) && exact(value, [
     "kind", "sessionId", "sessionFamilyId", "principal", "requestId", "idempotencyKey",
+    ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : []),
   ]) && value.kind === "human" && text(value.sessionId, 256) && text(value.sessionFamilyId, 256) &&
+    (!Object.hasOwn(value, "deviceId") || text(value.deviceId, 256)) &&
     isPrincipal(value.principal) && text(value.requestId, 256) && text(value.idempotencyKey, 256);
 }
 
