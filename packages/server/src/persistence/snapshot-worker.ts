@@ -120,8 +120,12 @@ function exact(value: Record<string, unknown>, keys: readonly string[]): boolean
 }
 
 function validContext(value: unknown): value is AuthenticatedSessionContext {
-  return isRecord(value) && exact(value, ["sessionId", "sessionFamilyId", "principal"]) &&
+  return isRecord(value) && exact(value, [
+    "sessionId", "sessionFamilyId", "principal",
+    ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : []),
+  ]) &&
     text(value.sessionId) && text(value.sessionFamilyId) && isRecord(value.principal) &&
+    (!Object.hasOwn(value, "deviceId") || text(value.deviceId)) &&
     exact(value.principal, ["accountId", "actorId"]) &&
     text(value.principal.accountId) && text(value.principal.actorId);
 }

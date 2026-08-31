@@ -58,6 +58,7 @@ function contextFor(suffix: string, familySuffix = suffix): AuthenticatedSession
   return {
     sessionId: tokenHash(`access-${suffix}`),
     sessionFamilyId: tokenHash(`family-${familySuffix}`),
+    deviceId: "test",
     principal: { accountId: "account-a", actorId: "human-a" },
   };
 }
