@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, generateKeyPairSync, type KeyObject } from "node:crypto";
 import {
   ATTACHMENT_AUTHORITY_LIMITS,
   CONTEXT_COMPILER_LIMITS,
@@ -130,6 +130,12 @@ export interface StartAuthoritativeServerOptions {
   readonly invitationSecretKey: Uint8Array;
   readonly sharedAuthority: {
     readonly maxOfflineReadLeaseMs: number;
+    readonly offlineReadLeaseSigning?: {
+      readonly tenantId: string;
+      readonly serverSubject: string;
+      readonly keyId: string;
+      readonly privateKey: KeyObject;
+    };
   };
   /**
    * Owner-controlled deployment bootstrap. The first successful startup seals
@@ -242,7 +248,7 @@ export function assertAgentRuntimeModelContextCapability(input: Readonly<{
 export function startAuthoritativeServer(
   options: StartAuthoritativeServerOptions,
 ): Promise<AuthoritativeServer> {
-  return start(options, {});
+  return start(options, {}, false);
 }
 
 /** Deep-import-only constructor for the compiled child-process harness. */
@@ -250,13 +256,28 @@ export function startAuthoritativeServerForTest(
   options: StartAuthoritativeServerOptions,
   testOptions: AuthoritativeServerTestOptions,
 ): Promise<AuthoritativeServer> {
-  return start(options, testOptions);
+  return start(options, testOptions, true);
 }
 
 async function start(
   options: StartAuthoritativeServerOptions,
   testOptions: AuthoritativeServerTestOptions,
+  testOnlyAllowEphemeralOfflineLeaseSigning: boolean,
 ): Promise<AuthoritativeServer> {
+  const ephemeralLeaseKey = options.sharedAuthority.offlineReadLeaseSigning === undefined &&
+      testOnlyAllowEphemeralOfflineLeaseSigning
+    ? generateKeyPairSync("ed25519").privateKey
+    : undefined;
+  const offlineReadLeaseSigning = options.sharedAuthority.offlineReadLeaseSigning ??
+    (ephemeralLeaseKey === undefined ? undefined : {
+      tenantId: "dao-test-tenant",
+      serverSubject: "dao-test-authority",
+      keyId: "dao-test-ephemeral-key",
+      privateKey: ephemeralLeaseKey,
+    });
+  if (offlineReadLeaseSigning === undefined) {
+    throw new TypeError("offlineReadLeaseSigning is required for production composition");
+  }
   const runtimeModel = options.agentRuntime?.model ?? "gpt-5-mini";
   assertAgentRuntimeModelContextCapability({
     model: runtimeModel,
@@ -332,6 +353,7 @@ async function start(
             maxOfflineReadLeaseMs: options.sharedAuthority.maxOfflineReadLeaseMs,
           },
           deploymentProviderDisclosure,
+          offlineReadLeaseSigning,
         })
       : await createWorkerDatabaseClientWithTransactionFaultForTest(
           {
@@ -341,6 +363,7 @@ async function start(
               maxOfflineReadLeaseMs: options.sharedAuthority.maxOfflineReadLeaseMs,
             },
             deploymentProviderDisclosure,
+            offlineReadLeaseSigning,
           },
           transactionFault,
         );
@@ -409,6 +432,8 @@ async function start(
       cachePath: options.snapshotCachePath,
       revalidate: (request) => authority.revalidateSnapshot(request),
       streamingAuthority: worker,
+      deploymentProviderCredentialReadiness:
+        deploymentProviderDisclosure.credentialReadiness,
       ...(testOptions.snapshotCacheQuotaBytes === undefined &&
           testOptions.snapshotMaxRecordsPerPage === undefined
         ? {}
@@ -428,6 +453,11 @@ async function start(
       authority: createWorkerRoomCacheInvalidationIntentAuthority(worker),
       purge: snapshotClient,
       batchLimit: 64,
+      alertSink: {
+        emit(alert) {
+          process.stderr.write(`${JSON.stringify({ source: "authority-outbox", ...alert })}\n`);
+        },
+      },
     });
     let cacheInvalidationDispatchRunning = false;
     const dispatchCacheInvalidations = async (): Promise<void> => {
@@ -441,7 +471,14 @@ async function start(
     };
     await dispatchCacheInvalidations();
     const cacheInvalidationTimer = setInterval(() => {
-      void dispatchCacheInvalidations().catch(() => undefined);
+      void dispatchCacheInvalidations().catch(() => {
+        process.stderr.write(`${JSON.stringify({
+          severity: "critical",
+          code: "outbox_dispatcher_failure",
+          family: "room-cache-invalidation",
+          reason: "storage_unavailable",
+        })}\n`);
+      });
     }, 1_000);
     cacheInvalidationTimer.unref();
     stopCacheInvalidationRecovery = () => clearInterval(cacheInvalidationTimer);
@@ -1160,6 +1197,23 @@ async function start(
       port: options.listen?.port ?? AUTHORITATIVE_SERVER_DEFAULT_PORT,
       outboxStore,
       outboxPollIntervalMs: 10,
+      outboxFailureLifecycle: {
+        scheduleRetry: (input) => authorityWorker.scheduleOutboxRetry(input),
+        deadLetter: (input) => authorityWorker.deadLetterOutbox(input),
+      },
+      outboxAlertSink: {
+        emit(alert) {
+          process.stderr.write(`${JSON.stringify({ source: "authority-outbox", ...alert })}\n`);
+        },
+      },
+      offlineReadLeaseAuthority: {
+        issue: (context, roomId) => authorityWorker.issueOfflineReadLease(
+          context,
+          roomId,
+          options.sharedAuthority.maxOfflineReadLeaseMs,
+          Date.now(),
+        ),
+      },
       agentRuntime: runtime,
       toolSafetyAuthority: publicToolSafetyAuthority,
       previewAuthority: {

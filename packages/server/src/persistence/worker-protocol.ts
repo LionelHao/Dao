@@ -55,6 +55,10 @@ import {
   type MemoryAuthorityOperation,
 } from "../room-memory/authority-protocol.js";
 import type { CommittedRoomCacheInvalidationIntent } from "../access/room-cache-invalidation-port.js";
+import {
+  isOfflineReadLeaseClaims,
+  type IssuedOfflineReadLease,
+} from "../access/offline-lease-invalidation-port.js";
 import type {
   AgentCollaborationCommand,
   AgentMessageCommitCommand,
@@ -603,6 +607,24 @@ export type AuthorityWorkerRequest =
       readonly reason: "closed" | "backpressure" | "send_rejected";
     }
   | {
+      readonly type: "authority.outbox-schedule-retry";
+      readonly requestId: string;
+      readonly deliveryId: string;
+      readonly eventId: string;
+      readonly attempt: number;
+      readonly reason: "closed" | "backpressure" | "send_rejected";
+      readonly availableAtMs: number;
+    }
+  | {
+      readonly type: "authority.outbox-dead-letter";
+      readonly requestId: string;
+      readonly deliveryId: string;
+      readonly eventId: string;
+      readonly attempt: number;
+      readonly reason: "closed" | "backpressure" | "send_rejected";
+      readonly deadLetteredAtMs: number;
+    }
+  | {
       readonly type: "authority.room-cache-invalidation-list";
       readonly requestId: string;
       readonly limit: number;
@@ -616,7 +638,18 @@ export type AuthorityWorkerRequest =
       readonly type: "authority.room-cache-invalidation-failed";
       readonly requestId: string;
       readonly invalidationIntentId: string;
+      readonly attempt: number;
       readonly errorCode: "purge_failed" | "authority_unavailable";
+      readonly availableAtMs?: number;
+      readonly deadLetteredAtMs?: number;
+    }
+  | {
+      readonly type: "authority.offline-read-lease-issue";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly roomId: string;
+      readonly requestedLeaseMs: number;
+      readonly now: number;
     }
   | {
       readonly type: "authority.sync-room";
@@ -712,12 +745,12 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 26;
+      readonly schemaVersion: 27;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 26;
+      readonly schemaVersion: 27;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -867,6 +900,11 @@ export type AuthorityWorkerResponse =
       readonly type: "authority.outbox-authorized";
       readonly requestId: string;
       readonly authorized: boolean;
+    }
+  | {
+      readonly type: "authority.offline-read-lease-issued";
+      readonly requestId: string;
+      readonly lease: IssuedOfflineReadLease;
     }
   | { readonly type: "authority.outbox-updated"; readonly requestId: string }
   | {
@@ -1505,14 +1543,17 @@ function isCommittedRoomCacheInvalidationIntent(
 ): value is CommittedRoomCacheInvalidationIntent {
   if (!isRecord(value) || !isText(value.invalidationIntentId) || !isText(value.roomId) ||
       !isNonNegativeSafeInteger(value.lifecycleGeneration) ||
-      !isNonNegativeSafeInteger(value.accessRevision)) return false;
+      !isNonNegativeSafeInteger(value.accessRevision) ||
+      !isNonNegativeSafeInteger(value.attempts) || value.attempts > 7 ||
+      !isNonNegativeSafeInteger(value.createdAtMs)) return false;
   if (value.reason === "room_archived") return hasExactKeys(value, [
     "invalidationIntentId", "roomId", "lifecycleGeneration", "accessRevision", "reason",
+    "attempts", "createdAtMs",
   ]);
   return (value.reason === "member_removed" || value.reason === "access_revoked") &&
     hasExactKeys(value, [
       "invalidationIntentId", "roomId", "lifecycleGeneration", "accessRevision", "reason",
-      "targetActorId",
+      "targetActorId", "attempts", "createdAtMs",
     ]) && isText(value.targetActorId);
 }
 
@@ -1716,6 +1757,21 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
         (value.reason === "closed" ||
           value.reason === "backpressure" ||
           value.reason === "send_rejected");
+    case "authority.outbox-schedule-retry":
+      return hasExactKeys(value, [
+        "type", "requestId", "deliveryId", "eventId", "attempt", "reason", "availableAtMs",
+      ]) && isText(value.deliveryId) && isText(value.eventId) &&
+        isNonNegativeSafeInteger(value.attempt) && value.attempt >= 1 && value.attempt < 8 &&
+        (value.reason === "closed" || value.reason === "backpressure" ||
+          value.reason === "send_rejected") &&
+        isNonNegativeSafeInteger(value.availableAtMs);
+    case "authority.outbox-dead-letter":
+      return hasExactKeys(value, [
+        "type", "requestId", "deliveryId", "eventId", "attempt", "reason", "deadLetteredAtMs",
+      ]) && isText(value.deliveryId) && isText(value.eventId) && value.attempt === 8 &&
+        (value.reason === "closed" || value.reason === "backpressure" ||
+          value.reason === "send_rejected") &&
+        isNonNegativeSafeInteger(value.deadLetteredAtMs);
     case "authority.room-cache-invalidation-list":
       return hasExactKeys(value, ["type", "requestId", "limit"]) &&
         isNonNegativeSafeInteger(value.limit) && value.limit > 0 && value.limit <= 256;
@@ -1723,10 +1779,23 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
       return hasExactKeys(value, ["type", "requestId", "invalidationIntentId"]) &&
         isText(value.invalidationIntentId);
     case "authority.room-cache-invalidation-failed":
+      return (hasExactKeys(value, [
+        "type", "requestId", "invalidationIntentId", "attempt", "errorCode", "availableAtMs",
+      ]) || hasExactKeys(value, [
+        "type", "requestId", "invalidationIntentId", "attempt", "errorCode", "deadLetteredAtMs",
+      ])) && isText(value.invalidationIntentId) &&
+        isNonNegativeSafeInteger(value.attempt) && value.attempt >= 1 && value.attempt <= 8 &&
+        (value.errorCode === "purge_failed" || value.errorCode === "authority_unavailable") &&
+        ((value.attempt < 8 && isNonNegativeSafeInteger(value.availableAtMs) &&
+          value.deadLetteredAtMs === undefined) ||
+          (value.attempt === 8 && isNonNegativeSafeInteger(value.deadLetteredAtMs) &&
+            value.availableAtMs === undefined));
+    case "authority.offline-read-lease-issue":
       return hasExactKeys(value, [
-        "type", "requestId", "invalidationIntentId", "errorCode",
-      ]) && isText(value.invalidationIntentId) &&
-        (value.errorCode === "purge_failed" || value.errorCode === "authority_unavailable");
+        "type", "requestId", "context", "roomId", "requestedLeaseMs", "now",
+      ]) && isAuthenticatedSessionContext(value.context) && isText(value.roomId) &&
+        isNonNegativeSafeInteger(value.requestedLeaseMs) && value.requestedLeaseMs > 0 &&
+        isNonNegativeSafeInteger(value.now);
     case "authority.sync-room": {
       const parsed = parseRoomSyncRequest(value.request);
       return hasExactKeys(value, ["type", "requestId", "context", "request", "now"]) &&
@@ -1801,7 +1870,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 26
+        value.schemaVersion === 27
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -1906,6 +1975,11 @@ export function isAuthorityWorkerResponse(
     case "authority.outbox-authorized":
       return hasExactKeys(value, ["type", "requestId", "authorized"]) &&
         typeof value.authorized === "boolean";
+    case "authority.offline-read-lease-issued":
+      return hasExactKeys(value, ["type", "requestId", "lease"]) &&
+        isRecord(value.lease) &&
+        hasExactKeys(value.lease, ["token", "claims"]) &&
+        isText(value.lease.token) && isOfflineReadLeaseClaims(value.lease.claims);
     case "authority.outbox-updated":
       return hasExactKeys(value, ["type", "requestId"]);
     case "authority.room-cache-invalidations":

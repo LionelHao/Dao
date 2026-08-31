@@ -199,7 +199,7 @@ function localUnavailable(operation: GovernanceOperationState): GovernanceOperat
     status: "failed",
     requestId: operation.requestId,
     command: operation.command,
-    error: { status: 503, code: "repair_unavailable" },
+    error: { status: 409, code: "room_read_only" },
   };
 }
 

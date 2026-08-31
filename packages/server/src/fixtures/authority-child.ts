@@ -12,6 +12,7 @@ import {
   type ProviderEvent,
 } from "@native-im/core";
 import { DatabaseSync } from "node:sqlite";
+import { generateKeyPairSync } from "node:crypto";
 import { createServer as createTcpServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import type { IdentityAdapter, LoginCredentials } from "../auth.js";
@@ -763,11 +764,20 @@ function createPreviewSentinelProvider(
 const attachmentFixture = command.enableAttachmentFixture === true
   ? await startAttachmentClamdFixture()
   : undefined;
+const offlineReadLeaseKeys = generateKeyPairSync("ed25519");
 const attachmentToolPath = resolve(import.meta.dirname, "attachment-tool-child.js");
 const serverOptions: StartAuthoritativeServerOptions = {
   databasePath: command.databasePath,
   snapshotCachePath: command.snapshotCachePath,
-  sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
+  sharedAuthority: {
+    maxOfflineReadLeaseMs: 60_000,
+    offlineReadLeaseSigning: {
+      tenantId: "dao-authority-fixture",
+      serverSubject: "dao-authority-child",
+      keyId: "fixture-key-1",
+      privateKey: offlineReadLeaseKeys.privateKey,
+    },
+  },
   listen: { host: "127.0.0.1", port: 0 },
   actors: command.actors,
   identities,

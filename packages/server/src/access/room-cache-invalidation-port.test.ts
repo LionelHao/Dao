@@ -242,7 +242,9 @@ function sqliteQueue(database: DatabaseSync): RoomCacheInvalidationIntentAuthori
           room_id AS roomId,
           lifecycle_generation AS lifecycleGeneration,
           access_revision AS accessRevision,
-          reason
+          reason,
+          attempts,
+          CAST(strftime('%s', created_at) AS INTEGER) * 1000 AS createdAtMs
         FROM room_cache_invalidation_intents
         WHERE status = 'pending'
         ORDER BY created_at ASC, id ASC
@@ -256,12 +258,17 @@ function sqliteQueue(database: DatabaseSync): RoomCacheInvalidationIntentAuthori
         WHERE id = ? AND status = 'pending'
       `).run(invalidationIntentId);
     },
-    async markFailed(invalidationIntentId, errorCode) {
+    async markFailed(input) {
       database.prepare(`
         UPDATE room_cache_invalidation_intents
-        SET attempts = attempts + 1, last_error_code = ?
+        SET attempts = ?, last_error_code = ?, available_at = ?
         WHERE id = ? AND status = 'pending'
-      `).run(errorCode, invalidationIntentId);
+      `).run(
+        input.attempt,
+        input.errorCode,
+        new Date(input.availableAtMs ?? input.deadLetteredAtMs ?? 0).toISOString(),
+        input.invalidationIntentId,
+      );
     },
   };
 }

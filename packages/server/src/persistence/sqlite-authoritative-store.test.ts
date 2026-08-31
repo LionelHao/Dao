@@ -1221,7 +1221,7 @@ describe("SQLite authoritative sessions", () => {
       accountId: "account-li",
       actorId: "human-li",
     });
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 26 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 27 });
     await client.close();
   });
 
@@ -3698,7 +3698,7 @@ describe("SQLite authoritative sessions", () => {
         replayed.find((item) => item.targetKind === "room")!,
         candidate,
       ),
-    ).resolves.toBe(false);
+    ).resolves.toBe(true);
     await expect(
       restartedAuthority.authorizeOutboxCandidate(
         replayed.find((item) => item.targetKind === "principal")!,

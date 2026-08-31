@@ -3,6 +3,7 @@ import type {
   RoomGovernanceView,
   RoomRepairRecord,
 } from "@native-im/core";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mountGovernanceSurface } from "../renderer/app.js";
@@ -11,12 +12,36 @@ import type { GovernanceBridge, GovernanceRemoteState } from "./contracts.js";
 import { authoritySnapshotChecksum } from "./authority-cache.js";
 import { createDesktopGovernanceRuntime } from "./production-runtime.js";
 import {
+  createDesktopOfflineReadLeaseVerifier,
+  type DesktopOfflineReadLeaseClaims,
+} from "./offline-read-lease.js";
+import {
   parseGovernanceServerFrame,
   validateGovernanceWebSocketEndpoint,
   type GovernanceWebSocketLike,
 } from "./websocket-authority.js";
 
 const servers: WebSocketServer[] = [];
+const leaseKeys = generateKeyPairSync("ed25519");
+const leaseNow = 1_800_000_000_000;
+
+function offlineLeaseToken(claims: DesktopOfflineReadLeaseClaims): string {
+  const text = JSON.stringify({
+    version: claims.version, keyId: claims.keyId, leaseId: claims.leaseId,
+    tenantId: claims.tenantId, accountId: claims.accountId, actorId: claims.actorId,
+    actorKind: claims.actorKind, sessionFamilyId: claims.sessionFamilyId,
+    deviceId: claims.deviceId, installationId: claims.installationId,
+    serverSubject: claims.serverSubject,
+    room: { roomId: claims.room.roomId,
+      lifecycleGeneration: claims.room.lifecycleGeneration,
+      accessRevision: claims.room.accessRevision,
+      leaseGeneration: claims.room.leaseGeneration },
+    issuedAtMs: claims.issuedAtMs, notBeforeMs: claims.notBeforeMs,
+    expiresAtMs: claims.expiresAtMs,
+  });
+  return `${Buffer.from(text).toString("base64url")}.${
+    sign(null, Buffer.from(text), leaseKeys.privateKey).toString("base64url")}`;
+}
 afterEach(async () => {
   document.body.replaceChildren();
   await Promise.all(servers.splice(0).map(async (server) => {
@@ -69,6 +94,7 @@ async function loopbackAuthority(): Promise<{
   readonly endpoint: string;
   readonly received: readonly Record<string, unknown>[];
   disconnect(): void;
+  setUnavailable(value: boolean): void;
   removeRoomAccess(): void;
   revokeSession(): void;
 }> {
@@ -82,7 +108,12 @@ async function loopbackAuthority(): Promise<{
   let currentRoom = room("active");
   let watermark = 9;
   const history: DesktopRoomEvent[] = [];
+  let unavailable = false;
   server.on("connection", (socket) => {
+    if (unavailable) {
+      socket.terminate();
+      return;
+    }
     socket.on("message", (bytes, binary) => {
       if (binary) return socket.close(1002, "text only");
       const frame = JSON.parse(bytes.toString()) as Record<string, unknown>;
@@ -128,6 +159,21 @@ async function loopbackAuthority(): Promise<{
           });
           send({ type: "room.subscribed.v2", requestId, roomId: "room-1", cursor: frame.cursor, watermark });
           return;
+        case "offline-read-lease.issue": {
+          const claims: DesktopOfflineReadLeaseClaims = {
+            version: 1, keyId: "lease-key-1", leaseId: `lease-${watermark}`,
+            tenantId: "tenant-1", accountId: "account-1", actorId: "owner-1",
+            actorKind: "human", sessionFamilyId: "family-1", deviceId: "device-1",
+            installationId: "device-1", serverSubject: "loopback-authority",
+            room: { roomId: "room-1", lifecycleGeneration: currentGovernance.archiveGeneration,
+              accessRevision: currentGovernance.governanceRevision, leaseGeneration: 0 },
+            issuedAtMs: leaseNow - 1_000, notBeforeMs: leaseNow - 1_000,
+            expiresAtMs: leaseNow + 60_000,
+          };
+          send({ type: "offline-read-lease.issued", requestId,
+            token: offlineLeaseToken(claims), claims });
+          return;
+        }
         case "room.departure.conflicts":
           send({ type: "room.departure.conflicts.result", requestId, conflicts: {
             roomId: "room-1", targetActorId: frame.targetActorId,
@@ -169,6 +215,10 @@ async function loopbackAuthority(): Promise<{
     endpoint: `ws://127.0.0.1:${address.port}`,
     received,
     disconnect() { for (const client of server.clients) client.terminate(); },
+    setUnavailable(value) {
+      unavailable = value;
+      if (value) for (const client of server.clients) client.terminate();
+    },
     removeRoomAccess() {
       for (const client of server.clients) client.send(JSON.stringify({
         eventId: "identity-room-removed", streamKind: "identity", streamId: "owner-1",
@@ -227,7 +277,7 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     let request = 0;
     const runtime = createDesktopGovernanceRuntime({
       endpoint: authority.endpoint,
-      session: () => ({ actorId: "owner-1", sessionId: "session-1", accessToken: "main-only-token",
+      session: () => ({ accountId: "account-1", actorId: "owner-1", sessionId: "session-1", accessToken: "main-only-token",
         expiresAt: "2026-08-19T12:00:00.000Z" }),
       webSocketFactory: (endpoint) => new WebSocket(endpoint) as unknown as GovernanceWebSocketLike,
       createRequestIdentity: () => ({ requestId: `governance-${++request}`, idempotencyKey: `key-${request}` }),
@@ -282,7 +332,7 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     let request = 0;
     const runtime = createDesktopGovernanceRuntime({
       endpoint: authority.endpoint,
-      session: () => ({ actorId: "owner-1", sessionId: "session-1", accessToken: "main-only-token",
+      session: () => ({ accountId: "account-1", actorId: "owner-1", sessionId: "session-1", accessToken: "main-only-token",
         expiresAt: "2026-08-19T12:00:00.000Z" }),
       webSocketFactory: (endpoint) => new WebSocket(endpoint) as unknown as GovernanceWebSocketLike,
       createRequestIdentity: () => ({ requestId: `offline-${++request}`, idempotencyKey: `key-${request}` }),
@@ -319,6 +369,52 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     runtime.close();
   });
 
+  it("serves only a signed generation-bound cache offline and rejects mutation before transport", async () => {
+    const authority = await loopbackAuthority();
+    let request = 0;
+    const runtime = createDesktopGovernanceRuntime({
+      endpoint: authority.endpoint,
+      session: () => ({ accountId: "account-1", actorId: "owner-1", sessionId: "session-1",
+        accessToken: "main-only-token", expiresAt: "2027-01-15T09:00:00.000Z" }),
+      webSocketFactory: (endpoint) => new WebSocket(endpoint) as unknown as GovernanceWebSocketLike,
+      createRequestIdentity: () => ({ requestId: `signed-offline-${++request}`,
+        idempotencyKey: `signed-key-${request}` }),
+      offlineReadLeaseVerifier: createDesktopOfflineReadLeaseVerifier({
+        verificationKeys: new Map([["lease-key-1", leaseKeys.publicKey]]),
+        now: () => leaseNow,
+      }),
+      offlineReadLeaseAuthority: { tenantId: "tenant-1", serverSubject: "loopback-authority" },
+      now: () => new Date(leaseNow).toISOString(),
+      timeoutMs: 500,
+    });
+    await expect(runtime.controller.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "ready", connection: { status: "online" },
+    });
+    expect(runtime.cache.offlineReadLease("room-1")?.claims.keyId).toBe("lease-key-1");
+
+    authority.setUnavailable(true);
+    await vi.waitFor(() => expect(runtime.controller.current("room-1")).toMatchObject({
+      connection: { status: "offline" },
+    }));
+    await expect(runtime.controller.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "ready",
+      connection: { status: "offline", leaseExpiresAt: new Date(leaseNow + 60_000).toISOString() },
+    });
+    const framesBeforeMutation = authority.received.length;
+    expect(runtime.controller.submit({
+      roomId: "room-1", intent: { command: "room.archive", expectedGovernanceRevision: 7 },
+    }).state).toMatchObject({
+      operation: { status: "failed", error: { status: 409, code: "room_read_only" } },
+    });
+    expect(authority.received).toHaveLength(framesBeforeMutation);
+
+    authority.setUnavailable(false);
+    await expect(runtime.controller.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "ready", connection: { status: "online" },
+    });
+    runtime.close();
+  });
+
   it("publishes terminal purge completion only after durable deletion and preserves cache on ordinary close", async () => {
     const authority = await loopbackAuthority();
     let releaseClear: (() => void) | undefined;
@@ -328,7 +424,7 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     let request = 0;
     const runtime = createDesktopGovernanceRuntime({
       endpoint: authority.endpoint,
-      session: () => ({ actorId: "owner-1", sessionId: "session-1", accessToken: "main-only-token",
+      session: () => ({ accountId: "account-1", actorId: "owner-1", sessionId: "session-1", accessToken: "main-only-token",
         expiresAt: "2026-08-19T12:00:00.000Z" }),
       webSocketFactory: (endpoint) => new WebSocket(endpoint) as unknown as GovernanceWebSocketLike,
       createRequestIdentity: () => ({ requestId: `purge-${++request}`, idempotencyKey: `key-${request}` }),
@@ -355,7 +451,7 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     let request = 0;
     const runtime = createDesktopGovernanceRuntime({
       endpoint: authority.endpoint,
-      session: () => ({ actorId: "owner-1", sessionId: "session-1", accessToken: "main-only-token",
+      session: () => ({ accountId: "account-1", actorId: "owner-1", sessionId: "session-1", accessToken: "main-only-token",
         expiresAt: "2026-08-19T12:00:00.000Z" }),
       webSocketFactory: (endpoint) => new WebSocket(endpoint) as unknown as GovernanceWebSocketLike,
       createRequestIdentity: () => ({ requestId: `close-${++request}`, idempotencyKey: `key-${request}` }),

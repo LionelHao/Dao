@@ -155,6 +155,7 @@ describe("IdentitySessionController startup", () => {
       .toEqual(["restoring", "authenticated"]);
     expect(JSON.stringify(states)).not.toMatch(/access-canary|refresh-canary/);
     expect(controller.getCurrentAuthoritySession()).toEqual({
+      accountId: stored.accountId,
       actorId: stored.actorId,
       sessionId: stored.sessionId,
       accessToken: stored.accessToken,

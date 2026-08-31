@@ -59,6 +59,7 @@ export interface IdentitySessionController {
 
 /** Main-process-only authority material. This is never part of IdentityPublicState or preload. */
 export interface IdentityAuthoritySession {
+  readonly accountId: string;
   readonly actorId: string;
   readonly sessionId: string;
   readonly accessToken: string;
@@ -140,8 +141,10 @@ export function createIdentitySessionController(options: {
   const getState = (): IdentityPublicState => cloneIdentityPublicState(state);
   const getCurrentAuthoritySession = (): IdentityAuthoritySession | undefined => {
     const credentials = activeCredentials;
-    if (state.status !== "authenticated" || credentials === undefined) return undefined;
+    if ((state.status !== "authenticated" && state.status !== "unavailable") ||
+        credentials === undefined) return undefined;
     return Object.freeze({
+      accountId: credentials.accountId,
       actorId: credentials.actorId,
       sessionId: credentials.sessionId,
       accessToken: credentials.accessToken,

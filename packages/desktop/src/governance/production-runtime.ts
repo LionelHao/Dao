@@ -12,6 +12,7 @@ import {
 } from "./controller.js";
 import { createDesktopAuthorityCache, type DesktopAuthorityCache } from "./authority-cache.js";
 import type { AuthorityCachePersistence } from "./encrypted-authority-cache.js";
+import type { EncryptedAuthorityGenerationStore } from "./encrypted-generation-store.js";
 import {
   GovernanceTransportError,
   createGovernanceWebSocketAuthority,
@@ -20,6 +21,10 @@ import {
 } from "./websocket-authority.js";
 import type { GovernanceClosedError } from "../renderer/governance/view-model.js";
 import { createInvocationController, type InvocationController } from "../invocation-runtime/controller.js";
+import type {
+  DesktopOfflineReadLeaseBinding,
+  DesktopOfflineReadLeaseVerifier,
+} from "./offline-read-lease.js";
 
 function closedError(error: unknown): GovernanceClosedError {
   if (!(error instanceof GovernanceTransportError)) {
@@ -93,9 +98,19 @@ export function createDesktopGovernanceRuntime(options: {
   readonly now?: () => string;
   readonly timeoutMs?: number;
   readonly cachePersistence?: AuthorityCachePersistence;
+  readonly generationStoreFactory?: (actorId: string) => EncryptedAuthorityGenerationStore;
+  readonly offlineReadLeaseVerifier?: DesktopOfflineReadLeaseVerifier;
+  readonly offlineReadLeaseAuthority?: Readonly<{
+    tenantId: string;
+    serverSubject: string;
+  }>;
 }): DesktopGovernanceRuntime {
   const now = options.now ?? (() => new Date().toISOString());
-  const cache = createDesktopAuthorityCache(now, options.cachePersistence);
+  const cache = createDesktopAuthorityCache(
+    now,
+    options.cachePersistence,
+    options.generationStoreFactory,
+  );
   const feed = createGovernanceReplicaFeed();
   const transport = createGovernanceWebSocketAuthority({
     endpoint: options.endpoint,
@@ -109,6 +124,39 @@ export function createDesktopGovernanceRuntime(options: {
     session: options.session, createRequestId: (kind) => `invocation-${kind}-${randomUUID()}`, now,
   });
   let closed = false;
+  const offlineRooms = new Set<string>();
+  const leaseBinding = (
+    session: IdentityAuthoritySession,
+    claims: ReturnType<NonNullable<typeof options.offlineReadLeaseVerifier>["verify"]>,
+  ): DesktopOfflineReadLeaseBinding => ({
+    tenantId: options.offlineReadLeaseAuthority?.tenantId ?? claims.tenantId,
+    accountId: session.accountId,
+    actorId: session.actorId,
+    sessionFamilyId: claims.sessionFamilyId,
+    deviceId: claims.deviceId,
+    installationId: claims.installationId,
+    serverSubject: options.offlineReadLeaseAuthority?.serverSubject ?? claims.serverSubject,
+    roomId: claims.room.roomId,
+    lifecycleGeneration: claims.room.lifecycleGeneration,
+    accessRevision: claims.room.accessRevision,
+    leaseGeneration: claims.room.leaseGeneration,
+  });
+  const refreshOfflineLease = async (
+    roomId: string,
+    session: IdentityAuthoritySession,
+  ): Promise<void> => {
+    const verifier = options.offlineReadLeaseVerifier;
+    if (verifier === undefined) return;
+    const issued = await transport.issueOfflineReadLease(roomId);
+    const verified = verifier.verify(issued.token, leaseBinding(session, issued.claims));
+    if (verified.room.roomId !== roomId) throw new GovernanceTransportError("protocol_error");
+    cache.installOfflineReadLease(roomId, { token: issued.token, claims: verified });
+  };
+  const repairAndLease = async (roomId: string, session: IdentityAuthoritySession): Promise<void> => {
+    await replica.repairRoom(roomId);
+    await refreshOfflineLease(roomId, session);
+    offlineRooms.delete(roomId);
+  };
   const completePurge = (
     roomIds: readonly string[],
     scope: "room" | "session",
@@ -140,7 +188,7 @@ export function createDesktopGovernanceRuntime(options: {
         } };
       }
       try {
-        await replica.repairRoom(roomId);
+        await repairAndLease(roomId, session);
         const projection = cache.governanceProjection(roomId);
         if (projection === undefined) {
           return { status: "locked", roomId, connection: {
@@ -152,7 +200,25 @@ export function createDesktopGovernanceRuntime(options: {
       } catch (error: unknown) {
         const authorityError = closedError(error);
         if (authorityError.status === 503) {
-          return { status: "locked", roomId, connection: { status: "offline", asOf: now() } };
+          const lease = cache.offlineReadLease(roomId);
+          const projection = cache.governanceProjection(roomId);
+          const verifier = options.offlineReadLeaseVerifier;
+          if (lease === undefined || projection === undefined || verifier === undefined) {
+            return { status: "locked", roomId, connection: { status: "offline", asOf: now() } };
+          }
+          try {
+            const verified = verifier.verify(lease.token, leaseBinding(session, lease.claims));
+            if (projection.archiveGeneration !== verified.room.lifecycleGeneration) {
+              throw new Error("offline generation mismatch");
+            }
+            offlineRooms.add(roomId);
+            return { status: "ready", projection, viewerActorId: session.actorId,
+              connection: { status: "offline", asOf: cache.updatedAt(roomId) ?? now(),
+                leaseExpiresAt: new Date(verified.expiresAtMs).toISOString() } };
+          } catch {
+            cache.clearRoom(roomId);
+            return { status: "locked", roomId, connection: { status: "offline", asOf: now() } };
+          }
         }
         if (authorityError.status === 401 || authorityError.status === 403) {
           if (authorityError.status === 401) cache.clear(); else cache.clearRoom(roomId);
@@ -180,6 +246,9 @@ export function createDesktopGovernanceRuntime(options: {
       const current = cache.governanceProjection(command.roomId);
       if (session === undefined || current === undefined) {
         throw new GovernanceAuthorityFailure({ status: 401, code: "authentication_required" });
+      }
+      if (offlineRooms.has(command.roomId)) {
+        throw new GovernanceAuthorityFailure({ status: 409, code: "room_read_only" });
       }
       try {
         const ack = await transport.execute(command);
@@ -223,7 +292,11 @@ export function createDesktopGovernanceRuntime(options: {
     controller,
     invocations,
     cache,
-    repairRoom(roomId: string) { return replica.repairRoom(roomId); },
+    async repairRoom(roomId: string) {
+      const session = options.session();
+      if (session === undefined) throw new GovernanceTransportError("authentication_required", 401);
+      await repairAndLease(roomId, session);
+    },
     restoreCache(actorId: string) { return cache.restore(actorId); },
     invalidateAuthorizedState() {
       const roomIds = cache.roomIds();
@@ -236,6 +309,7 @@ export function createDesktopGovernanceRuntime(options: {
       unsubscribeTerminal(); unsubscribeRoomAccess(); unsubscribeFailure(); controller.close();
       invocations.close();
       replica.close(); transport.close();
+      cache.close();
     },
   });
 }

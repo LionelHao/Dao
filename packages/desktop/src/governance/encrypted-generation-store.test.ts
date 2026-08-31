@@ -138,17 +138,36 @@ describe("encrypted Desktop authority generation store", () => {
     install(store, { snapshotId: "snapshot-secret", watermark: 9, records: oldRecords });
     store.applyRoomEventBatch({ roomId: "room-secret", nextCursor: 10,
       events: [{ eventId: "event-secret", streamSeq: 10 }], upserts: [], deletes: [] });
+    store.writeOfflineLease("room-secret", {
+      token: "offline-token-secret",
+      claims: { leaseId: "offline-lease-secret" },
+    });
+    expect(store.readOfflineLease("room-secret")).toEqual({
+      token: "offline-token-secret",
+      claims: { leaseId: "offline-lease-secret" },
+    });
     store.close();
     const files = await readdir(directory);
     const fileBytes = await Promise.all(files.map((file) => readFile(join(directory, file))));
     const disk = Buffer.concat(fileBytes);
     for (const sentinel of ["account-secret", "room-secret", "snapshot-secret", "event-secret",
-      "old-corpus", "record-identity-secret"]) {
+      "old-corpus", "record-identity-secret", "offline-token-secret", "offline-lease-secret"]) {
       const leakingFiles = files.filter((_file, index) =>
         fileBytes[index]!.includes(Buffer.from(sentinel, "utf8")));
       expect(disk.includes(Buffer.from(sentinel, "utf8")),
         `${sentinel} leaked in ${leakingFiles.join(",")}`).toBe(false);
     }
+  });
+
+  it("binds an offline lease to the exact active generation and drops it on atomic replacement", async () => {
+    const { store } = await fixture();
+    install(store, { snapshotId: "old", watermark: 9, records: oldRecords });
+    store.writeOfflineLease("room-secret", { token: "lease-for-old-generation" });
+    expect(store.readOfflineLease("room-secret")).toEqual({ token: "lease-for-old-generation" });
+
+    install(store, { snapshotId: "new", watermark: 12, records: newRecords });
+    expect(store.readOfflineLease("room-secret")).toBeUndefined();
+    store.close();
   });
 
   it("fails closed for unavailable safeStorage, enforces bounds, and destroys residual files", async () => {

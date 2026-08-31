@@ -83,7 +83,8 @@ export type GovernanceClosedError =
       readonly code:
         | "room_revision_conflict"
         | "ownership_transfer_required"
-        | "room_archived";
+        | "room_archived"
+        | "room_read_only";
     }
   | { readonly status: 410; readonly code: "snapshot_expired" }
   | { readonly status: 429; readonly code: "rate_limited"; readonly retryAfterSeconds?: number }

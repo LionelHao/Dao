@@ -9,7 +9,7 @@ import {
   type SaveDialogOptions,
 } from "electron";
 import { hostname } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createPublicKey, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { identityPlatformFromNode } from "./identity/device-identity.js";
@@ -39,6 +39,8 @@ import { registerProjectLoopIpc } from "./project-loop/ipc.js";
 import { createDesktopToolSafetyRuntime } from "./tool-safety/production-runtime.js";
 import { registerToolSafetyIpc } from "./tool-safety/ipc.js";
 import { createEncryptedAuthorityCachePersistence } from "./governance/encrypted-authority-cache.js";
+import { createEncryptedAuthorityGenerationStore } from "./governance/encrypted-generation-store.js";
+import { createDesktopOfflineReadLeaseVerifier } from "./governance/offline-read-lease.js";
 import { createDesktopAttachmentAuthorityRuntime } from "./attachment-authority/production-runtime.js";
 import {
   createElectronAttachmentPorts,
@@ -49,6 +51,33 @@ import {
   blankGroupChatWindowOptions,
   installWindowSecurityPolicy,
 } from "./window.js";
+
+function offlineReadLeaseVerificationFromEnvironment() {
+  const keyId = process.env.NATIVE_IM_OFFLINE_LEASE_KEY_ID;
+  const publicKeySpki = process.env.NATIVE_IM_OFFLINE_LEASE_PUBLIC_KEY_SPKI_BASE64;
+  const tenantId = process.env.NATIVE_IM_OFFLINE_LEASE_TENANT_ID;
+  const serverSubject = process.env.NATIVE_IM_OFFLINE_LEASE_SERVER_SUBJECT;
+  if ([keyId, publicKeySpki, tenantId, serverSubject].every((value) => value === undefined)) {
+    return undefined;
+  }
+  if ([keyId, publicKeySpki, tenantId, serverSubject].some(
+    (value) => value === undefined || value.length === 0,
+  )) throw new Error("Offline read lease verification configuration is incomplete");
+  const publicKey = createPublicKey({
+    key: Buffer.from(publicKeySpki!, "base64"),
+    format: "der",
+    type: "spki",
+  });
+  if (publicKey.asymmetricKeyType !== "ed25519") {
+    throw new Error("Offline read lease verification key must be Ed25519");
+  }
+  return Object.freeze({
+    verifier: createDesktopOfflineReadLeaseVerifier({
+      verificationKeys: new Map([[keyId!, publicKey]]),
+    }),
+    authority: Object.freeze({ tenantId: tenantId!, serverSubject: serverSubject! }),
+  });
+}
 
 const currentDirectory = dirname(fileURLToPath(import.meta.url));
 
@@ -118,6 +147,7 @@ async function createWindow(): Promise<void> {
       encryptString: (plaintext) => safeStorage.encryptString(plaintext),
       decryptString: (ciphertext) => safeStorage.decryptString(Buffer.from(ciphertext)),
     }, identityPlatform);
+    const offlineReadLeaseVerification = offlineReadLeaseVerificationFromEnvironment();
     identity = createDesktopIdentityRuntime({
       dataDirectory: app.getPath("userData"),
       deviceLabel: createIdentityDeviceLabel(app.getName(), hostname()),
@@ -151,6 +181,15 @@ async function createWindow(): Promise<void> {
       cachePersistence: createEncryptedAuthorityCachePersistence({
         filePath: join(app.getPath("userData"), "authority-cache.v1.enc"),
         encryption: desktopEncryption,
+      }),
+      generationStoreFactory: (actorId) => createEncryptedAuthorityGenerationStore({
+        databasePath: join(app.getPath("userData"), "authority-cache.v2.sqlite"),
+        accountId: actorId,
+        encryption: desktopEncryption,
+      }),
+      ...(offlineReadLeaseVerification === undefined ? {} : {
+        offlineReadLeaseVerifier: offlineReadLeaseVerification.verifier,
+        offlineReadLeaseAuthority: offlineReadLeaseVerification.authority,
       }),
     });
     disposeGovernanceIpc = registerGovernanceIpc({

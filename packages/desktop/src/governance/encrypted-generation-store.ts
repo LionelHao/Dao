@@ -42,7 +42,7 @@ export interface EncryptedAuthorityGenerationStore {
     roomId: string;
     snapshotId: string;
     watermark: number;
-    expectedCount: number;
+    expectedCount?: number;
     checksum: string;
   }>): void;
   stageRoomRecords(
@@ -75,6 +75,9 @@ export interface EncryptedAuthorityGenerationStore {
     eventId: string,
     streamSeq: number,
   ): "unseen" | "exact" | "conflict";
+  writeOfflineLease(roomId: string, lease: unknown): void;
+  readOfflineLease(roomId: string): unknown | undefined;
+  clearOfflineLease(roomId: string): void;
   clearRoom(roomId: string): void;
   clearAccount(): void;
   close(): void;
@@ -139,6 +142,11 @@ const SCHEMA = `
     stream_seq INTEGER NOT NULL CHECK (stream_seq > 0),
     PRIMARY KEY (room_hash, event_hash),
     UNIQUE (room_hash, stream_seq)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS cache_offline_leases (
+    room_hash TEXT PRIMARY KEY,
+    generation_id TEXT NOT NULL REFERENCES cache_generations(generation_id) ON DELETE CASCADE,
+    sealed_lease BLOB NOT NULL
   ) STRICT;
 `;
 
@@ -413,8 +421,9 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
     beginRoomGeneration(input) {
       requireOpen();
       validateText(input.checksum, "checksum");
-      if (!nonnegativeSafeInteger(input.watermark) || !nonnegativeSafeInteger(input.expectedCount) ||
-          input.expectedCount > limits.maxRecordsPerRoom) {
+      const expectedCount = input.expectedCount ?? 0;
+      if (!nonnegativeSafeInteger(input.watermark) || !nonnegativeSafeInteger(expectedCount) ||
+          expectedCount > limits.maxRecordsPerRoom) {
         throw new EncryptedGenerationStoreError("bound_exceeded", "Generation metadata exceeded bounds");
       }
       const room = roomHash(input.roomId);
@@ -428,7 +437,7 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
             watermark, cursor, expected_count, checksum
           ) VALUES (?, ?, ?, 'staging', ?, ?, ?, ?)
         `).run(randomUUID(), room, snapshot, input.watermark, input.watermark,
-          input.expectedCount, input.checksum);
+          expectedCount, input.checksum);
       });
     },
     stageRoomRecords(roomId, snapshotId, records) {
@@ -465,7 +474,8 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
       const room = roomHash(input.roomId);
       const stage = generation(input.roomId, input.snapshotId, "staging");
       if (stage === undefined || typeof stage.generation_id !== "string" ||
-          stage.watermark !== input.watermark || stage.expected_count !== input.expectedCount ||
+          stage.watermark !== input.watermark ||
+          (stage.expected_count !== 0 && stage.expected_count !== input.expectedCount) ||
           stage.checksum !== input.checksum) {
         throw new EncryptedGenerationStoreError("invalid_generation", "Generation completion did not match");
       }
@@ -477,8 +487,10 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
       transaction(database, () => {
         const oldHead = active(input.roomId);
         options.fault?.("before-active-flip");
-        database.prepare("UPDATE cache_generations SET generation_state = 'active' WHERE generation_id = ?")
-          .run(stage.generation_id as string);
+        database.prepare(
+          `UPDATE cache_generations
+           SET generation_state = 'active', expected_count = ? WHERE generation_id = ?`,
+        ).run(input.expectedCount, stage.generation_id as string);
         database.prepare(`
           INSERT INTO cache_room_heads(room_hash, active_generation_id) VALUES (?, ?)
           ON CONFLICT(room_hash) DO UPDATE SET active_generation_id = excluded.active_generation_id
@@ -649,9 +661,59 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
         ? "exact"
         : "conflict";
     },
+    writeOfflineLease(roomId, lease) {
+      requireOpen();
+      const room = roomHash(roomId);
+      const activeGeneration = active(roomId);
+      if (activeGeneration === undefined || typeof activeGeneration.generation_id !== "string") {
+        throw new EncryptedGenerationStoreError(
+          "invalid_generation",
+          "Offline lease requires an active Room generation",
+        );
+      }
+      const identity = identifierHash(dataKey, "record", "offline-read-lease");
+      const sealed = sealRecord(
+        dataKey,
+        recordAad(accountHash, room, "offline-read-lease", identity),
+        { identity: "offline-read-lease", value: lease },
+        limits.maxRecordBytes,
+      );
+      database.prepare(`
+        INSERT INTO cache_offline_leases(room_hash, generation_id, sealed_lease) VALUES (?, ?, ?)
+        ON CONFLICT(room_hash) DO UPDATE SET
+          generation_id = excluded.generation_id,
+          sealed_lease = excluded.sealed_lease
+      `).run(room, activeGeneration.generation_id, sealed);
+    },
+    readOfflineLease(roomId) {
+      requireOpen();
+      const room = roomHash(roomId);
+      const row = database.prepare(`
+        SELECT lease.sealed_lease
+        FROM cache_offline_leases AS lease
+        JOIN cache_room_heads AS room_head
+          ON room_head.room_hash = lease.room_hash
+         AND room_head.active_generation_id = lease.generation_id
+        WHERE lease.room_hash = ?
+      `).get(room) as { sealed_lease?: unknown } | undefined;
+      if (row === undefined) return undefined;
+      const identity = identifierHash(dataKey, "record", "offline-read-lease");
+      return openRecord(
+        dataKey,
+        recordAad(accountHash, room, "offline-read-lease", identity),
+        blob(row.sealed_lease),
+        limits.maxRecordBytes,
+      ).value;
+    },
+    clearOfflineLease(roomId) {
+      requireOpen();
+      database.prepare("DELETE FROM cache_offline_leases WHERE room_hash = ?")
+        .run(roomHash(roomId));
+    },
     clearRoom(roomId) {
       requireOpen();
       transaction(database, () => {
+        database.prepare("DELETE FROM cache_offline_leases WHERE room_hash = ?").run(roomHash(roomId));
         database.prepare("DELETE FROM cache_room_heads WHERE room_hash = ?").run(roomHash(roomId));
         database.prepare("DELETE FROM cache_generations WHERE room_hash = ?").run(roomHash(roomId));
       });
@@ -661,6 +723,7 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
       transaction(database, () => {
         database.exec(`
           DELETE FROM cache_room_heads;
+          DELETE FROM cache_offline_leases;
           DELETE FROM cache_event_ledger;
           DELETE FROM cache_records;
           DELETE FROM cache_generations;

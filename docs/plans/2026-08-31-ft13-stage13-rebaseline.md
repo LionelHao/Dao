@@ -25,7 +25,7 @@ SHA-256 在开始时与任务给定值完全一致。本阶段不修改 Blueprin
 | --- | --- | --- | --- |
 | schema | 写作基线 v12，版本号留待 predecessor | immutable v26 | 如需物理字段/索引只追加 v27，不改 v1～v26 |
 | Requirement | 前言是旧 19 条/交叉集合 | 批准实施映射为本文 §4 的 21 条 | 以 21 条为直接范围 |
-| repair assembly | materialized/streaming 双份枚举 | `snapshot-worker.ts` 已以 closed registry 同时驱动两条路径，当前 union 32 kind | 保留单一 registry；补启动 fail-closed、当前 union 清单、全 kind parity/容量/抢占证明 |
+| repair assembly | materialized/streaming 双份枚举 | `snapshot-worker.ts` 已以 closed registry 同时驱动两条路径；Stage 13 补齐 assignment 后 union 为 33 kind | 保留单一 registry；补启动 fail-closed、当前 union 清单、全 kind parity/容量/抢占证明 |
 | offline lease | 当时没有实现 | 已有 Ed25519 issuer/verifier/invalidation 与持久化 seam | 不平行重写；接入生产 composition、RPC、Desktop verifier 与 cache gate |
 | Desktop cache | 计划为 SQLite/AES-GCM generation store | 仍是 safeStorage 整体加密的单 JSON，内存 staging/去重 | 替换为 main-only、AES-256-GCM、wrapped data key、事务 generation/cursor/ledger store |
 | cursor dedupe | 计划双唯一持久 ledger | `ClientSyncReplica` 仅持有进程内 `Set<eventId>` | eventId/seq 映射冲突、gap、backwards 进入 repair；apply/ledger/cursor 同事务 |
@@ -54,7 +54,7 @@ SHA-256 在开始时与任务给定值完全一致。本阶段不修改 Blueprin
 ### 3.2 有 seam 但尚未形成生产闭环
 
 - registry 结构存在，但缺少面向“当前全部 visible union”的固定 inventory 证据、生产启动
-  completeness 断言、32 kind 逐项 materialized/streaming canonical parity 与 10k/100k 容量证据。
+  completeness 断言、33 kind 逐项 materialized/streaming canonical parity 与 10k/100k 容量证据。
 - repair/page authorization 存在，但仍需对 logout、family/account revoke、membership remove、
   archive/reopen/credential generation 在 page 与 complete 之间的抢占给出全矩阵证据。
 - offline issuer/verifier 未进入 AuthorityWorker/WebSocket 生产签发路径，也没有 Desktop verifier、
@@ -116,9 +116,9 @@ project、tool safety、membership 与 archive 的现有 authoritative records�
 
 ## 5. 当前 repair record inventory
 
-当前 `RoomRepairRecord` union 与 `ROOM_REPAIR_KIND_MAP` 的 32 个 kind 必须恰好一一对应：
+当前 `RoomRepairRecord` union 与 `ROOM_REPAIR_KIND_MAP` 的 33 个 kind 必须恰好一一对应：
 
-`room`、`governance`、`membership`、`message`（deprecated compatibility）、
+`room`、`governance`、`membership`、`room-agent-assignment`、`message`（deprecated compatibility）、
 `timeline-message`、`message-revision`、`attachment`、`human-read`、`agent-judgement`、
 `open-item`、`open-item-agent-failure`、`light-task`、`agent-invocation-intent`、
 `agent-execution`、`agent-execution-attempt`、`agent-execution-retry`、

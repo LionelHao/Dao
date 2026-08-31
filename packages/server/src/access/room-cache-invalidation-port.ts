@@ -6,6 +6,8 @@ import type {
   RoomCacheInvalidationPort,
   RoomCacheInvalidationResult,
 } from "../room-governance/private-participant-contracts.js";
+import { createOutboxRetryPolicy, type OutboxRetryPolicy } from "../outbox-retry-policy.js";
+import { createOutboxAlertController, type OutboxAlertSink } from "../outbox-alert-sink.js";
 
 export const ROOM_ACCESS_AUTHORITY_SCHEMA_STATEMENTS = [
   `CREATE TABLE room_access_authority (
@@ -143,6 +145,8 @@ interface CommittedRoomCacheInvalidationIntentBase {
   readonly roomId: string;
   readonly lifecycleGeneration: number;
   readonly accessRevision: number;
+  readonly attempts: number;
+  readonly createdAtMs: number;
 }
 
 export type CommittedRoomCacheInvalidationIntent =
@@ -158,8 +162,13 @@ export interface RoomCacheInvalidationIntentAuthority {
   listCommittedReady(limit: number): Promise<readonly CommittedRoomCacheInvalidationIntent[]>;
   markCompleted(invalidationIntentId: string): Promise<void>;
   markFailed(
-    invalidationIntentId: string,
-    errorCode: "purge_failed" | "authority_unavailable",
+    input: Readonly<{
+      invalidationIntentId: string;
+      attempt: number;
+      errorCode: "purge_failed" | "authority_unavailable";
+      availableAtMs?: number;
+      deadLetteredAtMs?: number;
+    }>,
   ): Promise<void>;
 }
 
@@ -177,11 +186,18 @@ export class RoomCacheInvalidationPostCommitDispatcher {
   readonly #authority: RoomCacheInvalidationIntentAuthority;
   readonly #purge: RoomCachePurgeAdapter;
   readonly #batchLimit: number;
+  readonly #retryPolicy: OutboxRetryPolicy;
+  readonly #alerts: ReturnType<typeof createOutboxAlertController>;
+  readonly #now: () => number;
 
   constructor(options: Readonly<{
     authority: RoomCacheInvalidationIntentAuthority;
     purge: RoomCachePurgeAdapter;
     batchLimit: number;
+    retryPolicy?: OutboxRetryPolicy;
+    alertSink?: OutboxAlertSink;
+    now?: () => number;
+    random?: () => number;
   }>) {
     if (!Number.isSafeInteger(options.batchLimit) || options.batchLimit <= 0) {
       throw new TypeError("Room cache invalidation batch limit is invalid");
@@ -189,6 +205,14 @@ export class RoomCacheInvalidationPostCommitDispatcher {
     this.#authority = options.authority;
     this.#purge = options.purge;
     this.#batchLimit = options.batchLimit;
+    this.#retryPolicy = options.retryPolicy ?? createOutboxRetryPolicy({
+      batchSize: Math.min(options.batchLimit, 100),
+      ...(options.random === undefined ? {} : { random: options.random }),
+    });
+    this.#alerts = createOutboxAlertController({
+      sink: options.alertSink ?? { emit: () => undefined },
+    });
+    this.#now = options.now ?? Date.now;
   }
 
   async dispatchReadyBatch(): Promise<RoomCacheInvalidationDispatchResult> {
@@ -201,12 +225,42 @@ export class RoomCacheInvalidationPostCommitDispatcher {
     let completed = 0;
     let failed = 0;
     for (const intent of intents) {
+      const currentNow = this.#now();
+      await this.#alerts.observeBacklog({
+        family: "room-cache-invalidation",
+        deliveryId: intent.invalidationIntentId,
+        eventId: intent.invalidationIntentId,
+        occurredAtMs: intent.createdAtMs,
+        attempts: intent.attempts,
+      }, currentNow);
       try {
         await this.#purge.purgeCommittedRoom(intent);
         await this.#authority.markCompleted(intent.invalidationIntentId);
+        this.#alerts.settled("room-cache-invalidation", intent.invalidationIntentId);
         completed += 1;
       } catch {
-        await this.#authority.markFailed(intent.invalidationIntentId, "purge_failed");
+        const decision = this.#retryPolicy.afterFailure({
+          priorAttempts: intent.attempts,
+          nowMs: currentNow,
+        });
+        await this.#authority.markFailed({
+          invalidationIntentId: intent.invalidationIntentId,
+          attempt: decision.attempt,
+          errorCode: "purge_failed",
+          ...(decision.kind === "retry"
+            ? { availableAtMs: decision.availableAtMs }
+            : { deadLetteredAtMs: currentNow }),
+        });
+        if (decision.kind === "dead-letter") {
+          await this.#alerts.deadLetter({
+            family: "room-cache-invalidation",
+            deliveryId: intent.invalidationIntentId,
+            eventId: intent.invalidationIntentId,
+            attempts: decision.attempt,
+            ageMs: Math.max(0, currentNow - intent.createdAtMs),
+            reason: "send_rejected",
+          });
+        }
         failed += 1;
       }
     }
@@ -223,10 +277,12 @@ function isCommittedInvalidationIntent(
     candidate.invalidationIntentId.length > 0 &&
     typeof candidate.roomId === "string" && candidate.roomId.length > 0 &&
     Number.isSafeInteger(candidate.lifecycleGeneration) && candidate.lifecycleGeneration! >= 0 &&
-    Number.isSafeInteger(candidate.accessRevision) && candidate.accessRevision! >= 0;
+    Number.isSafeInteger(candidate.accessRevision) && candidate.accessRevision! >= 0 &&
+    Number.isSafeInteger(candidate.attempts) && candidate.attempts! >= 0 &&
+    Number.isSafeInteger(candidate.createdAtMs) && candidate.createdAtMs! >= 0;
   if (!common) return false;
-  if (candidate.reason === "room_archived") return Object.keys(value).length === 5;
+  if (candidate.reason === "room_archived") return Object.keys(value).length === 7;
   return (candidate.reason === "member_removed" || candidate.reason === "access_revoked") &&
-    Object.keys(value).length === 6 && typeof candidate.targetActorId === "string" &&
+    Object.keys(value).length === 8 && typeof candidate.targetActorId === "string" &&
     candidate.targetActorId.length > 0;
 }

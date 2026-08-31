@@ -92,7 +92,9 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
     keys.every((key) => Object.hasOwn(value, key));
 }
 
-function claims(value: unknown): value is DesktopOfflineReadLeaseClaims {
+export function isDesktopOfflineReadLeaseClaims(
+  value: unknown,
+): value is DesktopOfflineReadLeaseClaims {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
   if (!exactKeys(candidate, [
@@ -184,7 +186,7 @@ export function createDesktopOfflineReadLeaseVerifier(options: Readonly<{
     let value: unknown;
     try { value = JSON.parse(text); }
     catch { reject("malformed_claims"); }
-    if (!claims(value)) reject("malformed_claims");
+    if (!isDesktopOfflineReadLeaseClaims(value)) reject("malformed_claims");
     if (canonical(value) !== text) reject("noncanonical_claims");
     const key = options.verificationKeys.get(value.keyId);
     if (key === undefined) reject("unknown_key");

@@ -35,8 +35,10 @@ import {
   createOutboxDispatcher,
   type OutboxDispatchFrame,
   type OutboxDispatchStore,
+  type OutboxFailureLifecyclePort,
   type OutboxSendResult,
 } from "./outbox-dispatcher.js";
+import type { OutboxAlertSink } from "./outbox-alert-sink.js";
 import type {
   AuthenticatedSessionContext,
   AuthenticatedCommandContext,
@@ -46,6 +48,7 @@ import type {
   SyncQueryStore,
 } from "./persistence/contracts.js";
 import type { OutboxDelivery } from "./persistence/contracts.js";
+import type { IssuedOfflineReadLease } from "./access/offline-lease-invalidation-port.js";
 import {
   MessageValidationError,
   RoomAccessError,
@@ -219,6 +222,14 @@ export interface StartMessageWebSocketServerOptions {
   readonly afterSubscribeRegistered?: (roomId: string) => void | Promise<void>;
   readonly outboxStore?: OutboxDispatchStore;
   readonly outboxPollIntervalMs?: number;
+  readonly outboxFailureLifecycle?: OutboxFailureLifecyclePort;
+  readonly outboxAlertSink?: OutboxAlertSink;
+  readonly offlineReadLeaseAuthority?: {
+    issue(
+      context: AuthenticatedSessionContext,
+      roomId: string,
+    ): Promise<IssuedOfflineReadLease>;
+  };
   readonly subscriptionRegistry?: SubscriptionRegistry;
   readonly sync?: SyncService;
   readonly v2GateMaxEvents?: number;
@@ -1481,6 +1492,7 @@ function isCorrelatedRecoveryResponse(
       | "room.member.remove"
       | "room.archive"
       | "room.reopen"
+      | "offline-read-lease.issue"
       | "agent.invoke"
       | "agent.interrupt"
       | "agent.retry"
@@ -1631,6 +1643,7 @@ async function handleRecoveryFrame(
       | "room.member.remove"
       | "room.archive"
       | "room.reopen"
+      | "offline-read-lease.issue"
       | "agent.invoke"
       | "agent.interrupt"
       | "agent.retry"
@@ -3256,6 +3269,32 @@ async function handleFrame(
       }
       return;
     }
+    case "offline-read-lease.issue": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      const generation = context.credentialGeneration;
+      if (options.offlineReadLeaseAuthority === undefined) {
+        sendCurrentGeneration(socket, errorFrame(
+          503,
+          "dependency_unavailable",
+          "Offline read lease authority is unavailable",
+          frame.requestId,
+        ), generation, context);
+        return;
+      }
+      try {
+        const lease = await options.offlineReadLeaseAuthority.issue(session, frame.roomId);
+        sendCurrentGeneration(socket, {
+          type: "offline-read-lease.issued",
+          requestId: frame.requestId,
+          token: lease.token,
+          claims: lease.claims,
+        }, generation, context);
+      } catch (error: unknown) {
+        sendCurrentGeneration(socket, mappedError(error, frame.requestId), generation, context);
+      }
+      return;
+    }
     case "workspace.bootstrap.begin":
     case "workspace.bootstrap.page":
     case "room.sync":
@@ -3340,6 +3379,10 @@ export async function startMessageWebSocketServer(
         ...(options.outboxPollIntervalMs === undefined
           ? {}
           : { pollIntervalMs: options.outboxPollIntervalMs }),
+        ...(options.outboxFailureLifecycle === undefined
+          ? {}
+          : { failureLifecycle: options.outboxFailureLifecycle }),
+        ...(options.outboxAlertSink === undefined ? {} : { alertSink: options.outboxAlertSink }),
         async send(candidate, frame: OutboxDispatchFrame, delivery: OutboxDelivery) {
           const live = liveConnections.get(candidate.connectionId);
           const session = live?.context.session;

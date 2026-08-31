@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   listAuthorityTables,
   migrateAuthorityDatabase,
-  migrateAuthorityDatabaseToPreviousVersionForTest,
+  migrateAuthorityDatabaseToHistoricalVersionForTest,
   readSchemaVersion,
 } from "./schema.js";
 
@@ -55,7 +55,7 @@ export function defineV26RollbackRangeTest(first: number, last: number): void {
           failAfterStatement += 1
         ) {
           withDatabase((database) => {
-            migrateAuthorityDatabaseToPreviousVersionForTest(database);
+            migrateAuthorityDatabaseToHistoricalVersionForTest(database, 25);
             const before = snapshot(database);
 
             expect(() => migrateAuthorityDatabase(database, { failAfterStatement }))

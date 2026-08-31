@@ -103,6 +103,6 @@ export const AUTHORITATIVE_OUTBOX_FAMILIES = Object.freeze([
     terminalState: "dead_letter" },
   { id: "room-cache-invalidation", table: "room_cache_invalidation_intents",
     classification: "security-post-commit-intent", consumer: "cache-invalidation-dispatcher",
-    requiresV27: false, batchSize: 100, maxAttempts: 8,
+    requiresV27: true, batchSize: 100, maxAttempts: 8,
     backlogWarningMs: 60000, backlogCriticalMs: 300000, terminalState: "dead_letter" },
 ] as const satisfies readonly AuthoritativeOutboxFamilyDescriptor[]);

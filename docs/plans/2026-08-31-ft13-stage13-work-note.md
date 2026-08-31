@@ -56,7 +56,7 @@ Shared hot files 由主 Agent 独占：
 ## 5. 计划证据索引
 
 - Requirement：见 rebaseline §4 的 21 条逐项表。
-- repair kinds：见 rebaseline §5 的 32 kind 清单。
+- repair kinds：见 rebaseline §5 的 33 kind 清单（含 Stage 13 补齐的 `room-agent-assignment`）。
 - UI/error/a11y：见 rebaseline §7；设计偏离为“无”。
 - production contracts：见 production addendum §§2～7。
 - schema：如需物理变更使用 immutable v27；不得修改 v1～v26。

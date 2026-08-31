@@ -10,6 +10,11 @@ import { isProjectEvent } from "@native-im/core";
 import type { ClientAuthorityCache, DesktopRoomEvent } from "../sync/client-sync-replica.js";
 import type { GovernanceProjection } from "../renderer/governance/view-model.js";
 import type { AuthorityCachePersistence } from "./encrypted-authority-cache.js";
+import type { EncryptedAuthorityGenerationStore } from "./encrypted-generation-store.js";
+import {
+  isDesktopOfflineReadLeaseClaims,
+  type DesktopOfflineReadLeaseClaims,
+} from "./offline-read-lease.js";
 
 interface CatalogStage { readonly snapshotId: string; readonly rooms: RoomSummary[] }
 interface RoomStage { readonly snapshotId: string; readonly records: RoomRepairRecord[] }
@@ -219,17 +224,32 @@ export interface DesktopAuthorityCache extends ClientAuthorityCache {
   clearRoom(roomId: string): void;
   waitForPersistence(): Promise<void>;
   restore(actorId: string): Promise<boolean>;
+  installOfflineReadLease(roomId: string, lease: Readonly<{
+    token: string;
+    claims: DesktopOfflineReadLeaseClaims;
+  }>): void;
+  offlineReadLease(roomId: string): Readonly<{
+    token: string;
+    claims: DesktopOfflineReadLeaseClaims;
+  }> | undefined;
+  close(): void;
 }
 
 export function createDesktopAuthorityCache(
   now: () => string = () => new Date().toISOString(),
   persistence?: AuthorityCachePersistence,
+  generationStoreFactory?: (actorId: string) => EncryptedAuthorityGenerationStore,
 ): DesktopAuthorityCache {
   let catalogStage: CatalogStage | undefined;
   let catalog: RoomSummary[] = [];
   const roomStages = new Map<string, RoomStage>();
   const rooms = new Map<string, LiveRoom>();
+  const offlineLeases = new Map<string, Readonly<{
+    token: string;
+    claims: DesktopOfflineReadLeaseClaims;
+  }>>();
   let activeActorId: string | undefined;
+  let generationStore: EncryptedAuthorityGenerationStore | undefined;
   let persistenceWork = Promise.resolve();
   const roomListeners = new Set<(
     roomId: string,
@@ -289,6 +309,18 @@ export function createDesktopAuthorityCache(
     stageRoomPage(page) {
       const stage = roomStages.get(page.roomId);
       if (stage?.snapshotId !== page.snapshotId) throw new TypeError("Room stage is absent");
+      if (stage.records.length === 0 && generationStore !== undefined) {
+        generationStore.beginRoomGeneration({
+          roomId: page.roomId,
+          snapshotId: page.snapshotId,
+          watermark: page.watermark,
+          checksum: page.snapshotChecksum,
+        });
+      }
+      generationStore?.stageRoomRecords(page.roomId, page.snapshotId, page.records.map((record) => ({
+        identity: recordIdentity(record),
+        value: record,
+      })));
       stage.records.push(...structuredClone(page.records));
     },
     async finalizeRoom(snapshotId, expectedChecksum) {
@@ -303,6 +335,14 @@ export function createDesktopAuthorityCache(
     commitRoom(roomId, watermark) {
       const stage = roomStages.get(roomId);
       if (stage === undefined) throw new TypeError("Room stage is absent");
+      const checksum = authoritySnapshotChecksum("room", stage.records);
+      generationStore?.commitRoomGeneration({
+        roomId,
+        snapshotId: stage.snapshotId,
+        watermark,
+        expectedCount: stage.records.length,
+        checksum,
+      });
       rooms.set(roomId, {
         records: structuredClone(stage.records),
         cursor: { version: 1, roomId, afterSeq: watermark },
@@ -315,7 +355,19 @@ export function createDesktopAuthorityCache(
     applyRoomEvents(roomId, events, cursor) {
       const room = rooms.get(roomId);
       if (room === undefined) throw new TypeError("Live Room is absent");
-      for (const event of events) applyProjectionEvent(room.records, event);
+      const nextRecords = structuredClone(room.records);
+      for (const event of events) applyProjectionEvent(nextRecords, event);
+      if (generationStore !== undefined) {
+        const nextIdentities = new Set(nextRecords.map(recordIdentity));
+        generationStore.applyRoomEventBatch({
+          roomId,
+          events: events.map((event) => ({ eventId: event.eventId, streamSeq: event.streamSeq })),
+          nextCursor: cursor.afterSeq,
+          upserts: nextRecords.map((record) => ({ identity: recordIdentity(record), value: record })),
+          deletes: room.records.map(recordIdentity).filter((identity) => !nextIdentities.has(identity)),
+        });
+      }
+      room.records = nextRecords;
       room.cursor = structuredClone(cursor);
       room.updatedAt = now();
       publishRoom(roomId);
@@ -324,7 +376,10 @@ export function createDesktopAuthorityCache(
     discardSnapshot(snapshotId) {
       if (catalogStage?.snapshotId === snapshotId) catalogStage = undefined;
       for (const [roomId, stage] of roomStages) {
-        if (stage.snapshotId === snapshotId) roomStages.delete(roomId);
+        if (stage.snapshotId === snapshotId) {
+          generationStore?.discardRoomGeneration(roomId, snapshotId);
+          roomStages.delete(roomId);
+        }
       }
     },
     clear() {
@@ -333,8 +388,11 @@ export function createDesktopAuthorityCache(
       catalog = [];
       roomStages.clear();
       rooms.clear();
+      offlineLeases.clear();
       for (const roomId of roomIds) publishRoom(roomId);
       activeActorId = undefined;
+      generationStore?.clearAccount();
+      generationStore = undefined;
       if (persistence !== undefined) schedulePersistence(() => persistence.clear());
     },
     clearRoom(roomId) {
@@ -347,6 +405,8 @@ export function createDesktopAuthorityCache(
       catalog = catalog.filter((room) => room.roomId !== roomId);
       roomStages.delete(roomId);
       rooms.delete(roomId);
+      offlineLeases.delete(roomId);
+      generationStore?.clearRoom(roomId);
       publishRoom(roomId);
       persist();
     },
@@ -402,6 +462,16 @@ export function createDesktopAuthorityCache(
       roomListeners.add(listener);
       return () => roomListeners.delete(listener);
     },
+    installOfflineReadLease(roomId, lease) {
+      if (lease.claims.room.roomId !== roomId) throw new TypeError("Offline lease Room mismatch");
+      const closed = structuredClone(lease);
+      generationStore?.writeOfflineLease(roomId, closed);
+      offlineLeases.set(roomId, closed);
+    },
+    offlineReadLease(roomId) {
+      const lease = offlineLeases.get(roomId);
+      return lease === undefined ? undefined : structuredClone(lease);
+    },
     async restore(actorId) {
       if (activeActorId === actorId) return rooms.size > 0;
       if (activeActorId !== undefined && activeActorId !== actorId) {
@@ -410,6 +480,7 @@ export function createDesktopAuthorityCache(
         for (const roomId of priorRoomIds) publishRoom(roomId);
       }
       if (persistence === undefined) { activeActorId = actorId; return false; }
+      generationStore ??= generationStoreFactory?.(actorId);
       await persistenceWork;
       const value = await persistence.load();
       if (typeof value !== "object" || value === null || Array.isArray(value) ||
@@ -443,8 +514,32 @@ export function createDesktopAuthorityCache(
               expiresAt: "2099-01-01T00:00:00.000Z" })) {
           await persistence.clear().catch(() => undefined); activeActorId = actorId; return false;
         }
-        restored.set(item.roomId, { records: structuredClone(item.records) as RoomRepairRecord[],
-          cursor: structuredClone(item.cursor), updatedAt: item.updatedAt });
+        const durable = generationStore?.readActiveRoom(item.roomId);
+        const durableRecords = durable?.records.map((record) => record.value);
+        if (generationStore !== undefined && (durable === undefined ||
+            !Array.isArray(durableRecords) || durable.cursor.afterSeq !== item.cursor.afterSeq ||
+            authoritySnapshotChecksum("room", durableRecords) !== item.checksum ||
+            !isRoomRepairPage({ type: "room.repair.page", requestId: "cache-durable-restore",
+              snapshotId: `cache:${item.roomId}`, roomId: item.roomId, page: 0,
+              records: durableRecords, watermark: durable.cursor.afterSeq,
+              snapshotChecksum: item.checksum, hasMore: false, mode: "materialized",
+              expiresAt: "2099-01-01T00:00:00.000Z" }))) {
+          generationStore.clearAccount(); generationStore = undefined;
+          await persistence.clear().catch(() => undefined); activeActorId = actorId; return false;
+        }
+        restored.set(item.roomId, {
+          records: structuredClone((durableRecords ?? item.records) as RoomRepairRecord[]),
+          cursor: structuredClone(durable?.cursor ?? item.cursor), updatedAt: item.updatedAt,
+        });
+        const lease = generationStore?.readOfflineLease(item.roomId);
+        if (lease !== undefined && typeof lease === "object" && lease !== null &&
+            "token" in lease && typeof lease.token === "string" && lease.token.length > 0 &&
+            "claims" in lease && isDesktopOfflineReadLeaseClaims(lease.claims) &&
+            lease.claims.actorId === actorId && lease.claims.room.roomId === item.roomId) {
+          offlineLeases.set(item.roomId, structuredClone(lease) as Readonly<{
+            token: string; claims: DesktopOfflineReadLeaseClaims;
+          }>);
+        }
       }
       const priorRoomIds = new Set(rooms.keys());
       rooms.clear();
@@ -452,6 +547,10 @@ export function createDesktopAuthorityCache(
       activeActorId = actorId;
       for (const roomId of priorRoomIds) publishRoom(roomId);
       return restored.size > 0;
+    },
+    close() {
+      generationStore?.close();
+      generationStore = undefined;
     },
   };
 }
