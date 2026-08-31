@@ -1,16 +1,16 @@
 # FT-13 Sync & Reliability · Stage 13 交付说明
 
-> 状态：实现候选已收口；内容 PR、required CI、远程合并与 evidence PR 尚未发生，本文用
-> `PENDING` 明确标识待回填事实。本文只记录可复核证据，不把 Agent 自测、CI 或审阅等同于
-> owner 验收，不标记 verified。
+> 状态：内容 PR #77 已通过 required CI 并合入远端主分支；本文位于从该 merge 新建的
+> evidence-only worktree，正在固化最终证据。本文只记录可复核事实，不把 Agent 自测、CI、
+> 独立审阅或远程合并等同于 owner 验收，不标记 verified。
 
 ## 1. 一句话结果
 
 FT-13 已在当前内容分支上把单一 AuthorityWorker/SQLite writer、封闭 repair registry、连续
 cursor/fixed-watermark repair、Desktop main-process AES-256-GCM generation cache、服务端签名的有限
-offline read lease、30 天 command receipt 和有界 at-least-once outbox 收敛为同一生产候选链路；
-最终测试计数、独立 reviewer 结论与远程 PR/CI/merge 事实仍待最终门禁及 evidence PR
-如实回填。
+offline read lease、30 天 command receipt 和有界 at-least-once outbox 收敛为同一生产链路；
+最终内容 head `53b1881` 的 270 files / 2804 tests、双 Node required CI、独立 reviewer
+`P0/P1/P2 = 0/0/0` 与内容 merge `551e998` 均已有可复核证据。
 
 ## 2. 权威基线与 rebaseline
 
@@ -247,8 +247,9 @@ peer isolation、revalidation、dead-letter、告警脱敏、无连接、send-be
   rollback position。`schema-foundations.test.ts`、`schema-integrity.test.ts`、`schema-recent.test.ts`
   与 legacy importer 继续覆盖 future/unknown/history/checksum/fingerprint/physical tamper、reopen 和 invariants。
 
-> 注：migration checksum 取自当前代码的实际 `AUTHORITY_V27_MIGRATION_CHECKSUM_FOR_TEST`计算结果；
-> evidence PR 回填前仍须由最终 schema suite 输出再确认。
+> 注：migration checksum 取自最终内容代码的实际
+> `AUTHORITY_V27_MIGRATION_CHECKSUM_FOR_TEST` 计算结果；最终 schema suite 23 files / 145 tests
+> 全部通过，并由独立 reviewer 再次确认 69 个 rollback 注入点无缺口、无重复。
 
 ## 12. UI J-01/J-02/J-07 状态与权威来源
 
@@ -296,36 +297,35 @@ opt-in live smoke。
 
 | 命令/门禁 | 状态 | 精确输出/证据 |
 | --- | --- | --- |
-| `corepack pnpm typecheck` | `PENDING_FINAL_GATE` | 最终内容 head 回填 |
-| `corepack pnpm lint` | `PENDING_FINAL_GATE` | 最终内容 head 回填 |
-| `corepack pnpm test` | `PENDING_FINAL_GATE` | 用 Vitest 最终 summary 回填，不沿用中间运行数 |
-| `corepack pnpm build` | `PENDING_FINAL_GATE` | 最终内容 head 回填 |
-| `corepack pnpm verify:core-boundary` | `PENDING_FINAL_GATE` | 最终内容 head 回填 |
-| `git diff --check` | `PENDING_FINAL_GATE` | 最终文档提交后回填 |
-| Electron smoke | `PENDING_FINAL_GATE` | 记录实际命令/结果 |
-| repository/runtime secret sentinel | `PENDING_FINAL_GATE` | 记录实际 suite 与 count |
-| encrypted-cache plaintext sentinel | `PENDING_FINAL_GATE` | 记录实际 suite 与 count |
+| `corepack pnpm typecheck` | `PASS` | 最终内容 head 完整 TypeScript build/type-test 通过 |
+| `corepack pnpm lint` | `PASS` | ESLint `--max-warnings=0` |
+| `corepack pnpm test` | `PASS` | 267 passed + 3 safely skipped = 270 files；2801 passed + 3 safely skipped = 2804 tests；0 failed；853.01s |
+| `corepack pnpm build` | `PASS` | Core、Server、Desktop 全部 build 完成 |
+| `corepack pnpm verify:core-boundary` | `PASS` | Core 无 I/O dependency/import；完整 test 同时验证 Desktop renderer 29 个生产 source 无 Node/Electron authority |
+| `git diff --check` | `PASS` | 内容最终提交与 evidence 文档 patch 均无 whitespace error |
+| Electron smoke | `PASS` | `corepack pnpm --filter @native-im/desktop smoke`：app bridge、native selection、secure preview loaded |
+| repository/runtime secret sentinel | `PASS` | 2 files / 2 named sentinel tests passed |
+| encrypted-cache plaintext sentinel | `PASS` | 2 files / 2 named sentinel tests passed；同一 selector 下其余 20 tests 明确跳过，未冒充 pass |
 
 ### 13.2 精确分类计数表
 
 | 分类 | Test files | Passed files | Skipped files | Failed files | Tests | Passed | Skipped | Failed | 状态 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 全仓总计 | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | 以最终 `pnpm test` 回填 |
-| Core | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | 最终 package summary |
-| Server | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | 最终 package summary |
-| Desktop | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | 最终 package summary |
-| FT-13 focused | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | 以显式文件清单运行回填 |
-| schema | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | v1–v27 + rollback/invariant/fingerprint |
-| repair/cursor | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | registry/parity/fixed-W/capacity |
-| idempotency | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | lifecycle/inventory/50k capacity |
-| outbox | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | policy/dispatcher/10k capacity |
-| Desktop cache/offline lease | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | generation/sentinel/runtime gates |
-| real restart E2E | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | real Worker + file SQLite + Desktop main cache |
-| capacity suites | 3 current dedicated files + repair E2E fixture | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` | 50k receipts、10k outbox、10k encrypted cache、10k repair |
+| 全仓总计 | 270 | 267 | 3 | 0 | 2804 | 2801 | 3 | 0 | 最终 `pnpm test` |
+| Core | 13 | 13 | 0 | 0 | 117 | 117 | 0 | 0 | package 精确归属 |
+| Server | 180 | 177 | 3 | 0 | 2004 | 2001 | 3 | 0 | 3 个 OpenAI live files 安全跳过 |
+| Desktop | 77 | 77 | 0 | 0 | 683 | 683 | 0 | 0 | package 精确归属 |
+| FT-13 focused | 55 | 55 | 0 | 0 | 752 | 752 | 0 | 0 | 最终 head 的 55 个 changed test files 显式清单；578.89s |
+| schema | 23 | 23 | 0 | 0 | 145 | 145 | 0 | 0 | v1–v27 + rollback/invariant/fingerprint |
+| repair/cursor | 6 | 6 | 0 | 0 | 168 | 168 | 0 | 0 | registry/parity/fixed-W/capacity |
+| idempotency | 3 | 3 | 0 | 0 | 17 | 17 | 0 | 0 | lifecycle/inventory/50k capacity |
+| outbox | 5 | 5 | 0 | 0 | 27 | 27 | 0 | 0 | policy/dispatcher/10k capacity |
+| Desktop cache/offline lease | 11 | 11 | 0 | 0 | 140 | 140 | 0 | 0 | generation/sentinel/runtime gates |
+| real restart E2E | 1 | 1 | 0 | 0 | 30 | 30 | 0 | 0 | real Worker + file SQLite + Desktop main cache |
+| capacity named selection | 4 | 4 | 0 | 0 | 33 | 4 | 29 | 0 | 四项容量断言通过；selector 跳过同文件内 29 个非容量用例 |
 
-起点基线 255 files / 2693 tests 只用于 rebaseline，不得冒充本阶段最终结果。上表
-`PENDING` 只能用最终内容 head 上的机器输出回填；如分类文件重叠，须在回填时同时给出
-去重口径，不得用分类之和伪装全仓总数。
+起点基线 255 files / 2693 tests 只用于 rebaseline，不冒充本阶段最终结果。除 Core/Server/Desktop
+三个互斥 package 行外，其余分类存在重叠，不能相加；全仓 270/2804 只取最终完整运行 summary。
 
 ## 14. Real restart E2E、capacity 与 sentinel
 
@@ -334,8 +334,8 @@ opt-in live smoke。
   fixed-W 10k mixed records、archive/reopen、clear-cache/cursor catch-up、send-before-mark 重放和最终
   replica convergence。
 - `encrypted-generation-store.test.ts` 和 capacity suite 对真实 Desktop main-process file cache 执行
-  staging/flip/reopen/lease/clear/purge/sentinel。组合的 real-worker + file-SQLite + Desktop-cache 端到端
-  命令与精确计数为 `PENDING_FINAL_GATE`，evidence 回填不得仅用内存 fake 代替。
+  staging/flip/reopen/lease/clear/purge/sentinel。最终真实 Authority E2E 为 1 file / 30 tests 全通过；
+  加密 store/sentinel/capacity 均使用真实文件 SQLite，不以 memory fake 代替。
 - PR 级容量：repair 10k/3 clients，receipts 50k，outbox 10k 且 10% failures，encrypted cache
   10k。100k repair/cache、1M receipts、100k outbox 是 nightly seam，不冒充 PR 门禁或 release 策略。
 - Desktop disk sentinel 扫描 DB/WAL/SHM/journal/tmp/backup/crash residual，对 raw corpus、account/room/event ID、
@@ -350,19 +350,23 @@ opt-in live smoke。
   派生值。本文也不嵌入 raw message/tool payload/test corpus。
 - 真实 OpenAI suites 仍是 opt-in；无显式 flag + secret 时必须记录“安全跳过”，不回退
   production mock。
-- 本次最终 live smoke 结果：`PENDING_FINAL_GATE`。evidence PR 只能回填实际 pass 或“因无
-  secret 安全跳过”以及精确 skip 数，不得把 skip 写成 pass。
+- 本次环境未设置 `OPENAI_API_KEY`；3 个 opt-in live files / 3 tests 安全跳过：
+  `openai-router-provider.live.test.ts`、`openai-memory-provider.live.test.ts`、
+  `openai-responses-provider.live.test.ts`。未读取或输出 secret，也未把 skip 写成 pass。
 
 ## 16. 独立审阅、已知风险与建议 reviewer
 
 ### 16.1 独立审阅
 
-- 已派出独立 Sol high reviewer；最终 P0/P1/P2 计数、每个发现与修复提交：
-  `PENDING_REVIEW_FINAL`。
+- 独立 Sol high reviewer 在最终内容 head 给出：`P0 = 0`、`P1 = 0`、`P2 = 0`、
+  `Mergeable: Yes`。最终复审确认 33-kind/lease/cache/outbox/schema 边界，并逐点核对
+  rollback 六段 `1–13、14–25、26–38、39–50、51–63、64–69` 共 69 个唯一位置。
 - 中间审阅重点暴露了租约过期需主动定时锁定、offline capability 需覆盖所有
   cache-backed Desktop surface、generation restore 不得被 legacy snapshot 逆向作废，以及 flip 前必须从
-  磁盘解密/重算 staging checksum/count。当前候选分别在 `e7c9c38` 与 `8f525fe` 收口；
-  这只是修复账本，不代替 reviewer 最终复审。
+  磁盘解密/重算 staging checksum/count。后续还修复了 device-bound context、active generation
+  offline visibility、unsupported/中断 rebuild、所有 cache deletion fence、CI 项目隔离、v27
+  历史与 rollback 矩阵分片，以及 stable-event/repair-completed 双收敛 E2E；最终提交为
+  `53b1881`，以上均已纳入最终复审。
 - 建议 reviewer 在内容 PR 最终 head 上重点复审：单 writer/无第二 authority；33-kind
   completeness、page/complete 抢占；租约 exact-expiry 与全 Desktop surface gate；磁盘密文残留；
   v1-v26 未改写；receipt exact expiry；peer accepted ledger/revoke；send-before-mark；archive 不冻结
@@ -378,8 +382,9 @@ opt-in live smoke。
    换取保密性。
 4. 100k/1M 规模是 nightly seam；当前 PR 门禁为 10k repair/cache/outbox 和 50k receipt。
    这不冻结 FT-14 运维阈值、retention、credential rotation 或 release policy。
-5. 最终全仓计数、Electron/live smoke、独立复审和远程 required CI 仍是交付门；在
-   `PENDING` 回填前，本文不宣称远程交付闭环已完成。
+5. 历史 CI 曾暴露 runner 资源饥饿、实进程事件/repair 竞态和 30 秒 migration matrix 边界；
+   失败 run 保留在下表。最终通过项目隔离、无断言弱化的矩阵分片与双权威收敛断言收口，
+   required CI run `33388107739` 双矩阵成功；这不改变未来 runner 性能仍需监测的事实。
 
 ## 17. Git、PR、CI 与 evidence 回填
 
@@ -388,24 +393,31 @@ opt-in live smoke。
 - 内容分支：`codex/ft13-stage13-sync-reliability`。
 - 内容 worktree：`/Users/leo/code/Dao-ft13-stage13`。
 - 起点：`origin/main@e19c1492e52cdf399b440c7dc959a5607c888e32`。
-- 本文初建时内容 head：`e7c9c38`；最终内容 head 需在 PR 创建前回填。
+- 本文初建时内容 head：`e7c9c38`；最终内容 remote head：
+  `53b18819d27d78d302e596d809b73fc3e440683d`。
 - 原始工作区 `/Users/leo/code/Dao` 及四个 owner 未跟踪文件不在本 worktree 的写入/
-  提交范围内；最终 SHA-256 复核与 worktree 清理事实为 `PENDING_FINAL_DELIVERY`。
+  提交范围内；内容合并后复核仍为原分支 `codex/ft02a-delivery-trace-fix`、原 HEAD
+  `979863e7936962626b54a130d0260a4689a9bfb0` 和仅四个原有 untracked files。其 SHA-256 依次为
+  `88a98e90739f79bfb97f90282a673d6a444cc57e12c782b721e6ba2f87a8f122`、
+  `8600eca88483da83ad9c2b4722cda4f891635990cef2be115218874250a5649c`、
+  `8c75b4e4a77cd4f0cce3fcccea58eeb51f497547a05ca9ac839e2d24e6ed9578`、
+  `8b535d6bafd118d977690071cfc499870dedc78e61f6a7f9b33874886007fdcd`。
 - 没有修改 Blueprint HTML/JSON，没有 force push，没有改写 v1-v26 migration。
 
 ### 17.2 远程事实表
 
 | 事实 | 值 | 回填规则 |
 | --- | --- | --- |
-| 内容 PR URL / number | `PENDING_CONTENT_PR` | 只在 GitHub 实际创建后回填 |
-| 内容 PR final head | `PENDING_CONTENT_HEAD` | 只记录实际 remote head SHA |
-| 内容 PR CI run | `PENDING_CONTENT_CI` | 回填 run URL 和 Node 22.13.1/22.x 每个 job 结果 |
-| 内容 PR merge SHA | `PENDING_CONTENT_MERGE` | 只在 required CI 绿且 GitHub 合并后回填 |
-| evidence PR URL / number | `PENDING_EVIDENCE_PR` | 从内容合并后的新 `origin/main` 创建 evidence-only worktree 后回填 |
-| evidence PR CI run | `PENDING_EVIDENCE_CI` | 只回填实际 run/job URL 和结果 |
-| evidence PR merge SHA | `PENDING_EVIDENCE_MERGE` | 只在 evidence PR 实际合并后回填 |
-| 最终 `origin/main` | `PENDING_FINAL_MAIN` | `git fetch origin --prune` 后回填 |
-| 临时 worktree 清理 | `PENDING_WORKTREE_CLEANUP` | 检查 clean/真实合并后 remove + prune，再回填 |
+| 内容 PR URL / number | https://github.com/LionelHao/Dao/pull/77 | GitHub 实际 PR |
+| 内容 PR final head | `53b18819d27d78d302e596d809b73fc3e440683d` | remote head |
+| 内容 PR CI run | https://github.com/LionelHao/Dao/actions/runs/33388107739 | success；Node 22.13.1 job `99475223728` 24m40s；Node 22.x job `99475223922` 23m26s |
+| 内容 PR merge SHA | `551e9983f1ae4205c090387f371c139db4b16847` | 2026-08-31T12:06:16Z squash merge |
+| 失败 CI 历史 | runs `33361557824`、`33366261341`、`33369496898` | 如实保留 runner timeout/资源饥饿、schema 边界与 E2E 竞态；未隐藏失败历史 |
+| evidence PR URL / number | evidence-only branch `codex/ft13-stage13-evidence` 已从 `551e998` 创建 | 首次提交后创建 GitHub PR，并在同一 PR 后续提交写入实际 URL |
+| evidence PR CI run | 由 evidence PR 的实际 checks 生成 | 首轮 green 后把真实 run/job URL 写入同一 PR，再等最终 head CI |
+| evidence PR merge SHA | GitHub 在 evidence PR 合并时生成，无法由该提交预先自指 | 精确 SHA 由合并后最终交付报告记录 |
+| 当前 `origin/main` | `551e9983f1ae4205c090387f371c139db4b16847` | 内容 PR 合并后 `git fetch origin --prune` 实测 |
+| 临时 worktree 清理 | evidence PR 合并后执行 clean check、`worktree remove` 与 `worktree prune` | 清理结果由合并后最终交付报告记录，避免文档伪造未来事实 |
 
 evidence PR 只允许更新本文中的真实内容 PR/CI/merge SHA、最终计数、reviewer 结论、
 live smoke、worktree 清理和原始工作区保护事实。它不得伪造链接，也不得在 evidence-only
