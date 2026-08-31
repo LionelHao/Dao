@@ -23,16 +23,20 @@ describe("FT-13 closed persistence inventory", () => {
       ]);
   });
 
-  it("enumerates exactly four authoritative delivery families and their current terminal seams", () => {
+  it("enumerates four durable post-commit ledgers without mislabeling cursor markers as delivery", () => {
     expect(AUTHORITATIVE_OUTBOX_FAMILIES).toHaveLength(4);
     expect(AUTHORITATIVE_OUTBOX_FAMILIES.map((entry) => entry.id)).toEqual([
       "central", "deployment-profile", "project-shadow", "room-cache-invalidation",
     ]);
     expect(new Set(AUTHORITATIVE_OUTBOX_FAMILIES.map((entry) => entry.table)).size).toBe(4);
     expect(AUTHORITATIVE_OUTBOX_FAMILIES.find((entry) => entry.id === "project-shadow"))
-      .toMatchObject({ classification: "terminal-mirror-reserved", consumer: "central-mirror" });
+      .toMatchObject({ classification: "terminal-mirror-reserved", consumer: "central-mirror",
+        deliveryContract: "central-terminal-mirror", maxAttempts: null,
+        terminalState: "mirrored_from_central" });
     expect(AUTHORITATIVE_OUTBOX_FAMILIES.find((entry) => entry.id === "deployment-profile"))
-      .toMatchObject({ classification: "dedicated-authoritative-stream", requiresV27: true });
+      .toMatchObject({ classification: "authoritative-cursor-marker", requiresV27: true,
+        deliveryContract: "authoritative-cursor-recovery", maxAttempts: null,
+        terminalState: "dispatched_marker" });
   });
 
   it.each(IDEMPOTENCY_RECEIPT_FAMILIES)(
@@ -53,8 +57,10 @@ describe("FT-13 closed persistence inventory", () => {
     },
   );
 
-  it.each(AUTHORITATIVE_OUTBOX_FAMILIES)(
-    "$id declares the common bounded terminal contract",
+  it.each(AUTHORITATIVE_OUTBOX_FAMILIES.filter(
+    (entry) => entry.deliveryContract === "bounded-at-least-once",
+  ))(
+    "$id declares the bounded at-least-once terminal contract",
     (entry) => {
       expect(entry).toMatchObject({
         batchSize: 100,
@@ -66,4 +72,10 @@ describe("FT-13 closed persistence inventory", () => {
       expect(entry.consumer.length).toBeGreaterThan(0);
     },
   );
+
+  it("limits the independent bounded send/retry contract to actual delivery consumers", () => {
+    expect(AUTHORITATIVE_OUTBOX_FAMILIES.filter(
+      (entry) => entry.deliveryContract === "bounded-at-least-once",
+    ).map((entry) => entry.id)).toEqual(["central", "room-cache-invalidation"]);
+  });
 });

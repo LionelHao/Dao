@@ -30,7 +30,7 @@ SHA-256 在开始时与任务给定值完全一致。本阶段不修改 Blueprin
 | Desktop cache | 计划为 SQLite/AES-GCM generation store | 仍是 safeStorage 整体加密的单 JSON，内存 staging/去重 | 替换为 main-only、AES-256-GCM、wrapped data key、事务 generation/cursor/ledger store |
 | cursor dedupe | 计划双唯一持久 ledger | `ClientSyncReplica` 仅持有进程内 `Set<eventId>` | eventId/seq 映射冲突、gap、backwards 进入 repair；apply/ledger/cursor 同事务 |
 | idempotency | 30 天目标但旧审计认为 replay 永久 | 多 family 已有 30 天常量/expiry seam；tenant administration 仍有 24h 默认，清理分散 | 建立封闭 inventory、统一 exact-expiry 与 Worker janitor |
-| outbox | 中央 row/peer 重试目标 | 多个 authoritative family，各自状态能力不一致 | 全 family inventory；统一 bounded policy/dead-letter/alert/peer isolation |
+| post-commit ledger | 中央 row/peer 重试目标 | 多个 durable family，各自执行语义不一致 | 全 family inventory；独立 delivery 使用 bounded policy/dead-letter/alert/peer isolation，cursor marker 与 terminal mirror 单独分类且不得虚称发送 |
 | UX | J-01/J-02/J-07 为批准表面 | view-model 覆盖部分状态，生产 wiring 不完整；Agent Settings 断线时伪造本地 +30s lease | 删除伪 lease；只用 server lease + 完整 cache generation；不实现 FT-12 通知中心 |
 | 测试数 | 旧计划数字已过时 | Stage 12 基线 255 files / 2693 tests（3 个 live smoke 安全跳过） | 只作为前置基线；交付写实际最终精确计数 |
 
@@ -80,7 +80,7 @@ SHA-256 在开始时与任务给定值完全一致。本阶段不修改 Blueprin
    不得静默明文或静默忘记故障。
 6. exact-expiry/30 天语义和 bounded cleanup 尚未覆盖当前所有 command receipt family；已知
    tenant administration 默认仍是 24h。
-7. authoritative outbox family 尚未统一 250ms full-jitter exponential backoff、30s cap、8 attempts、
+7. 独立 authoritative delivery consumer 尚未统一 250ms full-jitter exponential backoff、30s cap、8 attempts、
    batch 100、dead-letter、60s/5min alerts 与 process-local accepted peer ledger。
 8. 缺少真实 AuthorityWorker + 文件 SQLite + Desktop main cache 的三客户端 restart/revoke/archive/
    repair/outbox 全链 E2E，以及 10k PR 容量证据。

@@ -599,6 +599,8 @@ export interface AuthenticatedFrame {
   readonly requestId: string;
   readonly accountId: string;
   readonly actorId: string;
+  readonly sessionFamilyId?: string;
+  readonly deviceId?: string;
   readonly sessionId?: string;
   readonly accessToken?: string;
   readonly refreshToken?: string;

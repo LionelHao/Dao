@@ -72,37 +72,45 @@ export const IDEMPOTENCY_RECEIPT_FAMILIES = Object.freeze([
 
 export type OutboxClassification =
   | "central-transport"
-  | "dedicated-authoritative-stream"
+  | "authoritative-cursor-marker"
   | "terminal-mirror-reserved"
   | "security-post-commit-intent";
+
+export type OutboxDeliveryContract =
+  | "bounded-at-least-once"
+  | "authoritative-cursor-recovery"
+  | "central-terminal-mirror";
 
 export interface AuthoritativeOutboxFamilyDescriptor {
   readonly id: string;
   readonly table: string;
   readonly classification: OutboxClassification;
   readonly consumer: string;
+  readonly deliveryContract: OutboxDeliveryContract;
   readonly requiresV27: boolean;
   readonly batchSize: 100;
-  readonly maxAttempts: 8;
-  readonly backlogWarningMs: 60000;
-  readonly backlogCriticalMs: 300000;
-  readonly terminalState: "dead_letter";
+  readonly maxAttempts: 8 | null;
+  readonly backlogWarningMs: 60000 | null;
+  readonly backlogCriticalMs: 300000 | null;
+  readonly terminalState: "dead_letter" | "dispatched_marker" | "mirrored_from_central";
 }
 
 export const AUTHORITATIVE_OUTBOX_FAMILIES = Object.freeze([
   { id: "central", table: "outbox_deliveries", classification: "central-transport",
-    consumer: "central-dispatcher", requiresV27: true, batchSize: 100, maxAttempts: 8,
+    consumer: "central-dispatcher", deliveryContract: "bounded-at-least-once",
+    requiresV27: true, batchSize: 100, maxAttempts: 8,
     backlogWarningMs: 60000, backlogCriticalMs: 300000, terminalState: "dead_letter" },
   { id: "deployment-profile", table: "deployment_profile_outbox",
-    classification: "dedicated-authoritative-stream", consumer: "deployment-profile-dispatcher",
-    requiresV27: true, batchSize: 100, maxAttempts: 8,
-    backlogWarningMs: 60000, backlogCriticalMs: 300000, terminalState: "dead_letter" },
+    classification: "authoritative-cursor-marker", consumer: "deployment-profile-cursor-settler",
+    deliveryContract: "authoritative-cursor-recovery", requiresV27: true, batchSize: 100,
+    maxAttempts: null, backlogWarningMs: null, backlogCriticalMs: null,
+    terminalState: "dispatched_marker" },
   { id: "project-shadow", table: "project_event_outbox",
     classification: "terminal-mirror-reserved", consumer: "central-mirror", requiresV27: true,
-    batchSize: 100, maxAttempts: 8, backlogWarningMs: 60000, backlogCriticalMs: 300000,
-    terminalState: "dead_letter" },
+    deliveryContract: "central-terminal-mirror", batchSize: 100, maxAttempts: null,
+    backlogWarningMs: null, backlogCriticalMs: null, terminalState: "mirrored_from_central" },
   { id: "room-cache-invalidation", table: "room_cache_invalidation_intents",
     classification: "security-post-commit-intent", consumer: "cache-invalidation-dispatcher",
-    requiresV27: true, batchSize: 100, maxAttempts: 8,
+    deliveryContract: "bounded-at-least-once", requiresV27: true, batchSize: 100, maxAttempts: 8,
     backlogWarningMs: 60000, backlogCriticalMs: 300000, terminalState: "dead_letter" },
 ] as const satisfies readonly AuthoritativeOutboxFamilyDescriptor[]);

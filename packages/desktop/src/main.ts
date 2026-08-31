@@ -184,7 +184,12 @@ async function createWindow(): Promise<void> {
       }),
       generationStoreFactory: (actorId) => createEncryptedAuthorityGenerationStore({
         databasePath: join(app.getPath("userData"), "authority-cache.v2.sqlite"),
-        accountId: actorId,
+        accountId: identity?.getCurrentAuthoritySession()?.accountId ?? (() => {
+          void actorId;
+          throw new Error("Authority cache account binding is unavailable");
+        })(),
+        tenantId: offlineReadLeaseVerification?.authority.tenantId ??
+          process.env.NATIVE_IM_TENANT_ID ?? "dao-local-tenant",
         encryption: desktopEncryption,
       }),
       ...(offlineReadLeaseVerification === undefined ? {} : {

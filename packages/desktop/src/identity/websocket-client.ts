@@ -39,6 +39,8 @@ export class IdentityTransportError extends Error {
 export interface IdentityIssuedSession {
   readonly accountId: string;
   readonly actorId: string;
+  readonly sessionFamilyId?: string;
+  readonly deviceId?: string;
   readonly sessionId: string;
   readonly accessToken: string;
   readonly refreshToken: string;
@@ -49,6 +51,8 @@ export interface IdentityIssuedSession {
 export interface IdentityResumedSession {
   readonly accountId: string;
   readonly actorId: string;
+  readonly sessionFamilyId?: string;
+  readonly deviceId?: string;
   readonly sessionId: string;
 }
 
@@ -146,6 +150,7 @@ function isDevice(value: IdentityDevice): boolean {
 }
 
 const RESUMED_FIELDS = new Set(["type", "requestId", "accountId", "actorId", "sessionId"]);
+const BOUND_RESUMED_FIELDS = new Set([...RESUMED_FIELDS, "sessionFamilyId", "deviceId"]);
 const ISSUED_FIELDS = new Set([
   "type",
   "requestId",
@@ -157,6 +162,7 @@ const ISSUED_FIELDS = new Set([
   "expiresAt",
   "refreshExpiresAt",
 ]);
+const BOUND_ISSUED_FIELDS = new Set([...ISSUED_FIELDS, "sessionFamilyId", "deviceId"]);
 const SESSIONS_FIELDS = new Set(["type", "requestId", "sessions"]);
 const PUBLIC_SESSION_REQUIRED_FIELDS = new Set([
   "id",
@@ -296,8 +302,12 @@ function parseServerFrame(raw: string): ParsedServerFrame | undefined {
         !isBoundedString(value.actorId, IDENTITY_CONTRACT_LIMITS.actorId)
       ) return undefined;
       if (
-        hasOnlyFields(value, RESUMED_FIELDS) &&
-        isBoundedString(value.sessionId, IDENTITY_CONTRACT_LIMITS.sessionId)
+        (hasOnlyFields(value, RESUMED_FIELDS) || hasOnlyFields(value, BOUND_RESUMED_FIELDS)) &&
+        isBoundedString(value.sessionId, IDENTITY_CONTRACT_LIMITS.sessionId) &&
+        (!Object.hasOwn(value, "sessionFamilyId") ||
+          isBoundedString(value.sessionFamilyId, IDENTITY_CONTRACT_LIMITS.token)) &&
+        (!Object.hasOwn(value, "deviceId") ||
+          isBoundedString(value.deviceId, IDENTITY_CONTRACT_LIMITS.deviceId))
       ) {
         return {
           type: "auth.authenticated",
@@ -305,14 +315,21 @@ function parseServerFrame(raw: string): ParsedServerFrame | undefined {
           accountId: value.accountId,
           actorId: value.actorId,
           sessionId: value.sessionId,
+          ...(typeof value.sessionFamilyId === "string"
+            ? { sessionFamilyId: value.sessionFamilyId } : {}),
+          ...(typeof value.deviceId === "string" ? { deviceId: value.deviceId } : {}),
         };
       }
       if (
-        !hasOnlyFields(value, ISSUED_FIELDS) ||
+        (!hasOnlyFields(value, ISSUED_FIELDS) && !hasOnlyFields(value, BOUND_ISSUED_FIELDS)) ||
         !isBoundedString(value.sessionId, IDENTITY_CONTRACT_LIMITS.sessionId) ||
         !isBoundedString(value.accessToken, IDENTITY_CONTRACT_LIMITS.token) ||
         !isBoundedString(value.refreshToken, IDENTITY_CONTRACT_LIMITS.token) ||
-        !isIsoTimestamp(value.expiresAt) || !isIsoTimestamp(value.refreshExpiresAt)
+        !isIsoTimestamp(value.expiresAt) || !isIsoTimestamp(value.refreshExpiresAt) ||
+        (Object.hasOwn(value, "sessionFamilyId") &&
+          !isBoundedString(value.sessionFamilyId, IDENTITY_CONTRACT_LIMITS.token)) ||
+        (Object.hasOwn(value, "deviceId") &&
+          !isBoundedString(value.deviceId, IDENTITY_CONTRACT_LIMITS.deviceId))
       ) return undefined;
       return {
         type: "auth.authenticated",
@@ -320,6 +337,9 @@ function parseServerFrame(raw: string): ParsedServerFrame | undefined {
         accountId: value.accountId,
         actorId: value.actorId,
         sessionId: value.sessionId,
+        ...(typeof value.sessionFamilyId === "string"
+          ? { sessionFamilyId: value.sessionFamilyId } : {}),
+        ...(typeof value.deviceId === "string" ? { deviceId: value.deviceId } : {}),
         accessToken: value.accessToken,
         refreshToken: value.refreshToken,
         expiresAt: value.expiresAt,
@@ -642,6 +662,10 @@ export function createIdentityWebSocketClient(options: {
           accountId: response.accountId,
           actorId: response.actorId,
           sessionId: response.sessionId,
+          ...(response.sessionFamilyId === undefined ? {} : {
+            sessionFamilyId: response.sessionFamilyId,
+          }),
+          ...(response.deviceId === undefined ? {} : { deviceId: response.deviceId }),
           accessToken: response.accessToken,
           refreshToken: response.refreshToken,
           expiresAt: response.expiresAt,
@@ -662,6 +686,10 @@ export function createIdentityWebSocketClient(options: {
           accountId: response.accountId,
           actorId: response.actorId,
           sessionId: response.sessionId,
+          ...(response.sessionFamilyId === undefined ? {} : {
+            sessionFamilyId: response.sessionFamilyId,
+          }),
+          ...(response.deviceId === undefined ? {} : { deviceId: response.deviceId }),
         }));
     },
     refresh(refreshToken) {
@@ -676,6 +704,10 @@ export function createIdentityWebSocketClient(options: {
         accountId: response.accountId,
         actorId: response.actorId,
         sessionId: response.sessionId,
+        ...(response.sessionFamilyId === undefined ? {} : {
+          sessionFamilyId: response.sessionFamilyId,
+        }),
+        ...(response.deviceId === undefined ? {} : { deviceId: response.deviceId }),
         accessToken: response.accessToken,
         refreshToken: response.refreshToken,
         expiresAt: response.expiresAt,

@@ -1098,20 +1098,25 @@ function isHashedSessionIssue(value: unknown): value is HashedSessionIssue {
 function isIssuedSessionRecord(value: unknown): value is IssuedSessionRecord {
   return (
     isRecord(value) &&
-    hasExactKeys(value, [
+    (hasExactKeys(value, [
       "sessionId",
       "familyId",
       "publicSessionId",
       "accountId",
       "actorId",
+      "deviceId",
       "accessExpiresAt",
       "refreshExpiresAt",
-    ]) &&
+    ]) || hasExactKeys(value, [
+      "sessionId", "familyId", "publicSessionId", "accountId", "actorId",
+      "accessExpiresAt", "refreshExpiresAt",
+    ])) &&
     isTokenHash(value.sessionId) &&
     isTokenHash(value.familyId) &&
     isBoundedSessionText(value.publicSessionId) &&
     isText(value.accountId) &&
     isText(value.actorId) &&
+    (!Object.hasOwn(value, "deviceId") || isText(value.deviceId)) &&
     isNonNegativeSafeInteger(value.accessExpiresAt) &&
     isNonNegativeSafeInteger(value.refreshExpiresAt)
   );
@@ -1155,9 +1160,11 @@ function isAuthenticatedSessionContext(
 ): value is AuthenticatedSessionContext {
   return (
     isRecord(value) &&
-    hasExactKeys(value, ["sessionId", "sessionFamilyId", "principal"]) &&
+    (hasExactKeys(value, ["sessionId", "sessionFamilyId", "deviceId", "principal"]) ||
+      hasExactKeys(value, ["sessionId", "sessionFamilyId", "principal"])) &&
     isTokenHash(value.sessionId) &&
     isTokenHash(value.sessionFamilyId) &&
+    (!Object.hasOwn(value, "deviceId") || isText(value.deviceId)) &&
     isRecord(value.principal) &&
     hasExactKeys(value.principal, ["accountId", "actorId"]) &&
     isText(value.principal.accountId) &&

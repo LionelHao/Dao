@@ -225,8 +225,11 @@ export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined
   if (!record(value) || typeof value.type !== "string") return undefined;
   switch (value.type) {
     case "auth.authenticated":
-      return exact(value, ["type", "requestId", "accountId", "actorId", "sessionId"]) &&
-        text(value.requestId, 128) && text(value.accountId, 256) && text(value.actorId, 256) && text(value.sessionId, 256)
+      return exact(value, ["type", "requestId", "accountId", "actorId", "sessionId"],
+        ["sessionFamilyId", "deviceId"]) &&
+        text(value.requestId, 128) && text(value.accountId, 256) && text(value.actorId, 256) &&
+        text(value.sessionId, 256) && (value.sessionFamilyId === undefined ||
+          text(value.sessionFamilyId, 256)) && (value.deviceId === undefined || text(value.deviceId, 128))
         ? { type: value.type, requestId: value.requestId, actorId: value.actorId, sessionId: value.sessionId }
         : undefined;
     case "room.governance.ack": {

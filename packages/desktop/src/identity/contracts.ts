@@ -93,6 +93,8 @@ export interface IdentityStoredCredentials {
   readonly version: 1;
   readonly accountId: string;
   readonly actorId: string;
+  readonly sessionFamilyId?: string;
+  readonly deviceId?: string;
   readonly sessionId: string;
   readonly accessToken: string;
   readonly refreshToken: string;

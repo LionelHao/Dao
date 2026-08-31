@@ -106,8 +106,11 @@ function parseServerFrame(raw: string): ServerFrame | undefined {
   if (!record(value) || typeof value.type !== "string") return undefined;
   switch (value.type) {
     case "auth.authenticated":
-      return exact(value, ["type", "requestId", "accountId", "actorId", "sessionId"]) &&
-        id(value.requestId, 128) && id(value.accountId) && id(value.actorId) && id(value.sessionId)
+      return exact(value, ["type", "requestId", "accountId", "actorId", "sessionId"],
+        ["sessionFamilyId", "deviceId"]) &&
+        id(value.requestId, 128) && id(value.accountId) && id(value.actorId) && id(value.sessionId) &&
+        (value.sessionFamilyId === undefined || id(value.sessionFamilyId)) &&
+        (value.deviceId === undefined || id(value.deviceId, 128))
         ? { type: value.type, requestId: value.requestId, actorId: value.actorId, sessionId: value.sessionId }
         : undefined;
     case "auth.session-revoked":

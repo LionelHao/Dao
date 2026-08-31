@@ -100,9 +100,11 @@ describe("Invocation production controller", () => {
       repairRoom: vi.fn().mockRejectedValue(new GovernanceTransportError("service_unavailable")),
       session: () => ({ actorId: "human-1", sessionId: "session-1", accessToken: "secret", expiresAt: at }),
       createRequestId: () => "request-1" });
-    expect((await controller.getSurface({ roomId: "room-1" })).connection.status).toBe("offline");
+    const lockedOffline = await controller.getSurface({ roomId: "room-1" });
+    expect(lockedOffline.connection.status).toBe("offline");
+    expect(lockedOffline.executions).toEqual([]);
     expect((await controller.cancel({ roomId: "room-1", executionId: "execution-1", expectedVersion: 1 }))
-      .state.operations[0]).toMatchObject({ error: { status: 503 } });
+      .state.operations).toEqual([]);
     expect(controlInvocation).not.toHaveBeenCalled();
   });
 

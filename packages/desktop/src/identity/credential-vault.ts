@@ -131,6 +131,7 @@ const CREDENTIAL_FIELDS = new Set([
   "expiresAt",
   "refreshExpiresAt",
 ]);
+const BOUND_CREDENTIAL_FIELDS = new Set([...CREDENTIAL_FIELDS, "sessionFamilyId", "deviceId"]);
 
 function hasOnlyFields(value: UnknownRecord, fields: ReadonlySet<string>): boolean {
   return Reflect.ownKeys(value).length === fields.size &&
@@ -149,10 +150,16 @@ function isIsoTimestamp(value: unknown): value is string {
 }
 
 function isStoredCredentials(value: unknown): value is IdentityStoredCredentials {
-  return isRecord(value) && hasOnlyFields(value, CREDENTIAL_FIELDS) && value.version === 1 &&
+  return isRecord(value) &&
+    (hasOnlyFields(value, CREDENTIAL_FIELDS) || hasOnlyFields(value, BOUND_CREDENTIAL_FIELDS)) &&
+    value.version === 1 &&
     isBoundedString(value.accountId, IDENTITY_CONTRACT_LIMITS.accountId) &&
     isBoundedString(value.actorId, IDENTITY_CONTRACT_LIMITS.actorId) &&
     isBoundedString(value.sessionId, IDENTITY_CONTRACT_LIMITS.sessionId) &&
+    (value.sessionFamilyId === undefined ||
+      isBoundedString(value.sessionFamilyId, IDENTITY_CONTRACT_LIMITS.token)) &&
+    (value.deviceId === undefined ||
+      isBoundedString(value.deviceId, IDENTITY_CONTRACT_LIMITS.deviceId)) &&
     isBoundedString(value.accessToken, IDENTITY_CONTRACT_LIMITS.token) &&
     isBoundedString(value.refreshToken, IDENTITY_CONTRACT_LIMITS.token) &&
     isIsoTimestamp(value.expiresAt) && isIsoTimestamp(value.refreshExpiresAt);
@@ -163,6 +170,8 @@ function copyCredentials(value: IdentityStoredCredentials): IdentityStoredCreden
     version: 1,
     accountId: value.accountId,
     actorId: value.actorId,
+    ...(value.sessionFamilyId === undefined ? {} : { sessionFamilyId: value.sessionFamilyId }),
+    ...(value.deviceId === undefined ? {} : { deviceId: value.deviceId }),
     sessionId: value.sessionId,
     accessToken: value.accessToken,
     refreshToken: value.refreshToken,

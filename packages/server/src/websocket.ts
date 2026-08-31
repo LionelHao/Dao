@@ -1147,6 +1147,7 @@ function authenticatedFrame(
   principal: AuthenticatedPrincipal,
   session?: IssuedSession,
   resumedSessionId?: string,
+  binding?: AuthenticatedSessionContext,
 ): AuthenticatedFrame {
   return session === undefined
     ? {
@@ -1154,6 +1155,10 @@ function authenticatedFrame(
         requestId,
         accountId: principal.accountId,
         actorId: principal.actorId,
+        ...(binding === undefined ? {} : {
+          sessionFamilyId: binding.sessionFamilyId,
+          ...(binding.deviceId === undefined ? {} : { deviceId: binding.deviceId }),
+        }),
         ...(resumedSessionId === undefined ? {} : { sessionId: resumedSessionId }),
       }
     : {
@@ -1161,6 +1166,10 @@ function authenticatedFrame(
         requestId,
         accountId: principal.accountId,
         actorId: principal.actorId,
+        ...(binding === undefined ? {} : {
+          sessionFamilyId: binding.sessionFamilyId,
+          ...(binding.deviceId === undefined ? {} : { deviceId: binding.deviceId }),
+        }),
         ...(typeof session.sessionId === "string"
           ? { sessionId: session.sessionId }
           : {}),
@@ -1856,7 +1865,7 @@ async function handleLoginOrResume(
       registerIdentitySubscriptions(context, options.subscriptionRegistry);
       const sent = await sendFrameWithResult(
         socket,
-        authenticatedFrame(frame.requestId, principal, session),
+        authenticatedFrame(frame.requestId, principal, session, undefined, authenticatedSession),
       );
       if (!sent.accepted) {
         clearAuthentication(context, installedGeneration);
@@ -1886,7 +1895,9 @@ async function handleLoginOrResume(
     registerIdentitySubscriptions(context, options.subscriptionRegistry);
     sendFrame(
       socket,
-      authenticatedFrame(frame.requestId, principal, undefined, currentSession!.id),
+      authenticatedFrame(
+        frame.requestId, principal, undefined, currentSession!.id, authenticatedSession,
+      ),
     );
   } catch (error: unknown) {
     if (issuedSession !== undefined) {
@@ -1971,7 +1982,9 @@ async function handleRefresh(
     registerIdentitySubscriptions(context, options.subscriptionRegistry);
     const sent = await sendFrameWithResult(
       socket,
-      authenticatedFrame(frame.requestId, refreshedPrincipal, session),
+      authenticatedFrame(
+        frame.requestId, refreshedPrincipal, session, undefined, authenticatedSession,
+      ),
     );
     if (!sent.accepted) {
       clearAuthentication(context, installedGeneration);

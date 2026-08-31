@@ -61,6 +61,9 @@ export interface IdentitySessionController {
 export interface IdentityAuthoritySession {
   readonly accountId: string;
   readonly actorId: string;
+  readonly sessionFamilyId?: string;
+  readonly deviceId?: string;
+  readonly installationId?: string;
   readonly sessionId: string;
   readonly accessToken: string;
   readonly expiresAt: string;
@@ -146,6 +149,13 @@ export function createIdentitySessionController(options: {
     return Object.freeze({
       accountId: credentials.accountId,
       actorId: credentials.actorId,
+      ...(credentials.sessionFamilyId === undefined ? {} : {
+        sessionFamilyId: credentials.sessionFamilyId,
+      }),
+      ...(credentials.deviceId === undefined ? {} : {
+        deviceId: credentials.deviceId,
+        installationId: credentials.deviceId,
+      }),
       sessionId: credentials.sessionId,
       accessToken: credentials.accessToken,
       expiresAt: credentials.expiresAt,

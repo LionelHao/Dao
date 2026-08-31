@@ -90,7 +90,7 @@ function event(
         } };
 }
 
-async function loopbackAuthority(): Promise<{
+async function loopbackAuthority(leaseTtlMs = 60_000): Promise<{
   readonly endpoint: string;
   readonly received: readonly Record<string, unknown>[];
   disconnect(): void;
@@ -168,7 +168,7 @@ async function loopbackAuthority(): Promise<{
             room: { roomId: "room-1", lifecycleGeneration: currentGovernance.archiveGeneration,
               accessRevision: currentGovernance.governanceRevision, leaseGeneration: 0 },
             issuedAtMs: leaseNow - 1_000, notBeforeMs: leaseNow - 1_000,
-            expiresAtMs: leaseNow + 60_000,
+            expiresAtMs: leaseNow + leaseTtlMs,
           };
           send({ type: "offline-read-lease.issued", requestId,
             token: offlineLeaseToken(claims), claims });
@@ -375,7 +375,8 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     const runtime = createDesktopGovernanceRuntime({
       endpoint: authority.endpoint,
       session: () => ({ accountId: "account-1", actorId: "owner-1", sessionId: "session-1",
-        accessToken: "main-only-token", expiresAt: "2027-01-15T09:00:00.000Z" }),
+        accessToken: "main-only-token", sessionFamilyId: "family-1", deviceId: "device-1",
+        installationId: "device-1", expiresAt: "2027-01-15T09:00:00.000Z" }),
       webSocketFactory: (endpoint) => new WebSocket(endpoint) as unknown as GovernanceWebSocketLike,
       createRequestIdentity: () => ({ requestId: `signed-offline-${++request}`,
         idempotencyKey: `signed-key-${request}` }),
@@ -412,6 +413,64 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     await expect(runtime.controller.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
       status: "ready", connection: { status: "online" },
     });
+    runtime.close();
+  });
+
+  it("actively locks and purges an already visible offline Room at the exact lease boundary", async () => {
+    const leaseTtlMs = 200;
+    const authority = await loopbackAuthority(leaseTtlMs);
+    let currentNow = leaseNow;
+    const runtime = createDesktopGovernanceRuntime({
+      endpoint: authority.endpoint,
+      session: () => ({ accountId: "account-1", actorId: "owner-1", sessionId: "session-1",
+        accessToken: "main-only-token", sessionFamilyId: "family-1", deviceId: "device-1",
+        installationId: "device-1", expiresAt: "2027-01-15T09:00:00.000Z" }),
+      webSocketFactory: (endpoint) => new WebSocket(endpoint) as unknown as GovernanceWebSocketLike,
+      createRequestIdentity: () => ({ requestId: "lease-expiry", idempotencyKey: "lease-expiry-key" }),
+      offlineReadLeaseVerifier: createDesktopOfflineReadLeaseVerifier({
+        verificationKeys: new Map([["lease-key-1", leaseKeys.publicKey]]), now: () => currentNow,
+      }),
+      offlineReadLeaseAuthority: { tenantId: "tenant-1", serverSubject: "loopback-authority" },
+      now: () => new Date(currentNow).toISOString(),
+      timeoutMs: 500,
+    });
+    await runtime.controller.getSurface({ roomId: "room-1" });
+    authority.setUnavailable(true);
+    await vi.waitFor(() => expect(runtime.controller.current("room-1")).toMatchObject({
+      connection: { status: "offline" },
+    }));
+    await expect(runtime.controller.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "ready", connection: { status: "offline" },
+    });
+    currentNow = leaseNow + leaseTtlMs;
+    await vi.waitFor(() => expect(runtime.controller.current("room-1")).toMatchObject({
+      status: "locked", connection: { status: "fatal", errorCode: "offline_lease_expired" },
+    }), { timeout: 1_000 });
+    expect(runtime.cache.roomRepairRecords("room-1")).toBeUndefined();
+    runtime.close();
+  });
+
+  it("rejects a valid signature issued to another device or session family", async () => {
+    const authority = await loopbackAuthority();
+    const runtime = createDesktopGovernanceRuntime({
+      endpoint: authority.endpoint,
+      session: () => ({ accountId: "account-1", actorId: "owner-1", sessionId: "session-other",
+        accessToken: "main-only-token", sessionFamilyId: "family-other", deviceId: "device-other",
+        installationId: "device-other", expiresAt: "2027-01-15T09:00:00.000Z" }),
+      webSocketFactory: (endpoint) => new WebSocket(endpoint) as unknown as GovernanceWebSocketLike,
+      createRequestIdentity: () => ({ requestId: "wrong-binding", idempotencyKey: "wrong-binding-key" }),
+      offlineReadLeaseVerifier: createDesktopOfflineReadLeaseVerifier({
+        verificationKeys: new Map([["lease-key-1", leaseKeys.publicKey]]), now: () => leaseNow,
+      }),
+      offlineReadLeaseAuthority: { tenantId: "tenant-1", serverSubject: "loopback-authority" },
+      now: () => new Date(leaseNow).toISOString(),
+      timeoutMs: 500,
+    });
+    await expect(runtime.controller.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "locked", connection: { status: "offline" },
+    });
+    expect(runtime.cache.offlineReadLease("room-1")).toBeUndefined();
+    expect(runtime.cache.isOfflineReadAuthorized("room-1", leaseNow)).toBe(false);
     runtime.close();
   });
 

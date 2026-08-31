@@ -91,11 +91,16 @@ Worker 启动时以及每小时运行 janitor；每个 write transaction 最多�
 expired set 为空。SQL 参数、内存、日志和总 promise 数有界；错误 closed 且日志不含 payload/hash原文、
 secret 或 corpus。所有删除仍由 AuthorityWorker 执行。
 
-## 6. 所有 authoritative outbox family 的统一投递合同
+## 6. authoritative post-commit ledger 的分类合同
 
-closed inventory 枚举中央与 feature-specific outbox。每个 family 必须支持：batch ≤100；base 250ms；
-exponential full jitter；单次 cap 30s；最多 8 attempts；第八次失败进入 durable terminal dead-letter；
-60s backlog warning 与 5min critical；结构化 alert 只含 closed identifiers/code/age/count。
+closed inventory 枚举中央与 feature-specific durable ledger，并显式区分执行语义。中央 outbox 与 room cache
+invalidation 是独立 delivery/action consumer，必须支持：batch ≤100；base 250ms；exponential full jitter；
+单次 cap 30s；最多 8 attempts；第八次失败进入 durable terminal dead-letter；60s backlog warning 与 5min
+critical；结构化 alert 只含 closed identifiers/code/age/count。Project shadow 只是中央 outbox 的 terminal
+mirror，必须原子镜像 delivered/dead-letter terminal state，不独立执行 send/retry。Deployment Profile ledger
+是 authoritative cursor recovery marker：当前协议没有独立 realtime subscriber 或 socket send seam，worker 只在
+提交后本地结算 marker，客户端依靠 profile cursor catch-up；因此它不得被写成拥有统一 send/backoff/dead-letter
+delivery 合同。若未来增加独立传输消费者，必须先新增真实失败 seam 与验收证据再升级分类。
 
 dispatcher 的 process-local accepted ledger 绑定 `(deliveryId, connectionId, credentialGeneration)`。
 同一进程中成功 peer 不随坏 peer 每轮重收；发送前始终重验 connection/session/membership eligibility，

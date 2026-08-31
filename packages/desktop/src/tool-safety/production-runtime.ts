@@ -252,13 +252,17 @@ export function createDesktopToolSafetyRuntime(options: Readonly<{
   const state = (roomId: string): ToolSafetyRemoteState => {
     knownRooms.add(roomId);
     const session = options.session();
-    const records = options.authorityCache.roomRepairRecords(roomId);
+    const cachedRecords = options.authorityCache.roomRepairRecords(roomId);
     const governance = options.authorityCache.governanceProjection(roomId);
     const connection = session === undefined
       ? { status: "revoked" as const }
       : governance?.lifecycle === "archived"
         ? { status: "archived" as const } : connections.get(roomId) ??
-        (records === undefined ? { status: "repairing" as const } : { status: "online" as const });
+        { status: "repairing" as const };
+    const offlineAuthorized = options.authorityCache.isOfflineReadAuthorized?.(roomId) ?? false;
+    const mayRead = connection.status === "online" || connection.status === "archived" ||
+      ((connection.status === "offline" || connection.status === "repair-failed") && offlineAuthorized);
+    const records = mayRead ? cachedRecords : undefined;
     const cards = session === undefined || connection.status === "revoked" || records === undefined
       ? [] : buildCards(records as readonly unknown[], session.actorId, governance?.ownerActorId).map((card) => {
         const override = displayOverrides.get(roomId)?.get(card.toolCallId);
@@ -325,7 +329,10 @@ export function createDesktopToolSafetyRuntime(options: Readonly<{
     async getSurface(query: ToolSafetySurfaceQuery) {
       if (closed || !started) throw new TypeError("Tool Safety runtime is not started");
       if (!text(query.roomId)) throw new TypeError("Tool Safety query is invalid");
-      return options.authorityCache.roomRepairRecords(query.roomId) === undefined
+      const connection = connections.get(query.roomId);
+      return connection === undefined || options.authorityCache.roomRepairRecords(query.roomId) === undefined ||
+        ((connection?.status === "offline" || connection?.status === "repair-failed") &&
+          !(options.authorityCache.isOfflineReadAuthorized?.(query.roomId) ?? false))
         ? repair(query.roomId) : emit(query.roomId);
     },
     async submit(request: ToolSafetySubmitRequest) {

@@ -1042,6 +1042,7 @@ function issueSession(request: AuthorityWorkerRequest): void {
           publicSessionId: request.input.publicSessionId,
           accountId: request.input.accountId,
           actorId: request.input.actorId,
+          deviceId: request.input.device.id,
           accessExpiresAt: request.input.accessExpiresAt,
           refreshExpiresAt: request.input.refreshExpiresAt,
         },
@@ -1098,6 +1099,7 @@ function authenticateSession(request: AuthorityWorkerRequest): void {
            session.family_id AS familyId,
            session.account_id AS accountId,
            session.actor_id AS actorId,
+           family.device_id AS deviceId,
            session.access_expires_at AS accessExpiresAt,
            session.revoked_at AS revokedAt,
            family.revoked_at AS familyRevokedAt,
@@ -1145,7 +1147,8 @@ function authenticateSession(request: AuthorityWorkerRequest): void {
       typeof session.sessionId !== "string" ||
       typeof session.familyId !== "string" ||
       typeof session.accountId !== "string" ||
-      typeof session.actorId !== "string"
+      typeof session.actorId !== "string" ||
+      typeof session.deviceId !== "string"
     ) {
       throw new Error("session_corrupt");
     }
@@ -1155,6 +1158,7 @@ function authenticateSession(request: AuthorityWorkerRequest): void {
       context: {
         sessionId: session.sessionId,
         sessionFamilyId: session.familyId,
+        deviceId: session.deviceId,
         principal: {
           accountId: session.accountId,
           actorId: session.actorId,
@@ -1177,6 +1181,7 @@ interface SessionAuthorityRow {
   readonly publicSessionId: string;
   readonly accountId: string;
   readonly actorId: string;
+  readonly deviceId?: string;
   readonly accessExpiresAt: number;
   readonly refreshExpiresAt: number;
   readonly revokedAt: number | null;
@@ -1236,6 +1241,7 @@ function readSessionByRefreshHash(
          family.public_id AS publicSessionId,
          session.account_id AS accountId,
          session.actor_id AS actorId,
+         family.device_id AS deviceId,
          session.access_expires_at AS accessExpiresAt,
          session.refresh_expires_at AS refreshExpiresAt,
          session.revoked_at AS revokedAt,
@@ -1257,6 +1263,7 @@ function readSessionByRefreshHash(
     typeof row.publicSessionId !== "string" ||
     typeof row.accountId !== "string" ||
     typeof row.actorId !== "string" ||
+    typeof row.deviceId !== "string" ||
     typeof row.accessExpiresAt !== "number" ||
     typeof row.refreshExpiresAt !== "number" ||
     (row.revokedAt !== null && typeof row.revokedAt !== "number") ||
@@ -1558,6 +1565,7 @@ function rotateSession(request: AuthorityWorkerRequest): void {
           publicSessionId: current.publicSessionId,
           accountId: current.accountId,
           actorId: current.actorId,
+          ...(current.deviceId === undefined ? {} : { deviceId: current.deviceId }),
           accessExpiresAt: request.input.accessExpiresAt,
           refreshExpiresAt: request.input.refreshExpiresAt,
         },

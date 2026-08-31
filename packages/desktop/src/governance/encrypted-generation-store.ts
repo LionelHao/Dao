@@ -257,6 +257,7 @@ function identifierHash(key: Buffer, namespace: string, value: string): string {
 }
 
 function recordAad(
+  tenantHash: string,
   accountHash: string,
   roomHash: string,
   generationId: string,
@@ -265,6 +266,7 @@ function recordAad(
   return Buffer.from([
     "dao.desktop.authority-generation",
     SCHEMA_VERSION,
+    tenantHash,
     accountHash,
     roomHash,
     generationId,
@@ -335,12 +337,15 @@ function openRecord(
 export function createEncryptedAuthorityGenerationStore(options: Readonly<{
   databasePath: string;
   accountId: string;
+  tenantId?: string;
   encryption: CredentialEncryption;
   limits?: Partial<Limits>;
   fault?: (point: "before-active-flip" | "after-active-flip") => void;
 }>): EncryptedAuthorityGenerationStore {
   validateText(options.databasePath, "databasePath");
   validateText(options.accountId, "accountId");
+  const tenantId = options.tenantId ?? "dao-local-tenant";
+  validateText(tenantId, "tenantId");
   const limits = validateLimits(options.limits);
   try {
     if (!options.encryption.isEncryptionAvailable()) {
@@ -382,6 +387,8 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
           .run("wrapped_data_key", wrapped);
         database.prepare("INSERT INTO cache_metadata(metadata_key, metadata_value) VALUES (?, ?)")
           .run("account_hash", Buffer.from(identifierHash(dataKey, "account", options.accountId), "utf8"));
+        database.prepare("INSERT INTO cache_metadata(metadata_key, metadata_value) VALUES (?, ?)")
+          .run("tenant_hash", Buffer.from(identifierHash(dataKey, "tenant", tenantId), "utf8"));
       });
     } else {
       dataKey = unwrapKey(options.encryption, blob(wrappedRow.metadata_value));
@@ -391,9 +398,13 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
       const accountRow = database.prepare(
         "SELECT metadata_value FROM cache_metadata WHERE metadata_key = 'account_hash'",
       ).get() as { metadata_value?: unknown } | undefined;
+      const tenantRow = database.prepare(
+        "SELECT metadata_value FROM cache_metadata WHERE metadata_key = 'tenant_hash'",
+      ).get() as { metadata_value?: unknown } | undefined;
       if (schemaRow === undefined || blob(schemaRow.metadata_value).toString("utf8") !== SCHEMA_VERSION ||
           accountRow === undefined || blob(accountRow.metadata_value).toString("utf8") !==
-            identifierHash(dataKey, "account", options.accountId)) {
+            identifierHash(dataKey, "account", options.accountId) || tenantRow === undefined ||
+          blob(tenantRow.metadata_value).toString("utf8") !== identifierHash(dataKey, "tenant", tenantId)) {
         dataKey.fill(0);
         throw new EncryptedGenerationStoreError("integrity_failed", "Cache binding is invalid");
       }
@@ -406,6 +417,7 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
   }
 
   const accountHash = identifierHash(dataKey, "account", options.accountId);
+  const tenantHash = identifierHash(dataKey, "tenant", tenantId);
   let closed = false;
   const requireOpen = (): void => {
     if (closed) throw new EncryptedGenerationStoreError("closed", "Generation store is closed");
@@ -459,7 +471,7 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
         throw new EncryptedGenerationStoreError("integrity_failed", "Record identity is invalid");
       }
       const result = openRecord(dataKey,
-        recordAad(accountHash, room, generationId, row.identity_hash),
+        recordAad(tenantHash, accountHash, room, generationId, row.identity_hash),
         blob(row.sealed_record), limits.maxRecordBytes);
       if (identityHash(result.identity) !== row.identity_hash || identities.has(result.identity)) {
         throw new EncryptedGenerationStoreError("integrity_failed", "Record identity binding failed");
@@ -471,7 +483,7 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
 
   const sealRoomId = (roomId: string, room: string): Buffer => {
     const identity = identifierHash(dataKey, "record", "room-catalog-binding");
-    return sealRecord(dataKey, recordAad(accountHash, room, "room-catalog", identity), {
+    return sealRecord(dataKey, recordAad(tenantHash, accountHash, room, "room-catalog", identity), {
       identity: "room-catalog-binding",
       value: roomId,
     }, limits.maxRecordBytes);
@@ -480,7 +492,7 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
   const openRoomId = (room: string, sealed: unknown): string => {
     const identity = identifierHash(dataKey, "record", "room-catalog-binding");
     const record = openRecord(dataKey,
-      recordAad(accountHash, room, "room-catalog", identity), blob(sealed), limits.maxRecordBytes);
+      recordAad(tenantHash, accountHash, room, "room-catalog", identity), blob(sealed), limits.maxRecordBytes);
     if (record.identity !== "room-catalog-binding" || typeof record.value !== "string" ||
         roomHash(record.value) !== room) {
       throw new EncryptedGenerationStoreError("integrity_failed", "Room catalog binding failed");
@@ -531,7 +543,7 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
         records.forEach((record, index) => {
           const hashedIdentity = identityHash(record.identity);
           const sealed = sealRecord(dataKey,
-            recordAad(accountHash, room, stage.generation_id as string, hashedIdentity),
+            recordAad(tenantHash, accountHash, room, stage.generation_id as string, hashedIdentity),
             record, limits.maxRecordBytes);
           database.prepare(`
             INSERT INTO cache_records(generation_id, identity_hash, ordinal, sealed_record)
@@ -712,7 +724,7 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
                 `).get(head.generation_id as string) as { ordinal?: unknown }).ordinal)
               : count(existing.ordinal);
             const sealed = sealRecord(dataKey,
-              recordAad(accountHash, room, head.generation_id as string, hashedIdentity),
+              recordAad(tenantHash, accountHash, room, head.generation_id as string, hashedIdentity),
               record, limits.maxRecordBytes);
             database.prepare(`
               INSERT INTO cache_records(generation_id, identity_hash, ordinal, sealed_record)
@@ -769,7 +781,7 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
       const identity = identifierHash(dataKey, "record", "offline-read-lease");
       const sealed = sealRecord(
         dataKey,
-        recordAad(accountHash, room, "offline-read-lease", identity),
+        recordAad(tenantHash, accountHash, room, "offline-read-lease", identity),
         { identity: "offline-read-lease", value: lease },
         limits.maxRecordBytes,
       );
@@ -795,7 +807,7 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
       const identity = identifierHash(dataKey, "record", "offline-read-lease");
       return openRecord(
         dataKey,
-        recordAad(accountHash, room, "offline-read-lease", identity),
+        recordAad(tenantHash, accountHash, room, "offline-read-lease", identity),
         blob(row.sealed_lease),
         limits.maxRecordBytes,
       ).value;

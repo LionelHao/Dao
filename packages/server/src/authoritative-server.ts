@@ -113,6 +113,106 @@ export interface AuthoritativeServer {
   close(): Promise<void>;
 }
 
+export class DetachedRecoveryTerminalError extends Error {
+  readonly code = "detached_recovery_shutdown_failed";
+  readonly state = "closed";
+
+  constructor(
+    readonly family: string,
+    readonly reason: "active_batch_failed" | "shutdown_timeout",
+    readonly terminalCause?: unknown,
+  ) {
+    super(`Detached ${family} recovery closed with ${reason}`);
+    this.name = "DetachedRecoveryTerminalError";
+  }
+}
+
+export interface BoundedDetachedRecovery {
+  kick(): Promise<void>;
+  start(): void;
+  close(): Promise<void>;
+}
+
+/**
+ * Owns a detached post-commit batch so shutdown cannot close its backing worker
+ * while the batch is still using it. Once close begins no new batch is accepted.
+ */
+export function createBoundedDetachedRecovery(options: Readonly<{
+  family: string;
+  intervalMs: number;
+  shutdownTimeoutMs: number;
+  runBatch: () => Promise<void>;
+  onBackgroundFailure: (error: unknown) => void;
+}>): BoundedDetachedRecovery {
+  if (!Number.isSafeInteger(options.intervalMs) || options.intervalMs <= 0 ||
+      !Number.isSafeInteger(options.shutdownTimeoutMs) || options.shutdownTimeoutMs <= 0) {
+    throw new TypeError("Detached recovery timing limits must be positive safe integers");
+  }
+  let accepting = true;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let active: Promise<void> | undefined;
+  let closePromise: Promise<void> | undefined;
+
+  const kick = (): Promise<void> => {
+    if (!accepting) return Promise.resolve();
+    if (active !== undefined) return active;
+    const attempt = Promise.resolve().then(options.runBatch);
+    const tracked = attempt.finally(() => {
+      if (active === tracked) active = undefined;
+    });
+    active = tracked;
+    return tracked;
+  };
+
+  const stop = (): void => {
+    accepting = false;
+    if (timer !== undefined) {
+      clearInterval(timer);
+      timer = undefined;
+    }
+  };
+
+  return Object.freeze({
+    kick,
+    start() {
+      if (!accepting || timer !== undefined) return;
+      timer = setInterval(() => {
+        void kick().catch(options.onBackgroundFailure);
+      }, options.intervalMs);
+      timer.unref();
+    },
+    close() {
+      if (closePromise !== undefined) return closePromise;
+      stop();
+      const draining = active;
+      closePromise = draining === undefined
+        ? Promise.resolve()
+        : new Promise<void>((resolveClose, rejectClose) => {
+            const timeout = setTimeout(() => rejectClose(new DetachedRecoveryTerminalError(
+              options.family,
+              "shutdown_timeout",
+            )), options.shutdownTimeoutMs);
+            timeout.unref();
+            void draining.then(
+              () => {
+                clearTimeout(timeout);
+                resolveClose();
+              },
+              (error: unknown) => {
+                clearTimeout(timeout);
+                rejectClose(new DetachedRecoveryTerminalError(
+                  options.family,
+                  "active_batch_failed",
+                  error,
+                ));
+              },
+            );
+          });
+      return closePromise;
+    },
+  });
+}
+
 export interface StartAuthoritativeServerOptions {
   readonly databasePath: string;
   readonly snapshotCachePath: string;
@@ -190,6 +290,7 @@ interface AuthoritativeServerTestOptions {
   readonly initialize?: (facades: AuthoritativeServerTestFacades) => Promise<void>;
   readonly registerMissingActors?: false;
   readonly afterCloseForTest?: Partial<Record<
+    | "cache-invalidation-recovery"
     | "transport"
     | "attachment-authority"
     | "attachment-processing"
@@ -206,6 +307,7 @@ interface AuthoritativeServerTestOptions {
   readonly agentRuntimeProviderForTest?: ProviderAdapter;
   /** Test-only cross-platform seam; production startup remains descriptor fail-closed. */
   readonly toolAdapterPathFallbackForTest?: true;
+  readonly cacheInvalidationShutdownTimeoutMs?: number;
 }
 
 export interface AuthoritativeServerTestFacades {
@@ -325,7 +427,7 @@ async function start(
   let sourceScopedRuntimeBoundary: SourceScopedRuntimeBoundary | undefined;
   let routeRuntime: RouteRuntimeService | undefined;
   let ballRuntime: BallRuntimeService | undefined;
-  let stopCacheInvalidationRecovery: (() => void) | undefined;
+  let cacheInvalidationRecovery: BoundedDetachedRecovery | undefined;
   let attachmentAuthority: AttachmentAuthorityCommandPort | undefined;
   let attachmentProcessing: AttachmentProcessingRuntime | undefined;
   let stopAttachmentRecovery: (() => void) | undefined;
@@ -459,29 +561,24 @@ async function start(
         },
       },
     });
-    let cacheInvalidationDispatchRunning = false;
-    const dispatchCacheInvalidations = async (): Promise<void> => {
-      if (cacheInvalidationDispatchRunning) return;
-      cacheInvalidationDispatchRunning = true;
-      try {
+    cacheInvalidationRecovery = createBoundedDetachedRecovery({
+      family: "room-cache-invalidation",
+      intervalMs: 1_000,
+      shutdownTimeoutMs: testOptions.cacheInvalidationShutdownTimeoutMs ?? 5_000,
+      runBatch: async () => {
         await cacheInvalidationDispatcher.dispatchReadyBatch();
-      } finally {
-        cacheInvalidationDispatchRunning = false;
-      }
-    };
-    await dispatchCacheInvalidations();
-    const cacheInvalidationTimer = setInterval(() => {
-      void dispatchCacheInvalidations().catch(() => {
+      },
+      onBackgroundFailure: () => {
         process.stderr.write(`${JSON.stringify({
           severity: "critical",
           code: "outbox_dispatcher_failure",
           family: "room-cache-invalidation",
           reason: "storage_unavailable",
         })}\n`);
-      });
-    }, 1_000);
-    cacheInvalidationTimer.unref();
-    stopCacheInvalidationRecovery = () => clearInterval(cacheInvalidationTimer);
+      },
+    });
+    await cacheInvalidationRecovery.kick();
+    cacheInvalidationRecovery.start();
     const materializedSnapshots = {
       async beginRoomRepair(...args: Parameters<typeof snapshotClient.beginRoomRepair>) {
         const result = await snapshotClient.beginRoomRepair(...args);
@@ -1264,7 +1361,7 @@ async function start(
     });
   } catch (error: unknown) {
     settleAttachmentReader(undefined);
-    stopCacheInvalidationRecovery?.();
+    await cacheInvalidationRecovery?.close().catch(() => undefined);
     stopRuntimeRecovery?.();
     stopAttachmentRecovery?.();
     stopMemoryRecovery?.();
@@ -1288,13 +1385,13 @@ async function start(
     close() {
       if (closePromise !== undefined) return closePromise;
       const attempt = (async () => {
-        stopCacheInvalidationRecovery?.();
         stopRuntimeRecovery?.();
         stopAttachmentRecovery?.();
         stopMemoryRecovery?.();
         const failures: unknown[] = [];
         let runtimeSafetySettled = true;
         for (const [stage, close] of [
+          ["cache-invalidation-recovery", () => cacheInvalidationRecovery!.close()],
           ["transport", () => transport.close()],
           ["attachment-authority", async () => attachmentAuthority?.close()],
           ["attachment-processing", async () => attachmentProcessing?.close()],
