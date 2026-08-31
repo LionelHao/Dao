@@ -358,14 +358,37 @@ function openRecord(
   }
 }
 
-export function createEncryptedAuthorityGenerationStore(options: Readonly<{
+type EncryptedGenerationStoreOptions = Readonly<{
   databasePath: string;
   accountId: string;
   tenantId?: string;
   encryption: CredentialEncryption;
   limits?: Partial<Limits>;
   fault?: (point: "before-active-flip" | "after-active-flip") => void;
-}>): EncryptedAuthorityGenerationStore {
+}>;
+
+function removeGenerationStoreFiles(databasePath: string): void {
+  validateText(databasePath, "databasePath");
+  const directory = dirname(databasePath);
+  const file = basename(databasePath);
+  let entries: string[] = [];
+  try { entries = readdirSync(directory); } catch { return; }
+  const targets = entries.filter((entry) => entry === file || entry === `${file}-wal` ||
+    entry === `${file}-shm` || entry === `${file}-journal` ||
+    entry.startsWith(`${file}.`) &&
+      (entry.endsWith(".tmp") || entry.endsWith(".bak") || entry.endsWith(".crash")));
+  if (targets.length > 4_096) {
+    throw new EncryptedGenerationStoreError("bound_exceeded", "Too many cache residuals");
+  }
+  // Sidecars go first and the main database last. An interrupted rebuild therefore leaves either
+  // a recognizable old database for the next attempt or no SQLite authority cache at all.
+  targets.sort((left, right) => Number(left === file) - Number(right === file));
+  for (const entry of targets) rmSync(join(directory, entry), { force: true });
+}
+
+export function createEncryptedAuthorityGenerationStore(
+  options: EncryptedGenerationStoreOptions,
+): EncryptedAuthorityGenerationStore {
   validateText(options.databasePath, "databasePath");
   validateText(options.accountId, "accountId");
   const tenantId = options.tenantId ?? "dao-local-tenant";
@@ -385,16 +408,18 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
 
   mkdirSync(dirname(options.databasePath), { recursive: true, mode: 0o700 });
   if (process.platform !== "win32") chmodSync(dirname(options.databasePath), 0o700);
-  let database: DatabaseSync;
+  let openedDatabase: DatabaseSync | undefined;
   try {
-    database = new DatabaseSync(options.databasePath);
-    database.exec(SCHEMA);
+    openedDatabase = new DatabaseSync(options.databasePath);
+    openedDatabase.exec(SCHEMA);
   } catch (cause: unknown) {
+    try { openedDatabase?.close(); } catch { /* preserve the open/schema failure */ }
     throw new EncryptedGenerationStoreError(
       "invalid_store",
       cause instanceof Error ? cause.message : "Generation store could not be opened",
     );
   }
+  const database = openedDatabase;
 
   let dataKey: Buffer;
   try {
@@ -934,19 +959,29 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
     },
     destroy() {
       if (!closed) api.close();
-      const directory = dirname(options.databasePath);
-      const file = basename(options.databasePath);
-      let entries: string[] = [];
-      try { entries = readdirSync(directory); } catch { /* already absent */ }
-      const targets = entries.filter((entry) => entry === file || entry === `${file}-wal` ||
-        entry === `${file}-shm` || entry === `${file}-journal` ||
-        entry.startsWith(`${file}.`) &&
-          (entry.endsWith(".tmp") || entry.endsWith(".bak") || entry.endsWith(".crash")));
-      if (targets.length > 4_096) {
-        throw new EncryptedGenerationStoreError("bound_exceeded", "Too many cache residuals");
-      }
-      for (const entry of targets) rmSync(join(directory, entry), { force: true });
+      removeGenerationStoreFiles(options.databasePath);
     },
   };
   return Object.freeze(api);
+}
+
+/**
+ * The authority generation database is a derived, encrypted cache rather than a source of truth.
+ * Production may discard an unsupported or corrupt cache only after the failed handle is closed;
+ * the next online repair then reconstructs it from Authority. Direct callers retain fail-closed
+ * inspection semantics through createEncryptedAuthorityGenerationStore.
+ */
+export function createRecoverableEncryptedAuthorityGenerationStore(
+  options: EncryptedGenerationStoreOptions,
+): EncryptedAuthorityGenerationStore {
+  try {
+    return createEncryptedAuthorityGenerationStore(options);
+  } catch (cause: unknown) {
+    if (!(cause instanceof EncryptedGenerationStoreError) ||
+        !["integrity_failed", "key_unwrap_failed", "invalid_store"].includes(cause.code)) {
+      throw cause;
+    }
+    removeGenerationStoreFiles(options.databasePath);
+    return createEncryptedAuthorityGenerationStore(options);
+  }
 }

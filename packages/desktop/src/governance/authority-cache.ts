@@ -572,8 +572,16 @@ export function createDesktopAuthorityCache(
       toolSafetyRepairRequired.clear();
       for (const roomId of roomIds) publishRoom(roomId);
       activeActorId = undefined;
-      generationStore?.clearAccount();
+      const store = generationStore;
       generationStore = undefined;
+      if (store !== undefined) {
+        try { store.clearAccount(); }
+        catch {
+          // This is a derived cache. Physical removal is the fail-closed recovery when its
+          // own schema or metadata is too damaged to perform the logical account purge.
+          store.destroy();
+        }
+      }
       if (persistence !== undefined) schedulePersistence(() => persistence.clear());
     },
     clearRoom(roomId) {

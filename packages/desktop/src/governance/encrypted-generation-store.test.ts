@@ -1,4 +1,5 @@
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { createHmac } from "node:crypto";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -8,6 +9,7 @@ import {
   EncryptedGenerationStoreError,
   authorityGenerationChecksum,
   createEncryptedAuthorityGenerationStore,
+  createRecoverableEncryptedAuthorityGenerationStore,
 } from "./encrypted-generation-store.js";
 
 const directories: string[] = [];
@@ -53,7 +55,82 @@ function install(store: ReturnType<typeof createEncryptedAuthorityGenerationStor
     watermark: input.watermark, expectedCount: input.records.length, checksum });
 }
 
+function identifierHash(key: Buffer, namespace: string, value: string): string {
+  return createHmac("sha256", key).update(namespace).update("\0").update(value).digest("hex");
+}
+
+function createVersion2Store(databasePath: string): void {
+  const database = new DatabaseSync(databasePath);
+  database.exec(`
+    CREATE TABLE cache_metadata (
+      metadata_key TEXT PRIMARY KEY,
+      metadata_value BLOB NOT NULL
+    ) STRICT;
+    CREATE TABLE cache_generations (
+      generation_id TEXT PRIMARY KEY,
+      room_hash TEXT NOT NULL,
+      snapshot_hash TEXT NOT NULL,
+      generation_state TEXT NOT NULL CHECK (generation_state IN ('staging', 'active')),
+      watermark INTEGER NOT NULL CHECK (watermark >= 0),
+      cursor INTEGER NOT NULL CHECK (cursor >= 0),
+      expected_count INTEGER NOT NULL CHECK (expected_count >= 0),
+      checksum TEXT NOT NULL
+    ) STRICT;
+  `);
+  const dataKey = Buffer.alloc(32, 0x2a);
+  const wrapped = wrapping.encryptString(dataKey.toString("base64"));
+  const insert = database.prepare(
+    "INSERT INTO cache_metadata(metadata_key, metadata_value) VALUES (?, ?)",
+  );
+  insert.run("schema_version", Buffer.from("2", "utf8"));
+  insert.run("wrapped_data_key", wrapped);
+  insert.run("account_hash", Buffer.from(identifierHash(dataKey, "account", "account-secret"), "utf8"));
+  insert.run("tenant_hash", Buffer.from(identifierHash(dataKey, "tenant", "dao-local-tenant"), "utf8"));
+  dataKey.fill(0);
+  database.close();
+}
+
 describe("encrypted Desktop authority generation store", () => {
+  it("rebuilds a derived v2 cache, resyncs it, and reopens the v3 generation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "dao-ft13-generation-v2-"));
+    directories.push(directory);
+    const databasePath = join(directory, "authority-cache.sqlite");
+    createVersion2Store(databasePath);
+
+    const rebuilt = createRecoverableEncryptedAuthorityGenerationStore({
+      databasePath, accountId: "account-secret", encryption: wrapping,
+    });
+    expect(rebuilt.listActiveRoomIds()).toEqual([]);
+    install(rebuilt, { snapshotId: "resynced", watermark: 9, records: oldRecords });
+    rebuilt.close();
+
+    const reopened = createRecoverableEncryptedAuthorityGenerationStore({
+      databasePath, accountId: "account-secret", encryption: wrapping,
+    });
+    expect(reopened.readActiveRoom("room-secret")).toMatchObject({
+      records: oldRecords, cursor: { afterSeq: 9 },
+    });
+    reopened.close();
+  });
+
+  it("recovers a same-version corrupt cache and removes interrupted rebuild residuals", async () => {
+    const { directory, databasePath, store } = await fixture();
+    install(store, { snapshotId: "old", watermark: 9, records: oldRecords });
+    store.close();
+    const tamper = new DatabaseSync(databasePath);
+    tamper.prepare("UPDATE cache_metadata SET metadata_value = ? WHERE metadata_key = 'account_hash'")
+      .run(Buffer.from("corrupt-binding", "utf8"));
+    tamper.close();
+    await writeFile(`${databasePath}.crash`, "interrupted-rebuild-sentinel", "utf8");
+
+    const rebuilt = createRecoverableEncryptedAuthorityGenerationStore({
+      databasePath, accountId: "account-secret", encryption: wrapping,
+    });
+    expect(rebuilt.listActiveRoomIds()).toEqual([]);
+    expect(await readdir(directory)).not.toContain("authority-cache.sqlite.crash");
+    rebuilt.close();
+  });
+
   it("keeps staging invisible and atomically flips only a complete generation", async () => {
     const { store } = await fixture();
     install(store, { snapshotId: "old", watermark: 9, records: oldRecords });

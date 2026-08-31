@@ -39,7 +39,9 @@ import { registerProjectLoopIpc } from "./project-loop/ipc.js";
 import { createDesktopToolSafetyRuntime } from "./tool-safety/production-runtime.js";
 import { registerToolSafetyIpc } from "./tool-safety/ipc.js";
 import { createEncryptedAuthorityCachePersistence } from "./governance/encrypted-authority-cache.js";
-import { createEncryptedAuthorityGenerationStore } from "./governance/encrypted-generation-store.js";
+import {
+  createRecoverableEncryptedAuthorityGenerationStore,
+} from "./governance/encrypted-generation-store.js";
 import { createDesktopOfflineReadLeaseVerifier } from "./governance/offline-read-lease.js";
 import { createDesktopAttachmentAuthorityRuntime } from "./attachment-authority/production-runtime.js";
 import {
@@ -182,7 +184,7 @@ async function createWindow(): Promise<void> {
         filePath: join(app.getPath("userData"), "authority-cache.v1.enc"),
         encryption: desktopEncryption,
       }),
-      generationStoreFactory: (actorId) => createEncryptedAuthorityGenerationStore({
+      generationStoreFactory: (actorId) => createRecoverableEncryptedAuthorityGenerationStore({
         databasePath: join(app.getPath("userData"), "authority-cache.v2.sqlite"),
         accountId: identity?.getCurrentAuthoritySession()?.accountId ?? (() => {
           void actorId;
