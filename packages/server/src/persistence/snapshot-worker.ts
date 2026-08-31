@@ -27,6 +27,8 @@ import type {
 } from "@native-im/core";
 import { lifecycleRepairSegmentDescriptor } from
   "../room-governance/lifecycle-repair-descriptor.js";
+import { createRoomAssignmentRepairSegmentDescriptor } from
+  "../agent-settings/room-assignment-repair-descriptor.js";
 import {
   memoryRepairSegmentDescriptor,
   ROOM_MEMORY_REPAIR_KEYSET_LIMIT,
@@ -58,7 +60,7 @@ import {
   validateSnapshotCachePhysicalSchema,
 } from "./schema.js";
 import {
-  createClosedRepairProjectionRegistry,
+  createGuardedClosedRepairProjectionRegistry,
   isPublicToolSafetyRepairRecord,
   type RepairKeysetPageInput,
   type RoomRepairSegmentDescriptor,
@@ -80,6 +82,7 @@ interface SnapshotWorkerData {
     readonly maxPageBytes: number;
   };
   readonly pauseState?: SharedArrayBuffer;
+  readonly deploymentProviderCredentialReadiness?: "ready" | "noauth";
 }
 
 class SnapshotBuildError extends Error {
@@ -660,6 +663,7 @@ const ROOM_REPAIR_KIND_MAP = Object.freeze({
   room: true,
   governance: true,
   membership: true,
+  "room-agent-assignment": true,
   message: true,
   "timeline-message": true,
   "message-revision": true,
@@ -1006,6 +1010,9 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
     stableKey: (record: RoomRepairRecord) =>
       String(record.kind === "membership" ? record.value.actorId : ""),
   },
+  createRoomAssignmentRepairSegmentDescriptor(
+    data.deploymentProviderCredentialReadiness ?? "noauth",
+  ),
   {
     descriptorId: "dao.repair.timeline-message.v1", descriptorVersion: 1,
     kind: "timeline-message", order: 3,
@@ -1527,12 +1534,25 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
   },
 ] as const satisfies readonly RoomRepairSegmentDescriptor<RoomRepairKind, RoomRepairRecord>[]);
 
-const ROOM_REPAIR_REGISTRY = createClosedRepairProjectionRegistry<
+const ROOM_REPAIR_REGISTRY = createGuardedClosedRepairProjectionRegistry<
   RoomRepairKind,
   RoomRepairRecord
 >({
   knownKinds: ROOM_REPAIR_KINDS,
   descriptors: ROOM_REPAIR_DESCRIPTORS,
+  recordGuard: (record, roomId): record is RoomRepairRecord => isRoomRepairPage({
+    type: "room.repair.page",
+    requestId: "registry-record-guard",
+    snapshotId: "registry-record-guard",
+    roomId,
+    page: 0,
+    records: [record],
+    watermark: 0,
+    snapshotChecksum: "registry-record-guard",
+    hasMore: false,
+    mode: "materialized",
+    expiresAt: "1970-01-01T00:00:00.000Z",
+  }),
 });
 
 function registeredRoomRecords(
@@ -1987,7 +2007,27 @@ function cachedPageValues(
   return values.map((value) => {
     if (isRecord(value) && value.kind === "timeline-message" && isRecord(value.value) &&
         typeof value.value.id === "string" && value.value.id.length > 0) {
-      return { kind: "timeline-message-reference", messageId: value.value.id };
+      const projectionVersion = value.value.lifecycle === "recalled" &&
+          typeof value.value.revisionCount === "number"
+        ? `recalled:${value.value.revisionCount}`
+        : value.value.authorKind === "human" && isRecord(value.value.currentRevision) &&
+            typeof value.value.currentRevision.revision === "number" &&
+            typeof value.value.revisionCount === "number"
+          ? `human:${value.value.currentRevision.revision}:${value.value.revisionCount}`
+          : value.value.authorKind === "agent" &&
+              typeof value.value.sourceExecutionId === "string"
+            ? `agent:${value.value.sourceExecutionId}`
+            : undefined;
+      if (projectionVersion === undefined) {
+        throw new SnapshotBuildError(
+          "storage_unavailable", "Snapshot message projection version is corrupt",
+        );
+      }
+      return {
+        kind: "timeline-message-reference",
+        messageId: value.value.id,
+        projectionVersion,
+      };
     }
     if (isRecord(value) && value.kind === "message-revision" &&
         typeof value.roomId === "string" && isRecord(value.value) &&
@@ -2006,6 +2046,7 @@ function cachedPageValues(
       return {
         kind: "attachment-reference",
         attachmentId: value.value.attachment.attachmentId,
+        generation: value.value.attachment.generation,
       };
     }
     return value;
@@ -2092,20 +2133,24 @@ function hydrateRoomPageReferences(
 ): readonly unknown[] {
   const authority = openAuthorityPreflight();
   try {
-    const stream = authority.prepare(
-      `SELECT head_seq AS headSeq FROM streams
-       WHERE stream_kind = 'room' AND stream_id = ?`,
-    ).get(manifest.roomId);
-    if (stream?.headSeq !== manifest.watermark) {
-      throw new SnapshotBuildError("snapshot_stale", "Snapshot Room watermark changed");
-    }
     return values.map((value) => {
       if (isRecord(value) && value.kind === "timeline-message-reference" &&
-          exact(value, ["kind", "messageId"]) && text(value.messageId)) {
+          exact(value, ["kind", "messageId", "projectionVersion"]) &&
+          text(value.messageId) && text(value.projectionVersion)) {
         const record = readOperationalMessageRepairRecord(authority, value.messageId);
         if (record.value.roomId !== manifest.roomId) {
           throw new SnapshotBuildError(
             "storage_unavailable", "Snapshot message reference escaped its Room",
+          );
+        }
+        const currentVersion = record.value.lifecycle === "recalled"
+          ? `recalled:${record.value.revisionCount}`
+          : record.value.authorKind === "human"
+            ? `human:${record.value.currentRevision.revision}:${record.value.revisionCount}`
+            : `agent:${record.value.sourceExecutionId}`;
+        if (currentVersion !== value.projectionVersion) {
+          throw new SnapshotBuildError(
+            "snapshot_stale", "Snapshot message projection reference is stale",
           );
         }
         return record;
@@ -2122,8 +2167,21 @@ function hydrateRoomPageReferences(
         );
       }
       if (isRecord(value) && value.kind === "attachment-reference" &&
-          exact(value, ["kind", "attachmentId"]) && text(value.attachmentId)) {
-        return hydrateAttachmentReference(authority, manifest.roomId, value.attachmentId);
+          exact(value, ["kind", "attachmentId", "generation"]) &&
+          text(value.attachmentId) && Number.isSafeInteger(value.generation) &&
+          Number(value.generation) > 0) {
+        const record = hydrateAttachmentReference(authority, manifest.roomId, value.attachmentId);
+        if (record.kind !== "attachment") {
+          throw new SnapshotBuildError(
+            "storage_unavailable", "Snapshot attachment projection kind is corrupt",
+          );
+        }
+        if (record.value.attachment.generation !== value.generation) {
+          throw new SnapshotBuildError(
+            "snapshot_stale", "Snapshot attachment projection reference is stale",
+          );
+        }
+        return record;
       }
       if (isRecord(value) &&
           (value.kind === "timeline-message" || value.kind === "timeline-message-reference" ||

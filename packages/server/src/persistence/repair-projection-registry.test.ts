@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   RepairProjectionRegistryError,
   createClosedRepairProjectionRegistry,
+  createGuardedClosedRepairProjectionRegistry,
   createToolSafetyRepairProjectionRegistry,
   isPublicToolSafetyRepairRecord,
   TOOL_SAFETY_REPAIR_KINDS,
@@ -80,6 +81,46 @@ describe("closed repair projection registry", () => {
       expect(registry.descriptorFor("lifecycle").descriptorId).toBe(
         "dao.repair.lifecycle.v1",
       );
+    } finally {
+      database.close();
+    }
+  });
+
+  it("requires and applies the production record guard before returning mapped records", () => {
+    const database = new DatabaseSync(":memory:");
+    try {
+      database.exec(`
+        CREATE TABLE repair_records (
+          room_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          id TEXT NOT NULL
+        ) STRICT;
+        INSERT INTO repair_records VALUES ('room-1', 'message', 'message-1');
+      `);
+      expect(() => createGuardedClosedRepairProjectionRegistry<Kind, RecordValue>({
+        knownKinds: ["lifecycle", "message"],
+        descriptors: [descriptor("lifecycle", 10), descriptor("message", 20)],
+        recordGuard: undefined as unknown as (
+          value: unknown,
+          roomId: string,
+        ) => value is RecordValue,
+      })).toThrow(new RepairProjectionRegistryError("missing_record_guard"));
+
+      const registry = createGuardedClosedRepairProjectionRegistry<Kind, RecordValue>({
+        knownKinds: ["lifecycle", "message"],
+        descriptors: [descriptor("lifecycle", 10), descriptor("message", 20)],
+        recordGuard: (value, roomId): value is RecordValue =>
+          typeof value === "object" && value !== null &&
+          (value as { kind?: unknown }).kind === "lifecycle" && roomId === "room-1",
+      });
+      expect(() => registry.readStablePage({
+        database,
+        roomId: "room-1",
+        watermark: 1,
+        kind: "message",
+        afterKey: undefined,
+        limit: 1,
+      })).toThrow(new RepairProjectionRegistryError("record_guard_rejected"));
     } finally {
       database.close();
     }

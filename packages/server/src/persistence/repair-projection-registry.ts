@@ -8,6 +8,8 @@ export type RepairProjectionRegistryFailureReason =
   | "duplicate_kind"
   | "duplicate_descriptor_id"
   | "duplicate_order"
+  | "missing_record_guard"
+  | "record_guard_rejected"
   | "cross_kind_record"
   | "unstable_page";
 
@@ -263,13 +265,18 @@ function isNonNegativeSafeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-export function createClosedRepairProjectionRegistry<
+type RepairRecordGuard<TRecord> = (
+  value: unknown,
+  roomId: string,
+) => value is TRecord;
+
+function createRegistry<
   TKind extends string,
   TRecord extends Readonly<{ kind: TKind }>,
 >(options: Readonly<{
   knownKinds: readonly TKind[];
   descriptors: readonly RoomRepairSegmentDescriptor<TKind, TRecord>[];
-}>): ClosedRepairProjectionRegistry<TKind, TRecord> {
+}>, recordGuard?: RepairRecordGuard<TRecord>): ClosedRepairProjectionRegistry<TKind, TRecord> {
   if (!Array.isArray(options.knownKinds) || options.knownKinds.length === 0 ||
     !options.knownKinds.every(isNonEmptyString) ||
     new Set(options.knownKinds).size !== options.knownKinds.length) {
@@ -331,6 +338,9 @@ export function createClosedRepairProjectionRegistry<
         if (typeof record !== "object" || record === null || record.kind !== input.kind) {
           reject("cross_kind_record");
         }
+        if (recordGuard !== undefined && !recordGuard(record, input.roomId)) {
+          reject("record_guard_rejected");
+        }
         const key = descriptor.stableKey(record);
         if (!isNonEmptyString(key) || (previousKey !== undefined && key <= previousKey)) {
           reject("unstable_page");
@@ -341,4 +351,29 @@ export function createClosedRepairProjectionRegistry<
       return Object.freeze(records);
     },
   });
+}
+
+export function createClosedRepairProjectionRegistry<
+  TKind extends string,
+  TRecord extends Readonly<{ kind: TKind }>,
+>(options: Readonly<{
+  knownKinds: readonly TKind[];
+  descriptors: readonly RoomRepairSegmentDescriptor<TKind, TRecord>[];
+}>): ClosedRepairProjectionRegistry<TKind, TRecord> {
+  return createRegistry(options);
+}
+
+export function createGuardedClosedRepairProjectionRegistry<
+  TKind extends string,
+  TRecord extends Readonly<{ kind: TKind }>,
+>(options: Readonly<{
+  knownKinds: readonly TKind[];
+  descriptors: readonly RoomRepairSegmentDescriptor<TKind, TRecord>[];
+  recordGuard: RepairRecordGuard<TRecord>;
+}>): ClosedRepairProjectionRegistry<TKind, TRecord> {
+  if (typeof options.recordGuard !== "function") reject("missing_record_guard");
+  return createRegistry({
+    knownKinds: options.knownKinds,
+    descriptors: options.descriptors,
+  }, options.recordGuard);
 }

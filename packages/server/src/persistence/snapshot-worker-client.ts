@@ -157,6 +157,7 @@ export interface CreateSnapshotWorkerClientOptions {
   readonly authorityPath: string;
   readonly cachePath: string;
   readonly revalidate: (request: SnapshotRevalidationRequest) => Promise<void>;
+  readonly deploymentProviderCredentialReadiness?: "ready" | "noauth";
   readonly streamingAuthority?: StreamingRepairAuthority;
   readonly clock?: () => number;
   readonly limits?: Partial<SnapshotWorkerSafetyLimits>;
@@ -1183,6 +1184,8 @@ function realWorkerFactory(
     authorityPath: options.authorityPath,
     cachePath: options.cachePath,
     limits,
+    deploymentProviderCredentialReadiness:
+      options.deploymentProviderCredentialReadiness ?? "noauth",
     ...(pauseState === undefined ? {} : { pauseState }),
   }});
 }
