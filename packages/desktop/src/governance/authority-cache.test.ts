@@ -3,7 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { authoritySnapshotChecksum, createDesktopAuthorityCache } from "./authority-cache.js";
+import {
+  authoritySnapshotChecksum,
+  createDesktopAuthorityCache,
+  DESKTOP_ROOM_EVENT_PROJECTION_ACTIONS_FOR_TEST,
+} from "./authority-cache.js";
 import { createEncryptedAuthorityGenerationStore } from "./encrypted-generation-store.js";
 import type { CredentialEncryption } from "../identity/credential-vault.js";
 import { projectSnapshot } from "../project-loop/test-fixture.js";
@@ -48,6 +52,13 @@ function page(): RoomRepairPage {
 }
 
 describe("production Desktop authority cache", () => {
+  it("classifies the complete persisted Room event union before cursor advancement", () => {
+    expect(Object.keys(DESKTOP_ROOM_EVENT_PROJECTION_ACTIONS_FOR_TEST)).toHaveLength(62);
+    expect(new Set(Object.values(DESKTOP_ROOM_EVENT_PROJECTION_ACTIONS_FOR_TEST))).toEqual(new Set([
+      "upsert", "remove", "invalidate", "explicit-noop",
+    ]));
+  });
+
   it("exposes the durability fence for an asynchronous authorized-state purge", async () => {
     let releaseClear: (() => void) | undefined;
     const clearGate = new Promise<void>((resolve) => { releaseClear = resolve; });
@@ -482,5 +493,141 @@ describe("production Desktop authority cache", () => {
       { kind: "agent-scoped-cancellation", value: cancellation },
       { kind: "project-boundary-invocation", value: boundary },
     ]);
+  });
+
+  it("reduces message, attachment, collaboration, membership and removal event families", async () => {
+    const cache = createDesktopAuthorityCache();
+    const seed = page();
+    cache.beginRoom("room-1", seed.snapshotId);
+    cache.stageRoomPage(seed);
+    expect(await cache.finalizeRoom(seed.snapshotId, seed.snapshotChecksum)).toBe(true);
+    cache.commitRoom("room-1", seed.watermark, seed.snapshotChecksum);
+    const base = {
+      streamKind: "room" as const, streamId: "room-1", roomId: "room-1",
+      actorId: "owner-1", occurredAt: "2026-08-31T01:00:00.000Z",
+    };
+    const events = [
+      { ...base, eventId: "legacy-message", streamSeq: 10, type: "room.message.accepted",
+        payload: { id: "legacy-message", roomId: "room-1", authorId: "owner-1",
+          authorKind: "human", body: "legacy", sentAt: base.occurredAt } },
+      { ...base, eventId: "timeline-message", streamSeq: 11, type: "room.message.accepted",
+        payload: { id: "timeline-message", roomId: "room-1", authorId: "owner-1",
+          authorKind: "human", createdAt: base.occurredAt, lifecycle: "active",
+          currentRevision: { messageId: "timeline-message", revision: 1, body: "current",
+            revisedAt: base.occurredAt, revisedByActorId: "owner-1" }, revisionCount: 1,
+          mentionedTargets: [], attachments: [], targetOutcomes: [] } },
+      { ...base, eventId: "attachment-bound", streamSeq: 12, type: "room.attachment.bound",
+        payload: { attachment: { attachmentId: "attachment-1" }, sourceEligibility: "bound-active" } },
+      { ...base, eventId: "read", streamSeq: 13, type: "room.human_read.recorded",
+        payload: { id: "read-1", messageId: "timeline-message", readerId: "member-1",
+          readAt: base.occurredAt } },
+      { ...base, eventId: "judgement", streamSeq: 14, type: "room.agent_judgment.recorded",
+        payload: { id: "judgement-1" } },
+      { ...base, eventId: "open", streamSeq: 15, type: "room.open_item.changed",
+        payload: { id: "open-1" } },
+      { ...base, eventId: "open-failure", streamSeq: 16,
+        type: "room.open_item.agent_attempt_failed", payload: { id: "failure-1" } },
+      { ...base, eventId: "task", streamSeq: 17, type: "room.light_task.changed",
+        payload: { id: "task-1" } },
+      { ...base, eventId: "agent", streamSeq: 18, type: "agent.configured",
+        payload: { membership: { kind: "agent", actorId: "agent-1" } } },
+      { ...base, eventId: "member-remove", streamSeq: 19, type: "member.removed",
+        payload: { targetActorId: "member-1" } },
+      { ...base, eventId: "attachment-excluded", streamSeq: 20,
+        type: "room.attachment.excluded", payload: { attachmentId: "attachment-1" } },
+    ] as unknown as readonly PersistedRoomEvent[];
+
+    cache.applyRoomEvents("room-1", events, { version: 1, roomId: "room-1", afterSeq: 20 });
+    const current = cache.roomRepairRecords("room-1") ?? [];
+    expect(current).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "message", value: expect.objectContaining({ id: "legacy-message" }) }),
+      expect.objectContaining({ kind: "timeline-message",
+        value: expect.objectContaining({ id: "timeline-message" }) }),
+      expect.objectContaining({ kind: "message-revision",
+        value: expect.objectContaining({ messageId: "timeline-message", revision: 1 }) }),
+      expect.objectContaining({ kind: "human-read", value: expect.objectContaining({ id: "read-1" }) }),
+      expect.objectContaining({ kind: "agent-judgement",
+        value: expect.objectContaining({ id: "judgement-1" }) }),
+      expect.objectContaining({ kind: "open-item", value: expect.objectContaining({ id: "open-1" }) }),
+      expect.objectContaining({ kind: "open-item-agent-failure",
+        value: expect.objectContaining({ id: "failure-1" }) }),
+      expect.objectContaining({ kind: "light-task", value: expect.objectContaining({ id: "task-1" }) }),
+      expect.objectContaining({ kind: "membership", value: expect.objectContaining({ actorId: "agent-1" }) }),
+    ]));
+    expect(current.some((record) => record.kind === "attachment")).toBe(false);
+    expect(current.some((record) => record.kind === "membership" &&
+      record.value.actorId === "member-1")).toBe(false);
+  });
+
+  it("upserts and invalidates legacy execution, route and calibration event families", async () => {
+    const legacyExecution = { id: "legacy-execution-1" };
+    const seedRecords = [
+      ...records,
+      { kind: "legacy-agent-execution", value: legacyExecution },
+    ] as unknown as readonly RoomRepairRecord[];
+    const checksum = authoritySnapshotChecksum("room", seedRecords);
+    const cache = createDesktopAuthorityCache();
+    cache.beginRoom("room-1", "legacy-families");
+    cache.stageRoomPage({ ...page(), snapshotId: "legacy-families", records: seedRecords,
+      snapshotChecksum: checksum });
+    expect(await cache.finalizeRoom("legacy-families", checksum)).toBe(true);
+    cache.commitRoom("room-1", 9, checksum);
+    const base = {
+      streamKind: "room" as const, streamId: "room-1", roomId: "room-1",
+      actorId: "system", occurredAt: "2026-08-31T02:00:00.000Z",
+    };
+    cache.applyRoomEvents("room-1", [
+      { ...base, eventId: "legacy-running", streamSeq: 10,
+        type: "room.agent_execution.changed", payload: { id: "legacy-execution-2" } },
+      { ...base, eventId: "legacy-terminal", streamSeq: 11,
+        type: "agent.execution.completed", payload: { executionId: "legacy-execution-1" } },
+      { ...base, eventId: "route", streamSeq: 12, type: "route.started",
+        payload: { id: "route-1" } },
+      { ...base, eventId: "route-judgement", streamSeq: 13,
+        type: "room.route_judgment.recorded", payload: { id: "route-judgement-1" } },
+      { ...base, eventId: "calibration", streamSeq: 14,
+        type: "room.calibration.recorded", payload: { id: "calibration-1" } },
+    ] as unknown as readonly PersistedRoomEvent[], {
+      version: 1, roomId: "room-1", afterSeq: 14,
+    });
+    const current = cache.roomRepairRecords("room-1") ?? [];
+    expect(current).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "legacy-agent-execution",
+        value: expect.objectContaining({ id: "legacy-execution-2" }) }),
+      expect.objectContaining({ kind: "route-job", value: expect.objectContaining({ id: "route-1" }) }),
+      expect.objectContaining({ kind: "route-judgment",
+        value: expect.objectContaining({ id: "route-judgement-1" }) }),
+      expect.objectContaining({ kind: "calibration",
+        value: expect.objectContaining({ id: "calibration-1" }) }),
+    ]));
+    expect(current.some((record) => record.kind === "legacy-agent-execution" &&
+      record.value.id === "legacy-execution-1")).toBe(false);
+  });
+
+  it("advances explicitly classified notification-only events without mutating repair records", async () => {
+    const cache = createDesktopAuthorityCache();
+    const seed = page();
+    cache.beginRoom("room-1", seed.snapshotId);
+    cache.stageRoomPage(seed);
+    expect(await cache.finalizeRoom(seed.snapshotId, seed.snapshotChecksum)).toBe(true);
+    cache.commitRoom("room-1", seed.watermark, seed.snapshotChecksum);
+    const before = cache.roomRepairRecords("room-1");
+    const base = {
+      streamKind: "room" as const, streamId: "room-1", roomId: "room-1",
+      actorId: "system", occurredAt: "2026-08-31T03:00:00.000Z",
+    };
+    cache.applyRoomEvents("room-1", [
+      { ...base, eventId: "invite", streamSeq: 10, type: "human.invitation.issued", payload: {} },
+      { ...base, eventId: "reject", streamSeq: 11, type: "human.invitation.rejected", payload: {} },
+      { ...base, eventId: "ball", streamSeq: 12, type: "room.ball.overdue", payload: {} },
+      { ...base, eventId: "preempt", streamSeq: 13,
+        type: "room.human_preemption.applied", payload: {} },
+      { ...base, eventId: "confirmation", streamSeq: 14,
+        type: "agent.tool.confirmation-required", payload: {} },
+    ] as unknown as readonly PersistedRoomEvent[], {
+      version: 1, roomId: "room-1", afterSeq: 14,
+    });
+    expect(cache.roomRepairRecords("room-1")).toEqual(before);
+    expect(cache.roomCursor("room-1")?.afterSeq).toBe(14);
   });
 });

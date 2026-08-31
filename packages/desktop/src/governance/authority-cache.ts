@@ -5,7 +5,6 @@ import {
   type RoomRepairRecord,
   type RoomSummary,
 } from "@native-im/core";
-import { isProjectEvent } from "@native-im/core";
 import type { ClientAuthorityCache, DesktopRoomEvent } from "../sync/client-sync-replica.js";
 import type { GovernanceProjection } from "../renderer/governance/view-model.js";
 import type { AuthorityCachePersistence } from "./encrypted-authority-cache.js";
@@ -84,17 +83,85 @@ function replaceRecord(records: RoomRepairRecord[], next: RoomRepairRecord): voi
   else records[index] = structuredClone(next);
 }
 
+function removeRecord(records: RoomRepairRecord[], predicate: (record: RoomRepairRecord) => boolean): void {
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    if (predicate(records[index]!)) records.splice(index, 1);
+  }
+}
+
+type ProjectionEventAction = "upsert" | "remove" | "invalidate" | "explicit-noop";
+
+/**
+ * This manifest intentionally mirrors the complete PersistedRoomEvent discriminant union.
+ * `satisfies` makes a newly added protocol event a compile failure until its cache behavior is
+ * classified; the reducer below remains the executable contract for the classification.
+ */
+export const DESKTOP_ROOM_EVENT_PROJECTION_ACTIONS_FOR_TEST = Object.freeze({
+  "room.created": "upsert",
+  "room.renamed": "upsert",
+  "room.governance.changed": "upsert",
+  "room.archived": "upsert",
+  "room.reopened": "upsert",
+  "room.security.reduced": "upsert",
+  "human.invitation.issued": "explicit-noop",
+  "human.invitation.accepted": "upsert",
+  "human.invitation.rejected": "explicit-noop",
+  "human.role.changed": "upsert",
+  "member.removed": "remove",
+  "agent.configured": "upsert",
+  "room.agent-assignment.changed": "upsert",
+  "room.message.accepted": "upsert",
+  "room.message.revised": "upsert",
+  "room.message.recalled": "upsert",
+  "room.attachment.bound": "upsert",
+  "room.attachment.excluded": "remove",
+  "room.memory.version.changed": "invalidate",
+  "room.memory.health.changed": "upsert",
+  "project.goal.changed": "invalidate",
+  "project.decision.changed": "invalidate",
+  "project.request.changed": "invalidate",
+  "project.next-action.changed": "invalidate",
+  "project.blocker.changed": "invalidate",
+  "project.open-question.changed": "invalidate",
+  "project.proposal.changed": "invalidate",
+  "project.confirmation.changed": "invalidate",
+  "project.transfer-proposal.changed": "invalidate",
+  "project.ball.changed": "invalidate",
+  "tool.safety.changed": "upsert",
+  "room.human_read.recorded": "upsert",
+  "room.agent_judgment.recorded": "upsert",
+  "room.open_item.changed": "upsert",
+  "room.open_item.agent_attempt_failed": "upsert",
+  "room.light_task.changed": "upsert",
+  "room.ball.overdue": "explicit-noop",
+  "room.human_preemption.applied": "explicit-noop",
+  "room.agent_execution.changed": "upsert",
+  "agent.execution.queued": "invalidate",
+  "agent.execution.started": "invalidate",
+  "agent.execution.retry-scheduled": "invalidate",
+  "agent.execution.completed": "invalidate",
+  "agent.execution.failed": "invalidate",
+  "agent.execution.cancelled": "invalidate",
+  "agent.execution.dead-lettered": "invalidate",
+  "agent.execution.recovered": "invalidate",
+  "agent.invocation.intent.changed": "upsert",
+  "agent.execution.changed": "upsert",
+  "agent.execution.attempt.changed": "upsert",
+  "agent.execution.retry.accepted": "upsert",
+  "agent.invocation.scoped-cancellation.committed": "upsert",
+  "project.boundary.invocation.decided": "upsert",
+  "room.route_judgment.recorded": "upsert",
+  "route.queued": "upsert",
+  "route.started": "upsert",
+  "route.retry-scheduled": "upsert",
+  "route.completed": "upsert",
+  "route.failed": "upsert",
+  "route.recovered": "upsert",
+  "agent.tool.confirmation-required": "explicit-noop",
+  "room.calibration.recorded": "upsert",
+} as const satisfies Record<DesktopRoomEvent["type"], ProjectionEventAction>);
+
 function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEvent): void {
-  if (event.type === "tool.safety.changed") {
-    replaceRecord(records, event.payload);
-    return;
-  }
-  if (isProjectEvent(event)) {
-    const index = records.findIndex((record) => record.kind === "project-loop" &&
-      record.roomId === event.roomId);
-    if (index !== -1) records.splice(index, 1);
-    return;
-  }
   switch (event.type) {
     case "room.archived":
     case "room.reopened": {
@@ -149,9 +216,8 @@ function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEve
       return;
     }
     case "member.removed": {
-      const index = records.findIndex((record) =>
+      removeRecord(records, (record) =>
         record.kind === "membership" && record.value.actorId === event.payload.targetActorId);
-      if (index !== -1) records.splice(index, 1);
       return;
     }
     case "room.memory.health.changed":
@@ -162,20 +228,72 @@ function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEve
       });
       return;
     case "room.memory.version.changed": {
-      const index = records.findIndex((record) => record.kind === "memory" &&
+      removeRecord(records, (record) => record.kind === "memory" &&
         record.value.recordType === "projection" &&
         record.value.projection.memoryRecordId === event.payload.memoryRecordId);
-      if (index !== -1) records.splice(index, 1);
       return;
     }
-    case "room.message.accepted":
+    case "room.message.accepted": {
       if ("lifecycle" in event.payload) {
         replaceRecord(records, { kind: "timeline-message", value: event.payload });
+        if ("currentRevision" in event.payload) {
+          replaceRecord(records, {
+            kind: "message-revision",
+            roomId: event.roomId,
+            value: event.payload.currentRevision,
+          });
+        }
+      } else {
+        replaceRecord(records, { kind: "message", value: event.payload });
       }
       return;
+    }
     case "room.message.revised":
+      replaceRecord(records, {
+        kind: "message-revision",
+        roomId: event.roomId,
+        value: event.payload.currentRevision,
+      });
+      replaceRecord(records, { kind: "timeline-message", value: event.payload });
+      return;
     case "room.message.recalled":
       replaceRecord(records, { kind: "timeline-message", value: event.payload });
+      return;
+    case "room.attachment.bound":
+      replaceRecord(records, { kind: "attachment", value: event.payload });
+      return;
+    case "room.attachment.excluded":
+      removeRecord(records, (record) => record.kind === "attachment" &&
+        record.value.attachment.attachmentId === event.payload.attachmentId);
+      return;
+    case "room.human_read.recorded":
+      replaceRecord(records, { kind: "human-read", value: event.payload });
+      return;
+    case "room.agent_judgment.recorded":
+      replaceRecord(records, { kind: "agent-judgement", value: event.payload });
+      return;
+    case "room.open_item.changed":
+      replaceRecord(records, { kind: "open-item", value: event.payload });
+      return;
+    case "room.open_item.agent_attempt_failed":
+      replaceRecord(records, { kind: "open-item-agent-failure", value: event.payload });
+      return;
+    case "room.light_task.changed":
+      replaceRecord(records, { kind: "light-task", value: event.payload });
+      return;
+    case "room.agent_execution.changed":
+      replaceRecord(records, { kind: "legacy-agent-execution", value: event.payload });
+      return;
+    case "agent.execution.queued":
+    case "agent.execution.started":
+    case "agent.execution.retry-scheduled":
+    case "agent.execution.completed":
+    case "agent.execution.failed":
+    case "agent.execution.cancelled":
+    case "agent.execution.dead-lettered":
+    case "agent.execution.recovered":
+      removeRecord(records, (record) => record.kind === "legacy-agent-execution" &&
+        record.value.id === event.payload.executionId);
       return;
     case "agent.invocation.intent.changed":
       replaceRecord(records, { kind: "agent-invocation-intent", value: event.payload });
@@ -195,9 +313,45 @@ function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEve
     case "project.boundary.invocation.decided":
       replaceRecord(records, { kind: "project-boundary-invocation", value: event.payload });
       return;
-    default:
+    case "room.route_judgment.recorded":
+      replaceRecord(records, { kind: "route-judgment", value: event.payload });
+      return;
+    case "route.queued":
+    case "route.started":
+    case "route.retry-scheduled":
+    case "route.completed":
+    case "route.failed":
+    case "route.recovered":
+      replaceRecord(records, { kind: "route-job", value: event.payload });
+      return;
+    case "room.calibration.recorded":
+      replaceRecord(records, { kind: "calibration", value: event.payload });
+      return;
+    case "tool.safety.changed":
+      replaceRecord(records, event.payload);
+      return;
+    case "project.goal.changed":
+    case "project.decision.changed":
+    case "project.request.changed":
+    case "project.next-action.changed":
+    case "project.blocker.changed":
+    case "project.open-question.changed":
+    case "project.proposal.changed":
+    case "project.confirmation.changed":
+    case "project.transfer-proposal.changed":
+    case "project.ball.changed":
+      removeRecord(records, (record) => record.kind === "project-loop" &&
+        record.roomId === event.roomId);
+      return;
+    case "human.invitation.issued":
+    case "human.invitation.rejected":
+    case "room.ball.overdue":
+    case "room.human_preemption.applied":
+    case "agent.tool.confirmation-required":
       return;
   }
+  const unhandled: never = event;
+  throw new TypeError(`Unhandled Desktop Room event: ${String(unhandled)}`);
 }
 
 export interface DesktopAuthorityCache extends ClientAuthorityCache {
