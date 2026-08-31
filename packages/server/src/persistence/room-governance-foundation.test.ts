@@ -327,14 +327,14 @@ describe("FT-02A room governance foundation", () => {
       ...context,
       requestId: "remove-target-replay",
     }, command)).resolves.toEqual({ ...removed, replayed: true });
-    await expect(value.client.listCommittedRoomCacheInvalidations(8)).resolves.toContainEqual({
+    await expect(value.client.listCommittedRoomCacheInvalidations(8)).resolves.toContainEqual(expect.objectContaining({
       invalidationIntentId: expect.any(String),
       roomId: value.roomId,
       lifecycleGeneration: 0,
       accessRevision: 1,
       reason: "member_removed",
       targetActorId: "human-target",
-    });
+    }));
     const database = new DatabaseSync(value.databasePath, { readOnly: true });
     expect(database.prepare(
       "SELECT actor_id AS actorId, result, details_json AS details FROM room_audit WHERE type = 'room.member.removed'",

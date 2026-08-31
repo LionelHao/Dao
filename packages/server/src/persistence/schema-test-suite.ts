@@ -1408,8 +1408,14 @@ describe("authority SQLite schema — foundations", () => {
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
         {
-          version: 27,
+          version: 26,
           name: "tool-safety-authority",
+          checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
+        {
+          version: 27,
+          name: "sync-reliability-lifecycle",
           checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
@@ -1456,6 +1462,7 @@ describe("authority SQLite schema — foundations", () => {
         "available_at",
         "delivered_at",
         "last_error",
+        "dead_lettered_at",
       ]);
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
     });
@@ -2155,7 +2162,7 @@ describe("authority SQLite schema — foundations", () => {
         streamSeq: 1,
         status: "pending",
         attempts: 2,
-        lastError: "retry",
+        lastError: "send_rejected",
       });
     });
   });
@@ -2726,9 +2733,9 @@ describe("authority SQLite schema — integrity", () => {
     });
 
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 27");
+      database.exec("PRAGMA user_version = 28");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(27);
+      expect(readSchemaVersion(database)).toBe(28);
     });
   });
 
@@ -2751,7 +2758,11 @@ describe("authority SQLite schema — integrity", () => {
   it("refuses v3 tables that are missing required contract columns", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
-      database.exec("ALTER TABLE outbox_deliveries DROP COLUMN last_error");
+      database.exec("PRAGMA writable_schema = ON");
+      database.prepare(
+        "UPDATE sqlite_schema SET sql = replace(sql, 'last_error TEXT', 'removed_last_error TEXT') WHERE name = 'outbox_deliveries'",
+      ).run();
+      database.exec("PRAGMA writable_schema = OFF");
 
       expect(() => migrateAuthorityDatabase(database)).toThrow(/unknown schema/i);
     });

@@ -412,9 +412,8 @@ function startBackgroundMaintenance(): void {
   // Direct Vitest worker fixtures intentionally use tiny epoch-relative clocks. They omit the
   // required production recovery policy and therefore must not compare those receipts with the
   // host wall clock. Every production worker has sharedAuthorityRecovery and starts maintenance.
-  if (workerData.testOnlyAllowMissingSharedAuthorityRecovery !== true) {
-    startIdempotencyCleanup();
-  }
+  if (workerData.testOnlyAllowMissingSharedAuthorityRecovery === true) return;
+  startIdempotencyCleanup();
   startDeploymentProfileOutbox();
 }
 

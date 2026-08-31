@@ -107,7 +107,7 @@ describe("authority SQLite v23 Project Loop authority", () => {
       expect(database.prepare(
         "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
       ).all()).toEqual(history);
-      database.exec("PRAGMA user_version = 27");
+      database.exec("PRAGMA user_version = 28");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema version/i);
     });
     withDatabase((database) => {

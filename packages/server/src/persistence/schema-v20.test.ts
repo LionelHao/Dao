@@ -77,7 +77,7 @@ describe("authority SQLite v20 Agent Profile and Routing Authority", () => {
       expect(AUTHORITY_SCHEMA_VERSION).toBe(27);
       expect(readSchemaVersion(database)).toBe(27);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 26 });
+        .toEqual({ count: 27 });
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
     });
     for (let version = 1; version <= 19; version += 1) {
@@ -513,7 +513,7 @@ describe("authority SQLite v20 Agent Profile and Routing Authority", () => {
 
   it("refuses future, migration-history, and physical-contract tamper", () => {
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 27");
+      database.exec("PRAGMA user_version = 28");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
     });
     withDatabase((database) => {
