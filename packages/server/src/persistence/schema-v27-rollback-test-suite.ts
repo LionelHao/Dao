@@ -43,8 +43,14 @@ function snapshot(database: DatabaseSync): LogicalSnapshot {
 
 export function defineV27RollbackRangeTest(first: number, last: number): void {
   describe("v27 sync reliability migration rollback matrix", () => {
-    it(`rolls statements ${first}-${last} back with v26 history intact`, () => {
-      for (let failAfterStatement = first; failAfterStatement <= last; failAfterStatement += 1) {
+    const cases: { readonly first: number; readonly last: number }[] = [];
+    for (let caseFirst = first; caseFirst <= last; caseFirst += 13) {
+      cases.push({ first: caseFirst, last: Math.min(caseFirst + 12, last) });
+    }
+    it.each(cases)("rolls statements $first-$last back with v26 history intact", (range) => {
+      for (let failAfterStatement = range.first;
+        failAfterStatement <= range.last;
+        failAfterStatement += 1) {
         withDatabase((database) => {
           migrateAuthorityDatabaseToHistoricalVersionForTest(database, 26);
           const before = snapshot(database);

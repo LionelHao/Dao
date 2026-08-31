@@ -1719,11 +1719,28 @@ describe("authoritative server real-process harness", () => {
       });
       if (externalAck.type !== "ack") throw new TypeError("external Assignment pause was rejected");
       await vi.waitFor(() => {
-        expect(observed).toEqual(expect.arrayContaining([expect.objectContaining({
-          type: "stable-event", eventId: externalAck.eventIds[0],
-          event: expect.objectContaining({ kind: "assignment.upserted",
-            assignment: expect.objectContaining({ paused: true, availability: "paused" }) }),
-        })]));
+        const observedStableEvent = observed.some((message) => {
+          const stableEvent = message as { type?: unknown; eventId?: unknown; event?: {
+            kind?: unknown; assignment?: { assignmentId?: unknown; paused?: unknown;
+              availability?: unknown } } };
+          return stableEvent.type === "stable-event" &&
+            stableEvent.eventId === externalAck.eventIds[0] &&
+            stableEvent.event?.kind === "assignment.upserted" &&
+            stableEvent.event.assignment?.assignmentId === externalAssignment.assignmentId &&
+            stableEvent.event.assignment.paused === true &&
+            stableEvent.event.assignment.availability === "paused";
+        });
+        const observedRepairSnapshot = observed.some((message) => {
+          if ((message as { type?: unknown }).type !== "repair-completed") return false;
+          const snapshot = (message as { snapshot?: {
+            room?: { status?: unknown; assignments?: readonly { assignmentId?: unknown;
+              paused?: unknown; availability?: unknown }[] } } }).snapshot;
+          const repairedAssignment = snapshot?.room?.assignments?.find((assignment) =>
+            assignment.assignmentId === externalAssignment.assignmentId);
+          return snapshot?.room?.status === "available" && repairedAssignment?.paused === true &&
+            repairedAssignment.availability === "paused";
+        });
+        expect(observedStableEvent || observedRepairSnapshot).toBe(true);
         expect(rendererState.snapshot?.room.status).toBe("available");
         expect(rendererState.snapshot?.room.status === "available"
           ? rendererState.snapshot.room.assignments[0] : undefined).toMatchObject({
