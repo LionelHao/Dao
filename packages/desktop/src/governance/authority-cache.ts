@@ -14,6 +14,7 @@ import {
 } from "./encrypted-generation-store.js";
 import {
   isDesktopOfflineReadLeaseClaims,
+  type DesktopActiveGenerationBinding,
   type DesktopOfflineReadLeaseClaims,
 } from "./offline-read-lease.js";
 
@@ -24,6 +25,11 @@ interface LiveRoom {
   cursor: RoomCursor;
   updatedAt: string;
 }
+
+const OFFLINE_BINDING_INVALIDATION_EVENTS = new Set<DesktopRoomEvent["type"]>([
+  "room.governance.changed", "room.archived", "room.reopened", "room.security.reduced",
+  "human.role.changed", "member.removed",
+]);
 
 export function authoritySnapshotChecksum(
   kind: "catalog" | "room",
@@ -157,7 +163,7 @@ export const DESKTOP_ROOM_EVENT_PROJECTION_ACTIONS_FOR_TEST = Object.freeze({
   "route.completed": "upsert",
   "route.failed": "upsert",
   "route.recovered": "upsert",
-  "agent.tool.confirmation-required": "explicit-noop",
+  "agent.tool.confirmation-required": "invalidate",
   "room.calibration.recorded": "upsert",
 } as const satisfies Record<DesktopRoomEvent["type"], ProjectionEventAction>);
 
@@ -257,6 +263,9 @@ function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEve
       replaceRecord(records, { kind: "timeline-message", value: event.payload });
       return;
     case "room.message.recalled":
+      removeRecord(records, (record) =>
+        record.kind === "message-revision" && record.value.messageId === event.payload.id ||
+        record.kind === "message" && record.value.id === event.payload.id);
       replaceRecord(records, { kind: "timeline-message", value: event.payload });
       return;
     case "room.attachment.bound":
@@ -343,11 +352,13 @@ function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEve
       removeRecord(records, (record) => record.kind === "project-loop" &&
         record.roomId === event.roomId);
       return;
+    case "agent.tool.confirmation-required":
+      removeRecord(records, (record) => record.kind.startsWith("tool-"));
+      return;
     case "human.invitation.issued":
     case "human.invitation.rejected":
     case "room.ball.overdue":
     case "room.human_preemption.applied":
-    case "agent.tool.confirmation-required":
       return;
   }
   const unhandled: never = event;
@@ -374,9 +385,11 @@ export interface DesktopAuthorityCache extends ClientAuthorityCache {
     token: string;
     claims: DesktopOfflineReadLeaseClaims;
   }> | undefined;
+  activeGenerationBinding(roomId: string): DesktopActiveGenerationBinding | undefined;
   authorizeOfflineRead(roomId: string, expiresAtMs: number): void;
   isOfflineReadAuthorized(roomId: string, nowMs?: number): boolean;
   revokeOfflineRead(roomId: string): void;
+  toolSafetyRepairRequired(roomId: string): boolean;
   close(): void;
 }
 
@@ -394,6 +407,8 @@ export function createDesktopAuthorityCache(
     claims: DesktopOfflineReadLeaseClaims;
   }>>();
   const offlineReadAuthorizations = new Map<string, number>();
+  const generationBindings = new Map<string, DesktopActiveGenerationBinding>();
+  const toolSafetyRepairRequired = new Set<string>();
   let activeActorId: string | undefined;
   let generationStore: EncryptedAuthorityGenerationStore | undefined;
   let persistenceWork = Promise.resolve();
@@ -494,6 +509,10 @@ export function createDesktopAuthorityCache(
         cursor: { version: 1, roomId, afterSeq: watermark },
         updatedAt: now(),
       });
+      offlineLeases.delete(roomId);
+      offlineReadAuthorizations.delete(roomId);
+      generationBindings.delete(roomId);
+      toolSafetyRepairRequired.delete(roomId);
       roomStages.delete(roomId);
       publishRoom(roomId);
       persist();
@@ -503,6 +522,8 @@ export function createDesktopAuthorityCache(
       if (room === undefined) throw new TypeError("Live Room is absent");
       const nextRecords = structuredClone(room.records);
       for (const event of events) applyProjectionEvent(nextRecords, event);
+      const invalidatesOfflineBinding = events.some((event) =>
+        OFFLINE_BINDING_INVALIDATION_EVENTS.has(event.type));
       if (generationStore !== undefined) {
         const nextIdentities = new Set(nextRecords.map(recordIdentity));
         generationStore.applyRoomEventBatch({
@@ -511,11 +532,22 @@ export function createDesktopAuthorityCache(
           nextCursor: cursor.afterSeq,
           upserts: nextRecords.map((record) => ({ identity: recordIdentity(record), value: record })),
           deletes: room.records.map(recordIdentity).filter((identity) => !nextIdentities.has(identity)),
+          invalidateActiveBinding: invalidatesOfflineBinding,
         });
       }
       room.records = nextRecords;
       room.cursor = structuredClone(cursor);
       room.updatedAt = now();
+      if (events.some((event) => event.type === "agent.tool.confirmation-required")) {
+        toolSafetyRepairRequired.add(roomId);
+      }
+      if (invalidatesOfflineBinding) {
+        offlineReadAuthorizations.delete(roomId);
+        offlineLeases.delete(roomId);
+        generationBindings.delete(roomId);
+        generationStore?.clearOfflineLease(roomId);
+        generationStore?.clearActiveGenerationBinding(roomId);
+      }
       publishRoom(roomId);
       persist();
     },
@@ -536,6 +568,8 @@ export function createDesktopAuthorityCache(
       rooms.clear();
       offlineLeases.clear();
       offlineReadAuthorizations.clear();
+      generationBindings.clear();
+      toolSafetyRepairRequired.clear();
       for (const roomId of roomIds) publishRoom(roomId);
       activeActorId = undefined;
       generationStore?.clearAccount();
@@ -554,6 +588,8 @@ export function createDesktopAuthorityCache(
       rooms.delete(roomId);
       offlineLeases.delete(roomId);
       offlineReadAuthorizations.delete(roomId);
+      generationBindings.delete(roomId);
+      toolSafetyRepairRequired.delete(roomId);
       generationStore?.clearRoom(roomId);
       publishRoom(roomId);
       persist();
@@ -613,18 +649,32 @@ export function createDesktopAuthorityCache(
     installOfflineReadLease(roomId, lease) {
       if (lease.claims.room.roomId !== roomId) throw new TypeError("Offline lease Room mismatch");
       const closed = structuredClone(lease);
+      const binding = Object.freeze({
+        roomId,
+        complete: true as const,
+        lifecycleGeneration: lease.claims.room.lifecycleGeneration,
+        accessRevision: lease.claims.room.accessRevision,
+        leaseGeneration: lease.claims.room.leaseGeneration,
+      });
+      generationStore?.bindActiveGeneration(roomId, binding);
       generationStore?.writeOfflineLease(roomId, closed);
+      generationBindings.set(roomId, binding);
       offlineLeases.set(roomId, closed);
     },
     offlineReadLease(roomId) {
       const lease = offlineLeases.get(roomId);
       return lease === undefined ? undefined : structuredClone(lease);
     },
+    activeGenerationBinding(roomId) {
+      const binding = generationBindings.get(roomId);
+      return binding === undefined ? undefined : structuredClone(binding);
+    },
     authorizeOfflineRead(roomId, expiresAtMs) {
       if (!rooms.has(roomId) || !Number.isSafeInteger(expiresAtMs) || expiresAtMs <= 0) {
         throw new TypeError("Offline read authorization is invalid");
       }
       offlineReadAuthorizations.set(roomId, expiresAtMs);
+      publishRoom(roomId);
     },
     isOfflineReadAuthorized(roomId, nowMs = Date.now()) {
       if (!Number.isFinite(nowMs)) return false;
@@ -639,6 +689,9 @@ export function createDesktopAuthorityCache(
     revokeOfflineRead(roomId) {
       offlineReadAuthorizations.delete(roomId);
     },
+    toolSafetyRepairRequired(roomId) {
+      return toolSafetyRepairRequired.has(roomId);
+    },
     async restore(actorId) {
       if (activeActorId === actorId) return rooms.size > 0;
       if (activeActorId !== undefined && activeActorId !== actorId) {
@@ -646,6 +699,7 @@ export function createDesktopAuthorityCache(
         rooms.clear();
         offlineLeases.clear();
         offlineReadAuthorizations.clear();
+        generationBindings.clear();
         for (const roomId of priorRoomIds) publishRoom(roomId);
       }
       generationStore ??= generationStoreFactory?.(actorId);
@@ -729,16 +783,17 @@ export function createDesktopAuthorityCache(
             token: string; claims: DesktopOfflineReadLeaseClaims;
           }>);
         }
+        const binding = generationStore?.readActiveGenerationBinding(roomId);
+        if (binding !== undefined) generationBindings.set(roomId, binding);
       }
-      const priorRoomIds = new Set(rooms.keys());
       rooms.clear();
-      for (const [roomId, room] of restored) { rooms.set(roomId, room); priorRoomIds.add(roomId); }
+      for (const [roomId, room] of restored) rooms.set(roomId, room);
       activeActorId = actorId;
-      for (const roomId of priorRoomIds) publishRoom(roomId);
       return restored.size > 0;
     },
     close() {
       offlineReadAuthorizations.clear();
+      generationBindings.clear();
       generationStore?.close();
       generationStore = undefined;
     },

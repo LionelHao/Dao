@@ -23,7 +23,9 @@ import type { GovernanceClosedError } from "../renderer/governance/view-model.js
 import type { GovernanceRemoteState } from "./contracts.js";
 import { createInvocationController, type InvocationController } from "../invocation-runtime/controller.js";
 import type {
+  DesktopActiveGenerationBinding,
   DesktopOfflineReadLeaseBinding,
+  DesktopOfflineReadLeaseClaims,
   DesktopOfflineReadLeaseVerifier,
 } from "./offline-read-lease.js";
 
@@ -157,24 +159,26 @@ export function createDesktopGovernanceRuntime(options: {
   };
   const leaseBinding = (
     session: IdentityAuthoritySession,
-    claims: ReturnType<NonNullable<typeof options.offlineReadLeaseVerifier>["verify"]>,
+    authority: Pick<DesktopOfflineReadLeaseClaims, "tenantId" | "serverSubject">,
+    room: Pick<DesktopActiveGenerationBinding,
+      "roomId" | "lifecycleGeneration" | "accessRevision" | "leaseGeneration">,
   ): DesktopOfflineReadLeaseBinding => {
     if (session.sessionFamilyId === undefined || session.deviceId === undefined ||
         session.installationId === undefined) {
       throw new GovernanceTransportError("authentication_required", 401);
     }
     return {
-    tenantId: options.offlineReadLeaseAuthority?.tenantId ?? claims.tenantId,
+    tenantId: options.offlineReadLeaseAuthority?.tenantId ?? authority.tenantId,
     accountId: session.accountId,
     actorId: session.actorId,
     sessionFamilyId: session.sessionFamilyId,
     deviceId: session.deviceId,
     installationId: session.installationId,
-    serverSubject: options.offlineReadLeaseAuthority?.serverSubject ?? claims.serverSubject,
-    roomId: claims.room.roomId,
-    lifecycleGeneration: claims.room.lifecycleGeneration,
-    accessRevision: claims.room.accessRevision,
-    leaseGeneration: claims.room.leaseGeneration,
+    serverSubject: options.offlineReadLeaseAuthority?.serverSubject ?? authority.serverSubject,
+    roomId: room.roomId,
+    lifecycleGeneration: room.lifecycleGeneration,
+    accessRevision: room.accessRevision,
+    leaseGeneration: room.leaseGeneration,
     };
   };
   const refreshOfflineLease = async (
@@ -184,11 +188,21 @@ export function createDesktopGovernanceRuntime(options: {
     const verifier = options.offlineReadLeaseVerifier;
     if (verifier === undefined) return;
     const issued = await transport.issueOfflineReadLease(roomId);
-    const verified = verifier.verify(issued.token, leaseBinding(session, issued.claims));
+    const verified = verifier.verify(
+      issued.token,
+      leaseBinding(session, issued.claims, issued.claims.room),
+    );
     if (verified.room.roomId !== roomId) throw new GovernanceTransportError("protocol_error");
     cache.installOfflineReadLease(roomId, { token: issued.token, claims: verified });
-    cache.authorizeOfflineRead(roomId, verified.expiresAtMs);
-    scheduleLeaseExpiry(roomId, verified.expiresAtMs);
+    const generation = cache.activeGenerationBinding(roomId);
+    if (generation === undefined) throw new GovernanceTransportError("protocol_error");
+    const generationVerified = verifier.verifyForActiveGeneration(
+      issued.token,
+      leaseBinding(session, issued.claims, generation),
+      generation,
+    );
+    cache.authorizeOfflineRead(roomId, generationVerified.expiresAtMs);
+    scheduleLeaseExpiry(roomId, generationVerified.expiresAtMs);
   };
   const repairAndLease = async (roomId: string, session: IdentityAuthoritySession): Promise<void> => {
     await replica.repairRoom(roomId);
@@ -246,7 +260,13 @@ export function createDesktopGovernanceRuntime(options: {
             return { status: "locked", roomId, connection: { status: "offline", asOf: now() } };
           }
           try {
-            const verified = verifier.verify(lease.token, leaseBinding(session, lease.claims));
+            const generation = cache.activeGenerationBinding(roomId);
+            if (generation === undefined) throw new Error("offline generation binding absent");
+            const verified = verifier.verifyForActiveGeneration(
+              lease.token,
+              leaseBinding(session, lease.claims, generation),
+              generation,
+            );
             if (projection.archiveGeneration !== verified.room.lifecycleGeneration) {
               throw new Error("offline generation mismatch");
             }
@@ -365,7 +385,13 @@ export function createDesktopGovernanceRuntime(options: {
         const lease = cache.offlineReadLease(roomId);
         if (lease === undefined) continue;
         try {
-          const verified = verifier.verify(lease.token, leaseBinding(session, lease.claims));
+          const generation = cache.activeGenerationBinding(roomId);
+          if (generation === undefined) throw new Error("offline generation binding absent");
+          const verified = verifier.verifyForActiveGeneration(
+            lease.token,
+            leaseBinding(session, lease.claims, generation),
+            generation,
+          );
           const projection = cache.governanceProjection(roomId);
           if (projection === undefined ||
               projection.archiveGeneration !== verified.room.lifecycleGeneration) throw new Error();

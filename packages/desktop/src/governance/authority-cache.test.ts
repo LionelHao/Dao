@@ -11,6 +11,7 @@ import {
 import { createEncryptedAuthorityGenerationStore } from "./encrypted-generation-store.js";
 import type { CredentialEncryption } from "../identity/credential-vault.js";
 import { projectSnapshot } from "../project-loop/test-fixture.js";
+import type { DesktopOfflineReadLeaseClaims } from "./offline-read-lease.js";
 
 const records: readonly RoomRepairRecord[] = [
   {
@@ -48,6 +49,18 @@ function page(): RoomRepairPage {
     roomId: "room-1", page: 0, records, watermark: 9,
     snapshotChecksum: authoritySnapshotChecksum("room", records),
     hasMore: false, mode: "materialized", expiresAt: "2026-08-19T00:05:00.000Z",
+  };
+}
+
+function offlineClaims(overrides: Partial<DesktopOfflineReadLeaseClaims["room"]> = {}):
+DesktopOfflineReadLeaseClaims {
+  return {
+    version: 1, keyId: "key-1", leaseId: "lease-1", tenantId: "tenant-1",
+    accountId: "human-1", actorId: "human-1", actorKind: "human",
+    sessionFamilyId: "family-1", deviceId: "device-1", installationId: "install-1",
+    serverSubject: "dao-server", room: { roomId: "room-1", lifecycleGeneration: 0,
+      accessRevision: 7, leaseGeneration: 3, ...overrides },
+    issuedAtMs: 1_000, notBeforeMs: 1_000, expiresAtMs: 10_000,
   };
 }
 
@@ -169,6 +182,42 @@ describe("production Desktop authority cache", () => {
     }
   });
 
+  it("keeps restored records private until a persisted lease matches the active generation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "dao-ft13-authority-cache-"));
+    const databasePath = join(directory, "authority-cache.sqlite");
+    const factory = (actorId: string) => createEncryptedAuthorityGenerationStore({
+      databasePath, accountId: actorId, encryption: wrapping,
+    });
+    try {
+      const first = createDesktopAuthorityCache(() => "2026-08-31T10:00:00.000Z", undefined, factory);
+      await first.restore("human-1");
+      const repair = page();
+      first.beginRoom("room-1", repair.snapshotId);
+      first.stageRoomPage(repair);
+      expect(await first.finalizeRoom(repair.snapshotId, repair.snapshotChecksum)).toBe(true);
+      first.commitRoom("room-1", repair.watermark, repair.snapshotChecksum);
+      first.installOfflineReadLease("room-1", { token: "signed-token", claims: offlineClaims() });
+      first.close();
+
+      const restarted = createDesktopAuthorityCache(
+        () => "2026-08-31T10:01:00.000Z", undefined, factory,
+      );
+      const published = vi.fn();
+      restarted.subscribeRoomRecords(published);
+      await expect(restarted.restore("human-1")).resolves.toBe(true);
+      expect(published).not.toHaveBeenCalled();
+      expect(restarted.activeGenerationBinding("room-1")).toEqual({
+        roomId: "room-1", complete: true,
+        lifecycleGeneration: 0, accessRevision: 7, leaseGeneration: 3,
+      });
+      restarted.authorizeOfflineRead("room-1", 10_000);
+      expect(published).toHaveBeenCalledOnce();
+      restarted.close();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("keeps verified offline-read authorization process-local, expiring, and revocable", async () => {
     const cache = createDesktopAuthorityCache();
     const repair = page();
@@ -238,11 +287,15 @@ describe("production Desktop authority cache", () => {
         }, archiveGeneration: 1, resumedTimerCount: 0 },
       },
     ];
+    cache.installOfflineReadLease("room-1", { token: "lease-before-archive", claims: offlineClaims() });
+    expect(cache.activeGenerationBinding("room-1")).toBeDefined();
     cache.applyRoomEvents("room-1", [events[0]!], { version: 1, roomId: "room-1", afterSeq: 10 });
     expect(cache.governanceProjection("room-1")).toMatchObject({
       lifecycle: "archived", governanceRevision: 8, archiveGeneration: 1,
       archivedAt: "2026-08-19T00:01:00.000Z",
     });
+    expect(cache.offlineReadLease("room-1")).toBeUndefined();
+    expect(cache.activeGenerationBinding("room-1")).toBeUndefined();
     cache.applyRoomEvents("room-1", [events[1]!], { version: 1, roomId: "room-1", afterSeq: 11 });
     expect(cache.governanceProjection("room-1")).toMatchObject({
       lifecycle: "active", governanceRevision: 9, archiveGeneration: 1,
@@ -604,6 +657,95 @@ describe("production Desktop authority cache", () => {
       record.value.id === "legacy-execution-1")).toBe(false);
   });
 
+  it("removes every retained message body when a stable recall tombstone arrives", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "dao-ft13-recall-cache-"));
+    const databasePath = join(directory, "authority-cache.sqlite");
+    const factory = (actorId: string) => createEncryptedAuthorityGenerationStore({
+      databasePath, accountId: actorId, encryption: wrapping,
+    });
+    try {
+    const messageId = "recalled-message";
+    const messageRecords = [
+      ...records,
+      { kind: "message", value: { id: messageId, roomId: "room-1", body: "legacy sentinel" } },
+      { kind: "timeline-message", value: { id: messageId, roomId: "room-1", authorId: "owner-1",
+        authorKind: "human", createdAt: "2026-08-31T01:00:00.000Z", lifecycle: "active",
+        currentRevision: { messageId, revision: 2, body: "current sentinel",
+          revisedAt: "2026-08-31T01:01:00.000Z", revisedByActorId: "owner-1" },
+        revisionCount: 2, mentionedTargets: [], attachments: [], targetOutcomes: [] } },
+      { kind: "message-revision", roomId: "room-1", value: { messageId, revision: 1,
+        body: "first sentinel", revisedAt: "2026-08-31T01:00:00.000Z",
+        revisedByActorId: "owner-1" } },
+      { kind: "message-revision", roomId: "room-1", value: { messageId, revision: 2,
+        body: "current sentinel", revisedAt: "2026-08-31T01:01:00.000Z",
+        revisedByActorId: "owner-1" } },
+    ] as unknown as readonly RoomRepairRecord[];
+    const checksum = authoritySnapshotChecksum("room", messageRecords);
+    const cache = createDesktopAuthorityCache(undefined, undefined, factory);
+    await cache.restore("human-1");
+    cache.beginRoom("room-1", "message-recall");
+    cache.stageRoomPage({ ...page(), snapshotId: "message-recall", records: messageRecords,
+      snapshotChecksum: checksum });
+    expect(await cache.finalizeRoom("message-recall", checksum)).toBe(true);
+    cache.commitRoom("room-1", 9, checksum);
+    cache.applyRoomEvents("room-1", [{
+      eventId: "recall-10", streamKind: "room", streamId: "room-1", streamSeq: 10,
+      roomId: "room-1", actorId: "owner-1", occurredAt: "2026-08-31T01:02:00.000Z",
+      type: "room.message.recalled", payload: { id: messageId, roomId: "room-1",
+        authorId: "owner-1", authorKind: "human", createdAt: "2026-08-31T01:00:00.000Z",
+        lifecycle: "recalled", recalledAt: "2026-08-31T01:02:00.000Z", revisionCount: 2 },
+    }], { version: 1, roomId: "room-1", afterSeq: 10 });
+    const current = cache.roomRepairRecords("room-1") ?? [];
+    expect(current.filter((record) => record.kind === "message-revision" &&
+      record.value.messageId === messageId)).toEqual([]);
+    expect(current.some((record) => record.kind === "message" && record.value.id === messageId)).toBe(false);
+    expect(current).toContainEqual(expect.objectContaining({ kind: "timeline-message",
+      value: expect.objectContaining({ id: messageId, lifecycle: "recalled" }) }));
+    expect(JSON.stringify(current)).not.toContain("sentinel");
+    cache.close();
+
+    const reopened = createDesktopAuthorityCache(undefined, undefined, factory);
+    await expect(reopened.restore("human-1")).resolves.toBe(true);
+    expect(JSON.stringify(reopened.roomRepairRecords("room-1"))).not.toContain("sentinel");
+    expect(reopened.roomRepairRecords("room-1")?.some((record) =>
+      record.kind === "message-revision" && record.value.messageId === messageId)).toBe(false);
+    reopened.close();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("invalidates legacy confirmation cards and requires canonical Tool Safety repair", async () => {
+    const toolRecords = [
+      ...records,
+      { kind: "tool-call", value: { toolCallId: "call-1" } },
+      { kind: "tool-confirmation", value: { confirmationId: "confirmation-1" } },
+    ] as unknown as readonly RoomRepairRecord[];
+    const checksum = authoritySnapshotChecksum("room", toolRecords);
+    const cache = createDesktopAuthorityCache();
+    cache.beginRoom("room-1", "tool-confirmation");
+    cache.stageRoomPage({ ...page(), snapshotId: "tool-confirmation", records: toolRecords,
+      snapshotChecksum: checksum });
+    expect(await cache.finalizeRoom("tool-confirmation", checksum)).toBe(true);
+    cache.commitRoom("room-1", 9, checksum);
+    cache.applyRoomEvents("room-1", [{
+      eventId: "legacy-confirmation", streamKind: "room", streamId: "room-1", streamSeq: 10,
+      roomId: "room-1", actorId: "agent-1", occurredAt: "2026-08-31T02:00:00.000Z",
+      type: "agent.tool.confirmation-required", payload: {},
+    }] as unknown as readonly PersistedRoomEvent[], {
+      version: 1, roomId: "room-1", afterSeq: 10,
+    });
+    expect(cache.roomRepairRecords("room-1")?.some((record) => record.kind.startsWith("tool-")))
+      .toBe(false);
+    expect(cache.toolSafetyRepairRequired("room-1")).toBe(true);
+
+    cache.beginRoom("room-1", "canonical-tool-repair");
+    cache.stageRoomPage({ ...page(), snapshotId: "canonical-tool-repair" });
+    expect(await cache.finalizeRoom("canonical-tool-repair", page().snapshotChecksum)).toBe(true);
+    cache.commitRoom("room-1", 10, page().snapshotChecksum);
+    expect(cache.toolSafetyRepairRequired("room-1")).toBe(false);
+  });
+
   it("advances explicitly classified notification-only events without mutating repair records", async () => {
     const cache = createDesktopAuthorityCache();
     const seed = page();
@@ -622,12 +764,10 @@ describe("production Desktop authority cache", () => {
       { ...base, eventId: "ball", streamSeq: 12, type: "room.ball.overdue", payload: {} },
       { ...base, eventId: "preempt", streamSeq: 13,
         type: "room.human_preemption.applied", payload: {} },
-      { ...base, eventId: "confirmation", streamSeq: 14,
-        type: "agent.tool.confirmation-required", payload: {} },
     ] as unknown as readonly PersistedRoomEvent[], {
-      version: 1, roomId: "room-1", afterSeq: 14,
+      version: 1, roomId: "room-1", afterSeq: 13,
     });
     expect(cache.roomRepairRecords("room-1")).toEqual(before);
-    expect(cache.roomCursor("room-1")?.afterSeq).toBe(14);
+    expect(cache.roomCursor("room-1")?.afterSeq).toBe(13);
   });
 });

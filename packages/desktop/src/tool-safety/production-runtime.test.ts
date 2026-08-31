@@ -144,6 +144,37 @@ describe("Tool Safety production bridge", () => {
     runtime.close();
   });
 
+  it("repairs instead of presenting legacy confirmation-required cache notifications", async () => {
+    let cacheListener: ((roomId: string) => void) | undefined;
+    let repairRequired = true;
+    const cache = {
+      roomRepairRecords: () => repairRequired ? [] : [call, pending],
+      governanceProjection: () => ({ lifecycle: "active" }), roomIds: () => ["room-1"],
+      toolSafetyRepairRequired: () => repairRequired,
+      subscribeRoomRecords(listener: (roomId: string) => void) {
+        cacheListener = listener;
+        return () => { cacheListener = undefined; };
+      },
+      clear: vi.fn(), clearRoom: vi.fn(),
+    } as unknown as DesktopAuthorityCache;
+    const repairRoom = vi.fn(async () => { repairRequired = false; });
+    const runtime = createDesktopToolSafetyRuntime({
+      session: () => ({ actorId: "human-1" }) as never,
+      transport: { toolSafetyCommand: vi.fn(), onTerminalRevoked: () => () => undefined,
+        onRoomAccessChanged: () => () => undefined,
+        onConnectionFailure: () => () => undefined } as unknown as MessageAuthorityWireTransport,
+      authorityCache: cache, repairRoom, createRequestId: () => "request-repair-legacy",
+    });
+    runtime.start();
+    cacheListener?.("room-1");
+    await vi.waitFor(() => expect(repairRoom).toHaveBeenCalledOnce());
+    await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      connection: { status: "online" },
+      cards: [expect.objectContaining({ confirmationId: "confirmation-1" })],
+    });
+    runtime.close();
+  });
+
   it("hides cached Tool Safety cards offline without a verified read capability", async () => {
     let failure: (() => void) | undefined;
     const cache = { roomRepairRecords: () => [call, pending],

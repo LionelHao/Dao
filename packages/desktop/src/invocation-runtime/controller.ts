@@ -158,7 +158,12 @@ export function createInvocationController(options: {
         operations.delete(executionId); operationRooms.delete(executionId);
       }
     }
-    connections.set(roomId, { status: "online" });
+    const prior = connections.get(roomId);
+    if (prior?.status !== "online") {
+      connections.set(roomId, options.cache.isOfflineReadAuthorized(roomId)
+        ? { status: "offline", asOf: now() }
+        : { status: "repairing" });
+    }
     publish(roomId);
   };
   const unsubscribeCache = options.cache.subscribeRoomRecords(reconcile);

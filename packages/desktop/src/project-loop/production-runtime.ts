@@ -139,7 +139,10 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
     options.authorityCache.clear();
   };
 
-  const readCachedSnapshot = (state: RoomState): ProjectLoopRemoteState => {
+  const readCachedSnapshot = (
+    state: RoomState,
+    source: "online" | "cache" = "cache",
+  ): ProjectLoopRemoteState => {
     const records = options.authorityCache.roomRepairRecords(state.roomId);
     const record = records?.find(
       (candidate): candidate is Extract<RoomRepairRecord, { kind: "project-loop" }> =>
@@ -154,7 +157,11 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
     }
     state.remote = {
       status: "ready", roomId: state.roomId, snapshot, viewerActorId: session.actorId,
-      connection: { status: "online" },
+      connection: source === "online"
+        ? { status: "online" }
+        : options.authorityCache.isOfflineReadAuthorized(state.roomId, Date.parse(now()))
+          ? { status: "offline", asOf: now() }
+          : { status: "repairing" },
       operation: records?.some((candidate) => candidate.kind === "room" &&
         candidate.value.id === state.roomId && candidate.value.status === "archived")
         ? { status: "failed", intentId: `lifecycle:${state.roomId}`,
@@ -192,7 +199,7 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
       if (!stillAuthorized()) return discardLateRepair();
       await options.repairRoom(state.roomId);
       if (!stillAuthorized()) return discardLateRepair();
-      return readCachedSnapshot(state);
+      return readCachedSnapshot(state, "online");
     })().catch((error: unknown) => {
       if (!stillAuthorized()) return discardLateRepair();
       const normalized = errorStatus(error);

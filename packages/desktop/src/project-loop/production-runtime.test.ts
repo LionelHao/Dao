@@ -631,7 +631,8 @@ describe("FT-09 Desktop Project Loop production runtime", () => {
       status: "active", createdAt: "2026-08-25T01:00:00.000Z" } },
     { kind: "project-loop", roomId: "room-1", value: projectSnapshot({ watermark: 9 }) }]);
     await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
-      status: "ready", snapshot: { watermark: 9 }, operation: { status: "idle" },
+      status: "ready", snapshot: { watermark: 9 }, connection: { status: "repair_failed" },
+      operation: { status: "failed", error: { status: 503 } },
     });
     repairEnabled = true;
     cache.clear("room-1");

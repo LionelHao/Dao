@@ -38,6 +38,14 @@ export interface EncryptedGenerationEvent {
   readonly streamSeq: number;
 }
 
+export interface EncryptedActiveGenerationBinding {
+  readonly roomId: string;
+  readonly complete: true;
+  readonly lifecycleGeneration: number;
+  readonly accessRevision: number;
+  readonly leaseGeneration: number;
+}
+
 export interface EncryptedAuthorityGenerationStore {
   beginRoomGeneration(input: Readonly<{
     roomId: string;
@@ -72,6 +80,7 @@ export interface EncryptedAuthorityGenerationStore {
     nextCursor: number;
     upserts: readonly EncryptedGenerationRecord[];
     deletes: readonly string[];
+    invalidateActiveBinding?: boolean;
   }>): Readonly<{ appliedEventIds: readonly string[]; replayedEventIds: readonly string[] }>;
   classifyRoomEvent(
     roomId: string,
@@ -81,6 +90,13 @@ export interface EncryptedAuthorityGenerationStore {
   writeOfflineLease(roomId: string, lease: unknown): void;
   readOfflineLease(roomId: string): unknown | undefined;
   clearOfflineLease(roomId: string): void;
+  bindActiveGeneration(roomId: string, binding: Readonly<{
+    lifecycleGeneration: number;
+    accessRevision: number;
+    leaseGeneration: number;
+  }>): void;
+  readActiveGenerationBinding(roomId: string): EncryptedActiveGenerationBinding | undefined;
+  clearActiveGenerationBinding(roomId: string): void;
   clearRoom(roomId: string): void;
   clearAccount(): void;
   close(): void;
@@ -101,7 +117,7 @@ const DEFAULT_LIMITS: Limits = Object.freeze({
 const DATA_KEY_BYTES = 32;
 const NONCE_BYTES = 12;
 const TAG_BYTES = 16;
-const SCHEMA_VERSION = "2";
+const SCHEMA_VERSION = "3";
 
 const SCHEMA = `
   PRAGMA foreign_keys = ON;
@@ -120,7 +136,14 @@ const SCHEMA = `
     watermark INTEGER NOT NULL CHECK (watermark >= 0),
     cursor INTEGER NOT NULL CHECK (cursor >= 0),
     expected_count INTEGER NOT NULL CHECK (expected_count >= 0),
-    checksum TEXT NOT NULL
+    checksum TEXT NOT NULL,
+    lifecycle_generation INTEGER CHECK (lifecycle_generation IS NULL OR lifecycle_generation >= 0),
+    access_revision INTEGER CHECK (access_revision IS NULL OR access_revision >= 0),
+    lease_generation INTEGER CHECK (lease_generation IS NULL OR lease_generation >= 0),
+    CHECK (
+      (lifecycle_generation IS NULL AND access_revision IS NULL AND lease_generation IS NULL) OR
+      (lifecycle_generation IS NOT NULL AND access_revision IS NOT NULL AND lease_generation IS NOT NULL)
+    )
   ) STRICT;
   CREATE INDEX IF NOT EXISTS cache_generations_room_state
     ON cache_generations(room_hash, generation_state);
@@ -452,7 +475,8 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
   };
 
   const active = (roomId: string) => database.prepare(`
-    SELECT g.generation_id, g.watermark, g.cursor, g.expected_count, g.checksum
+    SELECT g.generation_id, g.watermark, g.cursor, g.expected_count, g.checksum,
+      g.lifecycle_generation, g.access_revision, g.lease_generation
     FROM cache_room_heads h
     JOIN cache_generations g ON g.generation_id = h.active_generation_id
     WHERE h.room_hash = ? AND g.generation_state = 'active'
@@ -747,6 +771,14 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
             authorityGenerationChecksum("room", records.map((record) => record.value)),
             head.generation_id as string);
         }
+        if (input.invalidateActiveBinding === true) {
+          database.prepare("DELETE FROM cache_offline_leases WHERE room_hash = ?").run(room);
+          database.prepare(`
+            UPDATE cache_generations
+            SET lifecycle_generation = NULL, access_revision = NULL, lease_generation = NULL
+            WHERE generation_id = ?
+          `).run(head.generation_id as string);
+        }
       });
       return Object.freeze({
         appliedEventIds: Object.freeze(applied),
@@ -817,6 +849,54 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
       requireOpen();
       database.prepare("DELETE FROM cache_offline_leases WHERE room_hash = ?")
         .run(roomHash(roomId));
+    },
+    bindActiveGeneration(roomId, binding) {
+      requireOpen();
+      if (!nonnegativeSafeInteger(binding.lifecycleGeneration) ||
+          !nonnegativeSafeInteger(binding.accessRevision) ||
+          !nonnegativeSafeInteger(binding.leaseGeneration)) {
+        throw new EncryptedGenerationStoreError("invalid_generation", "Generation binding is invalid");
+      }
+      const head = active(roomId);
+      if (head === undefined || typeof head.generation_id !== "string") {
+        throw new EncryptedGenerationStoreError(
+          "invalid_generation",
+          "Generation binding requires an active Room generation",
+        );
+      }
+      database.prepare(`
+        UPDATE cache_generations
+        SET lifecycle_generation = ?, access_revision = ?, lease_generation = ?
+        WHERE generation_id = ? AND generation_state = 'active'
+      `).run(binding.lifecycleGeneration, binding.accessRevision, binding.leaseGeneration,
+        head.generation_id);
+    },
+    readActiveGenerationBinding(roomId) {
+      requireOpen();
+      const head = active(roomId);
+      if (head === undefined) return undefined;
+      const values = [head.lifecycle_generation, head.access_revision, head.lease_generation];
+      if (values.every((value) => value === null)) return undefined;
+      if (!values.every((value) => typeof value === "number" && nonnegativeSafeInteger(value))) {
+        throw new EncryptedGenerationStoreError("integrity_failed", "Generation binding is incomplete");
+      }
+      return Object.freeze({
+        roomId,
+        complete: true as const,
+        lifecycleGeneration: head.lifecycle_generation as number,
+        accessRevision: head.access_revision as number,
+        leaseGeneration: head.lease_generation as number,
+      });
+    },
+    clearActiveGenerationBinding(roomId) {
+      requireOpen();
+      const head = active(roomId);
+      if (head === undefined || typeof head.generation_id !== "string") return;
+      database.prepare(`
+        UPDATE cache_generations
+        SET lifecycle_generation = NULL, access_revision = NULL, lease_generation = NULL
+        WHERE generation_id = ?
+      `).run(head.generation_id);
     },
     clearRoom(roomId) {
       requireOpen();

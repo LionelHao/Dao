@@ -297,7 +297,12 @@ export function createDesktopToolSafetyRuntime(options: Readonly<{
     return emit(roomId);
   };
   const unsubscribeCache = options.authorityCache.subscribeRoomRecords((roomId) => {
-    if (!closed && connections.get(roomId)?.status !== "revoked") emit(roomId);
+    if (closed || connections.get(roomId)?.status === "revoked") return;
+    if (options.authorityCache.toolSafetyRepairRequired?.(roomId)) {
+      void repair(roomId);
+      return;
+    }
+    emit(roomId);
   });
   const unsubscribeTerminal = options.transport.onTerminalRevoked(() => {
     const roomIds = new Set([...knownRooms, ...options.authorityCache.roomIds()]);

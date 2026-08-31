@@ -235,13 +235,47 @@ describe("encrypted Desktop authority generation store", () => {
   });
 
   it("binds an offline lease to the exact active generation and drops it on atomic replacement", async () => {
-    const { store } = await fixture();
+    const { databasePath, store } = await fixture();
     install(store, { snapshotId: "old", watermark: 9, records: oldRecords });
+    store.bindActiveGeneration("room-secret", {
+      lifecycleGeneration: 2, accessRevision: 7, leaseGeneration: 11,
+    });
     store.writeOfflineLease("room-secret", { token: "lease-for-old-generation" });
     expect(store.readOfflineLease("room-secret")).toEqual({ token: "lease-for-old-generation" });
+    expect(store.readActiveGenerationBinding("room-secret")).toEqual({
+      roomId: "room-secret", complete: true,
+      lifecycleGeneration: 2, accessRevision: 7, leaseGeneration: 11,
+    });
 
-    install(store, { snapshotId: "new", watermark: 12, records: newRecords });
+    store.close();
+    const reopened = createEncryptedAuthorityGenerationStore({
+      databasePath, accountId: "account-secret", encryption: wrapping,
+    });
+    expect(reopened.readActiveGenerationBinding("room-secret")).toMatchObject({
+      lifecycleGeneration: 2, accessRevision: 7, leaseGeneration: 11,
+    });
+
+    install(reopened, { snapshotId: "new", watermark: 12, records: newRecords });
+    expect(reopened.readOfflineLease("room-secret")).toBeUndefined();
+    expect(reopened.readActiveGenerationBinding("room-secret")).toBeUndefined();
+    reopened.close();
+  });
+
+  it("revokes the persisted lease and generation binding in the stable-event transaction", async () => {
+    const { store } = await fixture();
+    install(store, { snapshotId: "old", watermark: 9, records: oldRecords });
+    store.bindActiveGeneration("room-secret", {
+      lifecycleGeneration: 2, accessRevision: 7, leaseGeneration: 11,
+    });
+    store.writeOfflineLease("room-secret", { token: "stale-after-access-change" });
+    store.applyRoomEventBatch({
+      roomId: "room-secret", nextCursor: 10,
+      events: [{ eventId: "access-change", streamSeq: 10 }],
+      upserts: [], deletes: [], invalidateActiveBinding: true,
+    });
     expect(store.readOfflineLease("room-secret")).toBeUndefined();
+    expect(store.readActiveGenerationBinding("room-secret")).toBeUndefined();
+    expect(store.readActiveRoom("room-secret")?.cursor.afterSeq).toBe(10);
     store.close();
   });
 

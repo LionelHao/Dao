@@ -417,6 +417,43 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     runtime.close();
   });
 
+  it("rejects a still-valid token when the active cache generation binding is stale", async () => {
+    const authority = await loopbackAuthority();
+    const runtime = createDesktopGovernanceRuntime({
+      endpoint: authority.endpoint,
+      session: () => ({ accountId: "account-1", actorId: "owner-1", sessionId: "session-1",
+        accessToken: "main-only-token", sessionFamilyId: "family-1", deviceId: "device-1",
+        installationId: "device-1", expiresAt: "2027-01-15T09:00:00.000Z" }),
+      webSocketFactory: (endpoint) => new WebSocket(endpoint) as unknown as GovernanceWebSocketLike,
+      createRequestIdentity: () => ({ requestId: "stale-generation",
+        idempotencyKey: "stale-generation-key" }),
+      offlineReadLeaseVerifier: createDesktopOfflineReadLeaseVerifier({
+        verificationKeys: new Map([["lease-key-1", leaseKeys.publicKey]]), now: () => leaseNow,
+      }),
+      offlineReadLeaseAuthority: { tenantId: "tenant-1", serverSubject: "loopback-authority" },
+      now: () => new Date(leaseNow).toISOString(), timeoutMs: 500,
+    });
+    await expect(runtime.controller.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "ready", connection: { status: "online" },
+    });
+    const binding = runtime.cache.activeGenerationBinding("room-1");
+    expect(binding).toBeDefined();
+    Object.defineProperty(runtime.cache, "activeGenerationBinding", {
+      configurable: true,
+      value: () => ({ ...binding!, accessRevision: binding!.accessRevision + 1 }),
+    });
+
+    authority.setUnavailable(true);
+    await vi.waitFor(() => expect(runtime.controller.current("room-1")).toMatchObject({
+      connection: { status: "offline" },
+    }));
+    await expect(runtime.controller.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "locked", connection: { status: "offline" },
+    });
+    expect(runtime.cache.roomRepairRecords("room-1")).toBeUndefined();
+    runtime.close();
+  });
+
   it("actively locks and purges an already visible offline Room at the exact lease boundary", async () => {
     const leaseTtlMs = 200;
     const authority = await loopbackAuthority(leaseTtlMs);
