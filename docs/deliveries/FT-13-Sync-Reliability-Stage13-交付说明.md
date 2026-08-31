@@ -1,8 +1,8 @@
 # FT-13 Sync & Reliability · Stage 13 交付说明
 
-> 状态：内容 PR #77 已通过 required CI 并合入远端主分支；本文位于从该 merge 新建的
-> evidence-only worktree，正在固化最终证据。本文只记录可复核事实，不把 Agent 自测、CI、
-> 独立审阅或远程合并等同于 owner 验收，不标记 verified。
+> 状态：内容 PR #77 已通过 required CI 并合入远端主分支；evidence-only PR #78 的首轮
+> required CI 也已双绿，本文固化其实际 URL 与 job 证据。本文只记录可复核事实，不把 Agent
+> 自测、CI、独立审阅或远程合并等同于 owner 验收，不标记 verified。
 
 ## 1. 一句话结果
 
@@ -413,8 +413,8 @@ opt-in live smoke。
 | 内容 PR CI run | https://github.com/LionelHao/Dao/actions/runs/33388107739 | success；Node 22.13.1 job `99475223728` 24m40s；Node 22.x job `99475223922` 23m26s |
 | 内容 PR merge SHA | `551e9983f1ae4205c090387f371c139db4b16847` | 2026-08-31T12:06:16Z squash merge |
 | 失败 CI 历史 | runs `33361557824`、`33366261341`、`33369496898` | 如实保留 runner timeout/资源饥饿、schema 边界与 E2E 竞态；未隐藏失败历史 |
-| evidence PR URL / number | evidence-only branch `codex/ft13-stage13-evidence` 已从 `551e998` 创建 | 首次提交后创建 GitHub PR，并在同一 PR 后续提交写入实际 URL |
-| evidence PR CI run | 由 evidence PR 的实际 checks 生成 | 首轮 green 后把真实 run/job URL 写入同一 PR，再等最终 head CI |
+| evidence PR URL / number | https://github.com/LionelHao/Dao/pull/78 | evidence-only；从内容 merge `551e998` 新建 |
+| evidence PR CI run | https://github.com/LionelHao/Dao/actions/runs/33390910092 | 首轮 success；[Node 22.13.1 job](https://github.com/LionelHao/Dao/actions/runs/33390910092/job/99484061163) 24m47s；[Node 22.x job](https://github.com/LionelHao/Dao/actions/runs/33390910092/job/99484061455) 22m19s；PR 页面保留最终文档 head 的 required checks |
 | evidence PR merge SHA | GitHub 在 evidence PR 合并时生成，无法由该提交预先自指 | 精确 SHA 由合并后最终交付报告记录 |
 | 当前 `origin/main` | `551e9983f1ae4205c090387f371c139db4b16847` | 内容 PR 合并后 `git fetch origin --prune` 实测 |
 | 临时 worktree 清理 | evidence PR 合并后执行 clean check、`worktree remove` 与 `worktree prune` | 清理结果由合并后最终交付报告记录，避免文档伪造未来事实 |
