@@ -70,6 +70,24 @@ describe("encrypted Desktop authority generation store", () => {
     store.close();
   });
 
+  it("atomically replaces an active generation when a valid repair repeats the same snapshot", async () => {
+    const { store } = await fixture();
+    install(store, { snapshotId: "same-fixed-snapshot", watermark: 9, records: oldRecords });
+    const checksum = authorityGenerationChecksum("room", oldRecords.map((record) => record.value));
+
+    store.beginRoomGeneration({ roomId: "room-secret", snapshotId: "same-fixed-snapshot",
+      watermark: 9, expectedCount: 1, checksum });
+    store.stageRoomRecords("room-secret", "same-fixed-snapshot", oldRecords);
+    expect(store.readActiveRoom("room-secret")).toMatchObject({ records: oldRecords,
+      cursor: { afterSeq: 9 } });
+
+    store.commitRoomGeneration({ roomId: "room-secret", snapshotId: "same-fixed-snapshot",
+      watermark: 9, expectedCount: 1, checksum });
+    expect(store.readActiveRoom("room-secret")).toMatchObject({ records: oldRecords,
+      cursor: { afterSeq: 9 } });
+    store.close();
+  });
+
   it.each(["before-active-flip", "after-active-flip"] as const)(
     "rolls back a crash at %s and reopens the old complete generation",
     async (failurePoint) => {

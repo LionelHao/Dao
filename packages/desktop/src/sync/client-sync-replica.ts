@@ -634,6 +634,9 @@ export function createClientSyncReplica(options: {
     const operationEpoch = lifecycleEpoch;
     const roomOperation = (roomOperationGenerations.get(roomId) ?? 0) + 1;
     roomOperationGenerations.set(roomId, roomOperation);
+    subscriptionGenerations.set(roomId, (subscriptionGenerations.get(roomId) ?? 0) + 1);
+    closeSubscription(subscriptions.get(roomId));
+    subscriptions.delete(roomId);
     const repairing = (async () => {
       const retryDelays = [250, 1_000] as const;
       for (let attempt = 0; ; attempt += 1) {

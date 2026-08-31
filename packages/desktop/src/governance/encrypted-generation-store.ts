@@ -101,7 +101,7 @@ const DEFAULT_LIMITS: Limits = Object.freeze({
 const DATA_KEY_BYTES = 32;
 const NONCE_BYTES = 12;
 const TAG_BYTES = 16;
-const SCHEMA_VERSION = "1";
+const SCHEMA_VERSION = "2";
 
 const SCHEMA = `
   PRAGMA foreign_keys = ON;
@@ -120,11 +120,12 @@ const SCHEMA = `
     watermark INTEGER NOT NULL CHECK (watermark >= 0),
     cursor INTEGER NOT NULL CHECK (cursor >= 0),
     expected_count INTEGER NOT NULL CHECK (expected_count >= 0),
-    checksum TEXT NOT NULL,
-    UNIQUE (room_hash, snapshot_hash)
+    checksum TEXT NOT NULL
   ) STRICT;
   CREATE INDEX IF NOT EXISTS cache_generations_room_state
     ON cache_generations(room_hash, generation_state);
+  CREATE UNIQUE INDEX IF NOT EXISTS cache_generations_one_staging_per_room
+    ON cache_generations(room_hash) WHERE generation_state = 'staging';
   CREATE TABLE IF NOT EXISTS cache_room_heads (
     room_hash TEXT PRIMARY KEY,
     active_generation_id TEXT NOT NULL UNIQUE

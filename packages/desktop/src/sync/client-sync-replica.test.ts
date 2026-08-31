@@ -814,6 +814,35 @@ describe("ClientSyncReplica", () => {
     expect(cache.liveRoom("room-1")?.events).toEqual([]);
   });
 
+  it("invalidates the live observer before a replacement repair can commit", async () => {
+    const transport = new FakeTransport();
+    const cache = new MemoryCache();
+    const replica = createClientSyncReplica({ transport, cache });
+    await replica.restoreWorkspace();
+    const stale = transport.observer!;
+    let release!: () => void;
+    let reached!: () => void;
+    const paused = new Promise<void>((resolve) => { release = resolve; });
+    const repairReached = new Promise<void>((resolve) => { reached = resolve; });
+    const original = transport.repairRoomBegin.bind(transport);
+    transport.repairRoomBegin = async (...args) => {
+      reached();
+      await paused;
+      return original(...args);
+    };
+
+    const repairing = replica.repairRoom("room-1");
+    await repairReached;
+    expect(transport.subscriptions[0]?.closed).toBe(true);
+    await stale.events([event(10)], { version: 1, roomId: "room-1", afterSeq: 10 });
+    expect(cache.roomCursor("room-1")?.afterSeq).toBe(9);
+    release();
+    await repairing;
+
+    expect(cache.roomCursor("room-1")?.afterSeq).toBe(9);
+    expect(cache.liveRoom("room-1")?.events).toEqual([]);
+  });
+
   it("keeps the newly committed complete room when subscribe fails after delta", async () => {
     const transport = new FakeTransport();
     const cache = new MemoryCache();
