@@ -3,6 +3,8 @@ import { configDefaults, defineConfig, defineProject } from "vitest/config";
 export default defineConfig({
   test: {
     globalSetup: ["./vitest.global-setup.ts"],
+    // Vitest 3.2.7 sorts groupOrder with the default lexicographic Array.sort.
+    // Keep latency-sensitive real-process projects at 0-3, then 4 and 40-50.
     projects: [
       defineProject({
         test: {
@@ -13,6 +15,7 @@ export default defineConfig({
             ...configDefaults.exclude,
             "packages/server/src/authority.e2e.test.ts",
             "packages/server/src/agent-runtime/human-preemption-authority.test.ts",
+            "packages/server/src/project-loop/database-authority.test.ts",
             "packages/server/src/persistence/legacy-importer.test.ts",
             "packages/server/src/persistence/context-snapshot-database-authority.test.ts",
             "packages/server/src/persistence/schema*.test.ts",
@@ -20,7 +23,7 @@ export default defineConfig({
             "packages/server/src/persistence/worker-database-client.test.ts",
             "packages/server/src/sync-service.test.ts",
           ],
-          sequence: { groupOrder: 0 },
+          sequence: { groupOrder: 4 },
         },
       }),
       defineProject({
@@ -30,7 +33,7 @@ export default defineConfig({
           include: ["packages/server/src/persistence/schema-recent.test.ts"],
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
-          sequence: { groupOrder: 1 },
+          sequence: { groupOrder: 40 },
         },
       }),
       defineProject({
@@ -40,7 +43,7 @@ export default defineConfig({
           include: ["packages/server/src/persistence/schema-foundations.test.ts"],
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
-          sequence: { groupOrder: 2 },
+          sequence: { groupOrder: 41 },
         },
       }),
       defineProject({
@@ -50,7 +53,7 @@ export default defineConfig({
           include: ["packages/server/src/persistence/schema-integrity.test.ts"],
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
-          sequence: { groupOrder: 3 },
+          sequence: { groupOrder: 42 },
         },
       }),
       defineProject({
@@ -60,7 +63,7 @@ export default defineConfig({
           include: ["packages/server/src/persistence/legacy-importer.test.ts"],
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
-          sequence: { groupOrder: 4 },
+          sequence: { groupOrder: 43 },
         },
       }),
       defineProject({
@@ -70,7 +73,7 @@ export default defineConfig({
           include: ["packages/server/src/persistence/schema-v26-rollback-01.test.ts"],
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
-          sequence: { groupOrder: 5 },
+          sequence: { groupOrder: 44 },
         },
       }),
       defineProject({
@@ -80,7 +83,7 @@ export default defineConfig({
           include: ["packages/server/src/persistence/schema-v26-rollback-02.test.ts"],
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
-          sequence: { groupOrder: 6 },
+          sequence: { groupOrder: 45 },
         },
       }),
       defineProject({
@@ -90,7 +93,7 @@ export default defineConfig({
           include: ["packages/server/src/persistence/schema-v26-rollback-03.test.ts"],
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
-          sequence: { groupOrder: 7 },
+          sequence: { groupOrder: 46 },
         },
       }),
       defineProject({
@@ -100,7 +103,7 @@ export default defineConfig({
           include: ["packages/server/src/persistence/schema-v26-rollback-04.test.ts"],
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
-          sequence: { groupOrder: 8 },
+          sequence: { groupOrder: 47 },
         },
       }),
       defineProject({
@@ -112,7 +115,27 @@ export default defineConfig({
           ],
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
-          sequence: { groupOrder: 9 },
+          sequence: { groupOrder: 1 },
+        },
+      }),
+      defineProject({
+        test: {
+          name: "authority-schema-v27",
+          environment: "jsdom",
+          include: ["packages/server/src/persistence/schema-v27.test.ts"],
+          pool: "forks",
+          poolOptions: { forks: { singleFork: true } },
+          sequence: { groupOrder: 2 },
+        },
+      }),
+      defineProject({
+        test: {
+          name: "project-loop-database-authority",
+          environment: "jsdom",
+          include: ["packages/server/src/project-loop/database-authority.test.ts"],
+          pool: "forks",
+          poolOptions: { forks: { singleFork: true } },
+          sequence: { groupOrder: 3 },
         },
       }),
       defineProject({
@@ -124,10 +147,13 @@ export default defineConfig({
             "packages/server/src/persistence/schema-v*.test.ts",
             "packages/server/src/persistence/worker-database-client.test.ts",
           ],
-          exclude: ["packages/server/src/persistence/schema-v26-rollback-*.test.ts"],
+          exclude: [
+            "packages/server/src/persistence/schema-v26-rollback-*.test.ts",
+            "packages/server/src/persistence/schema-v27.test.ts",
+          ],
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
-          sequence: { groupOrder: 10 },
+          sequence: { groupOrder: 48 },
         },
       }),
       defineProject({
@@ -138,7 +164,7 @@ export default defineConfig({
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
           testTimeout: 15_000,
-          sequence: { groupOrder: 11 },
+          sequence: { groupOrder: 0 },
         },
       }),
       defineProject({
@@ -149,7 +175,7 @@ export default defineConfig({
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
           testTimeout: 15_000,
-          sequence: { groupOrder: 12 },
+          sequence: { groupOrder: 49 },
         },
       }),
       defineProject({
@@ -160,7 +186,7 @@ export default defineConfig({
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
           testTimeout: 15_000,
-          sequence: { groupOrder: 13 },
+          sequence: { groupOrder: 50 },
         },
       }),
     ],
