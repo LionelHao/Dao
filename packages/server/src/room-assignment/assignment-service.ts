@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AuthenticatedSessionContext } from "../persistence/contracts.js";
+import { IDEMPOTENCY_RECEIPT_TTL_MS } from
+  "../persistence/idempotency-lifecycle.js";
 import type { AuthorityTransactionView } from
   "../room-governance/private-participant-contracts.js";
 import {
@@ -207,7 +209,7 @@ function persistReceipt(
     responseJson: JSON.stringify(result),
     statusCode: 200,
     createdAt: timestamp(now),
-    expiresAt: timestamp(now + 24 * 60 * 60 * 1_000),
+    expiresAt: timestamp(now + IDEMPOTENCY_RECEIPT_TTL_MS),
   });
 }
 
@@ -345,7 +347,7 @@ function execute(
 
   const scope = idempotencyScope(request, context.principal.actorId);
   const requestHash = requestFingerprint(request, context.principal.actorId);
-  const receipt = repository.readReceipt(scope, request.idempotencyKey);
+  const receipt = repository.readReceipt(scope, request.idempotencyKey, now);
   if (receipt !== undefined) {
     if (receipt.requestHash !== requestHash) fail(409, "idempotency_conflict");
     return parseReceipt(receipt.responseJson);

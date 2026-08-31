@@ -345,6 +345,28 @@ describe("SQLite Room Assignment repository and service", () => {
       .toThrow("history immutable");
   });
 
+  it("stores a 30-day receipt and removes it at the exact expiry boundary", () => {
+    const scope = ["room-assignment", "owner", "room-1", "create"].join("\0");
+    const expired = createRequest("exact-expired");
+    database.prepare(
+      `INSERT INTO idempotency_records (
+         scope, key, request_hash, response_json, status_code, created_at, expires_at
+       ) VALUES (?, ?, ?, '{}', 200, ?, ?)`,
+    ).run(scope, expired.idempotencyKey, "f".repeat(64),
+      new Date(now - 1).toISOString(), new Date(now).toISOString());
+    const result = inTransaction(database, "room-1", (transaction) =>
+      executeRoomAssignmentCommandInTransaction(transaction, context("owner"), expired, now));
+    expect(result).toMatchObject({ changed: true, acceptedRevision: 1 });
+    const row = database.prepare(
+      `SELECT created_at AS createdAt, expires_at AS expiresAt
+       FROM idempotency_records WHERE scope = ? AND key = ? AND expires_at > ?`,
+    ).get(scope, expired.idempotencyKey, new Date(now).toISOString()) as {
+      createdAt: string; expiresAt: string;
+    };
+    expect(Date.parse(row.expiresAt) - Date.parse(row.createdAt))
+      .toBe(30 * 24 * 60 * 60 * 1_000);
+  });
+
   it("materializes the legacy Agent membership only as an Assignment-derived projection", () => {
     database.exec("DELETE FROM room_memberships WHERE room_id='room-1' AND actor_id='agent-1'");
     const result = inTransaction(database, "room-1", (transaction) =>

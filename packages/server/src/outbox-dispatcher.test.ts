@@ -2,9 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import type { PersistedIdentityEvent, PersistedRoomEvent } from "@native-im/core";
 import {
   createOutboxDispatcher,
+  type OutboxFailureLifecyclePort,
   type OutboxDispatchStore,
   type OutboxSendResult,
 } from "./outbox-dispatcher.js";
+import type { OutboxStructuredAlert } from "./outbox-alert-sink.js";
 import type {
   OutboxDelivery,
   OutboxDispatchCandidate,
@@ -274,8 +276,8 @@ describe("OutboxDispatcher", () => {
       store: new MemoryOutboxStore([], () => true),
       registry: createSubscriptionRegistry(),
       send: async () => ({ accepted: true }),
-      batchSize: 1_001,
-    })).toThrow("batchSize must be at most 1000");
+      batchSize: 101,
+    })).toThrow("batchSize must be a positive safe integer at most 100");
   });
 
   it("applies target-kind authorization before every send", async () => {
@@ -376,6 +378,130 @@ describe("OutboxDispatcher", () => {
       expect(store.pending.size).toBe(0);
     },
   );
+
+  it("revalidates but does not resend an accepted peer while another peer retries", async () => {
+    const registry = createSubscriptionRegistry();
+    const acceptedPeer = connection("accepted-ledger", "human-accepted");
+    const rejectedPeer = connection("rejected-ledger", "human-rejected");
+    registry.addRoom({ roomId: "room-1", connection: acceptedPeer });
+    registry.addRoom({ roomId: "room-1", connection: rejectedPeer });
+    const item = delivery("delivery-ledger", "room", "room-1", roomEvent);
+    const store = new MemoryOutboxStore([item], () => true);
+    const retries: string[] = [];
+    const lifecycle: OutboxFailureLifecyclePort = {
+      async scheduleRetry(input) {
+        retries.push(`${input.attempt}:${input.availableAtMs}`);
+        await store.markOutboxFailed(input.deliveryId, input.reason);
+      },
+      async deadLetter() { throw new Error("delivery should recover before dead-letter"); },
+    };
+    const sends: string[] = [];
+    let reject = true;
+    const dispatcher = createOutboxDispatcher({
+      store,
+      registry,
+      failureLifecycle: lifecycle,
+      now: () => 1_000,
+      random: () => 0,
+      send: async (candidate) => {
+        sends.push(candidate.connectionId);
+        if (candidate.connectionId === rejectedPeer.connectionId && reject) {
+          return { accepted: false, reason: "backpressure" };
+        }
+        return { accepted: true };
+      },
+    });
+
+    await expect(dispatcher.flushOnce()).resolves.toBe(0);
+    reject = false;
+    await expect(dispatcher.flushOnce()).resolves.toBe(1);
+
+    expect(retries).toEqual(["1:1000"]);
+    expect(sends).toEqual([
+      acceptedPeer.connectionId,
+      rejectedPeer.connectionId,
+      rejectedPeer.connectionId,
+    ]);
+    expect(store.authorizationCalls).toHaveLength(4);
+  });
+
+  it("dead-letters the eighth failure and emits only closed alert metadata", async () => {
+    const registry = createSubscriptionRegistry();
+    const peer = connection("dead-peer", "human-dead");
+    registry.addRoom({ roomId: "room-1", connection: peer });
+    const initial = delivery("delivery-dead", "room", "room-1", roomEvent);
+    const item = { ...initial, attempts: 7 } satisfies OutboxDelivery;
+    const store = new MemoryOutboxStore([item], () => true);
+    const terminal: unknown[] = [];
+    const alerts: OutboxStructuredAlert[] = [];
+    const lifecycle: OutboxFailureLifecyclePort = {
+      async scheduleRetry() { throw new Error("eighth failure must be terminal"); },
+      async deadLetter(input) {
+        terminal.push(input);
+        store.pending.delete(input.deliveryId);
+      },
+    };
+    const now = Date.parse(roomEvent.occurredAt) + 5 * 60_000;
+    const dispatcher = createOutboxDispatcher({
+      store, registry, failureLifecycle: lifecycle, now: () => now,
+      alertSink: { emit: (alert) => { alerts.push(alert); } },
+      send: async () => ({ accepted: false, reason: "send_rejected" }),
+    });
+
+    await expect(dispatcher.flushOnce()).resolves.toBe(0);
+
+    expect(terminal).toEqual([{
+      deliveryId: item.deliveryId,
+      eventId: item.eventId,
+      attempt: 8,
+      reason: "send_rejected",
+      deadLetteredAtMs: now,
+    }]);
+    expect(alerts).toContainEqual({
+      severity: "critical", code: "outbox_delivery_dead_lettered", family: "central",
+      deliveryId: item.deliveryId, eventId: item.eventId, attempts: 8,
+      ageMs: 5 * 60_000, reason: "send_rejected",
+    });
+  });
+
+  it("surfaces loop storage failures through the structured sink", async () => {
+    const alerts: OutboxStructuredAlert[] = [];
+    const store = new MemoryOutboxStore([], () => true);
+    store.listPendingOutbox = async () => { throw new Error("raw database path /secret"); };
+    const dispatcher = createOutboxDispatcher({
+      store,
+      registry: createSubscriptionRegistry(),
+      send: async () => ({ accepted: true }),
+      pollIntervalMs: 5,
+      alertSink: { emit: (alert) => { alerts.push(alert); } },
+    });
+
+    dispatcher.start();
+    await vi.waitFor(() => expect(alerts).toContainEqual({
+      severity: "critical", code: "outbox_dispatcher_failure", family: "central",
+      reason: "storage_unavailable",
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(alerts).toHaveLength(1);
+    await dispatcher.close();
+    expect(JSON.stringify(alerts)).not.toContain("/secret");
+  });
+
+  it("bounds shutdown when an in-flight send does not settle", async () => {
+    const registry = createSubscriptionRegistry();
+    registry.addRoom({ roomId: "room-1", connection: connection("hung", "human-hung") });
+    const store = new MemoryOutboxStore([
+      delivery("delivery-hung", "room", "room-1", roomEvent),
+    ], () => true);
+    const dispatcher = createOutboxDispatcher({
+      store,
+      registry,
+      shutdownTimeoutMs: 10,
+      send: async () => new Promise<OutboxSendResult>(() => undefined),
+    });
+    void dispatcher.flushOnce();
+    await expect(dispatcher.close()).rejects.toThrow("outbox dispatcher shutdown timed out");
+  });
 
   it("marks a pending row dispatched when no eligible local connection exists", async () => {
     const registry = createSubscriptionRegistry();

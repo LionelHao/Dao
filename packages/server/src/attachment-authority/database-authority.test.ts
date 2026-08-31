@@ -494,6 +494,36 @@ describe("SQLite Attachment Authority transaction functions", () => {
     }
   });
 
+  it("deletes an exact-expiry ghost receipt before treating the request as new", () => {
+    const database = createDatabase();
+    const ids = createIds();
+    try {
+      const scope = "attachment-human:attachment.upload.begin:attachment-room";
+      database.prepare(
+        `INSERT INTO idempotency_records (
+           scope, key, request_hash, response_json, status_code, created_at, expires_at
+         ) VALUES (?, 'expired-upload', ?, '{}', 200, ?, ?)`,
+      ).run(scope, "f".repeat(64), new Date(NOW - 1).toISOString(),
+        new Date(NOW).toISOString());
+
+      const result = runAttachmentAuthorityImmediateTransaction(database, () =>
+        beginAttachmentUploadInTransaction(database, {
+          context: UPLOADER,
+          command: beginInput({ requestId: "expired-new", uploadKey: "expired-upload" }),
+          clock,
+          ids,
+        }));
+
+      expect(result).toMatchObject({ uploadId: uuid(1), replayed: false });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM idempotency_records
+         WHERE scope = ? AND key = 'expired-upload' AND expires_at > ?`,
+      ).get(scope, new Date(NOW).toISOString())).toEqual({ count: 1 });
+    } finally {
+      database.close();
+    }
+  });
+
   it("caps active uploads globally before allocating another durable upload", () => {
     const database = createDatabase();
     const ids = createIds();

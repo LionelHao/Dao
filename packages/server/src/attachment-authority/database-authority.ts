@@ -37,6 +37,8 @@ import type {
   AttachmentWorkerContext,
   AttachmentObjectReferenceSnapshot,
 } from "./database-contracts.js";
+import { IDEMPOTENCY_RECEIPT_TTL_MS } from
+  "../persistence/idempotency-lifecycle.js";
 
 type ErrorCode = AttachmentError["code"];
 type ErrorStatus = AttachmentError["status"];
@@ -275,10 +277,16 @@ function executeIdempotently<Receipt extends StoredReceipt>(
   }>,
 ): Receipt & Readonly<{ replayed: boolean }> {
   const requestHash = sha256(input.businessInput);
+  const current = now(input.clock);
+  database.prepare(`
+    DELETE FROM idempotency_records
+    WHERE scope = ? AND key = ? AND expires_at <= ?
+  `).run(input.scope, input.key, current.iso);
   const existing = database.prepare(`
     SELECT request_hash AS requestHash, response_json AS responseJson
-    FROM idempotency_records WHERE scope = ? AND key = ?
-  `).get(input.scope, input.key);
+    FROM idempotency_records
+    WHERE scope = ? AND key = ? AND expires_at > ?
+  `).get(input.scope, input.key, current.iso);
   if (existing !== undefined) {
     if (existing.requestHash !== requestHash) {
       return fail(409, input.conflictCode ?? "idempotency_conflict");
@@ -286,7 +294,6 @@ function executeIdempotently<Receipt extends StoredReceipt>(
     const receipt = parseStoredReceipt(existing.responseJson, input.receiptKeys);
     return { ...receipt, replayed: true } as Receipt & Readonly<{ replayed: boolean }>;
   }
-  const current = now(input.clock);
   const receipt = input.execute(current.iso);
   database.prepare(`
     INSERT INTO idempotency_records (
@@ -298,7 +305,7 @@ function executeIdempotently<Receipt extends StoredReceipt>(
     requestHash,
     canonicalJson(receipt),
     current.iso,
-    new Date(current.ms + 30 * 24 * 60 * 60 * 1_000).toISOString(),
+    new Date(current.ms + IDEMPOTENCY_RECEIPT_TTL_MS).toISOString(),
   );
   return { ...receipt, replayed: false };
 }
