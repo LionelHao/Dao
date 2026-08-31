@@ -144,7 +144,7 @@ export class SnapshotCompletionOutcomeUnknownError extends Error {
 export interface ClientSyncReplica {
   restoreWorkspace(): Promise<void>;
   repairRoom(roomId: string): Promise<void>;
-  clearAndRestore(): Promise<void>;
+  clearAndRestore(afterClear?: () => Promise<void>): Promise<void>;
   close(): void;
 }
 
@@ -723,7 +723,7 @@ export function createClientSyncReplica(options: {
   return {
     restoreWorkspace,
     repairRoom,
-    async clearAndRestore() {
+    async clearAndRestore(afterClear) {
       requireOpen();
       lifecycleEpoch += 1;
       for (const subscription of subscriptions.values()) closeSubscription(subscription);
@@ -738,6 +738,7 @@ export function createClientSyncReplica(options: {
         ...(pendingWorkspace === undefined ? [] : [pendingWorkspace]),
       ]);
       cache.clear();
+      await afterClear?.();
       await restoreWorkspace();
     },
     close() {

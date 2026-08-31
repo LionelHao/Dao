@@ -10,6 +10,7 @@ import type {
 
 export const GOVERNANCE_IPC_CHANNELS = Object.freeze({
   getSurface: "governance:get-surface",
+  clearCache: "governance:clear-cache",
   getDepartureConflicts: "governance:get-departure-conflicts",
   submit: "governance:submit",
   stateChanged: "governance:state-changed",
@@ -83,6 +84,7 @@ export interface GovernanceAuthorityCommand extends GovernanceMutationRequest {
 
 export interface GovernanceBridge {
   getSurface(query: GovernanceSurfaceQuery): Promise<GovernanceRemoteState>;
+  clearCache(query: GovernanceSurfaceQuery): Promise<GovernanceRemoteState>;
   getDepartureConflicts(query: GovernanceDepartureQuery): Promise<DepartureConflictList>;
   submit(request: GovernanceMutationRequest): Promise<GovernanceSubmitResult>;
   onStateChanged(listener: (state: GovernanceStateEnvelope) => void): () => void;

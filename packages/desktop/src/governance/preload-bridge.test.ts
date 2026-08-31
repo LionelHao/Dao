@@ -14,12 +14,14 @@ describe("Governance preload bridge", () => {
     };
     const bridge = createGovernanceBridge(ipc);
     expect(Object.keys(bridge).sort()).toEqual([
-      "getDepartureConflicts", "getSurface", "onStateChanged", "submit",
+      "clearCache", "getDepartureConflicts", "getSurface", "onStateChanged", "submit",
     ]);
     await expect(bridge.getSurface({ roomId: "room-1", token: "forbidden" } as never))
       .rejects.toThrow("Invalid Governance surface query");
     await expect(bridge.getSurface({ roomId: "room-1" })).resolves.toMatchObject({ status: "locked" });
     expect(ipc.invoke).toHaveBeenCalledWith(GOVERNANCE_IPC_CHANNELS.getSurface, { roomId: "room-1" });
+    await expect(bridge.clearCache({ roomId: "room-1" })).resolves.toMatchObject({ status: "locked" });
+    expect(ipc.invoke).toHaveBeenCalledWith(GOVERNANCE_IPC_CHANNELS.clearCache, { roomId: "room-1" });
     const callback = vi.fn();
     const close = bridge.onStateChanged(callback);
     listeners.get(GOVERNANCE_IPC_CHANNELS.stateChanged)?.({}, { token: "leak" });

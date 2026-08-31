@@ -20,6 +20,7 @@ import {
   type GovernanceWebSocketLike,
 } from "./websocket-authority.js";
 import type { GovernanceClosedError } from "../renderer/governance/view-model.js";
+import type { GovernanceRemoteState } from "./contracts.js";
 import { createInvocationController, type InvocationController } from "../invocation-runtime/controller.js";
 import type {
   DesktopOfflineReadLeaseBinding,
@@ -85,6 +86,7 @@ export interface DesktopGovernanceRuntime {
   readonly invocations: InvocationController;
   readonly cache: DesktopAuthorityCache;
   repairRoom(roomId: string): Promise<void>;
+  clearCache(roomId: string): Promise<GovernanceRemoteState>;
   restoreCache(actorId: string): Promise<boolean>;
   invalidateAuthorizedState(): void;
   close(): void;
@@ -343,6 +345,16 @@ export function createDesktopGovernanceRuntime(options: {
       const session = options.session();
       if (session === undefined) throw new GovernanceTransportError("authentication_required", 401);
       await repairAndLease(roomId, session);
+    },
+    async clearCache(roomId: string) {
+      const session = options.session();
+      if (session === undefined) throw new GovernanceTransportError("authentication_required", 401);
+      for (const cachedRoomId of [...leaseExpiryTimers.keys()]) clearLeaseTimer(cachedRoomId);
+      offlineRooms.clear();
+      await replica.clearAndRestore(async () => {
+        await cache.restore(session.actorId);
+      });
+      return controller.getSurface({ roomId });
     },
     async restoreCache(actorId: string) {
       const restored = await cache.restore(actorId);

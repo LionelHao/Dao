@@ -8,6 +8,7 @@ import {
   isGovernanceDepartureQuery,
   isGovernanceMutationRequest,
   isGovernanceSurfaceQuery,
+  type GovernanceRemoteState,
 } from "./contracts.js";
 
 interface GovernanceIpcEvent { readonly sender: unknown; readonly senderFrame: unknown }
@@ -32,6 +33,7 @@ export function registerGovernanceIpc(options: {
   readonly webContents: GovernanceIpcWebContents;
   readonly controller: Pick<GovernanceController,
     "getSurface" | "getDepartureConflicts" | "submit" | "subscribe">;
+  readonly clearCache: (roomId: string) => Promise<GovernanceRemoteState>;
 }): () => void {
   options.ipcMain.handle(GOVERNANCE_IPC_CHANNELS.getSurface, async (event, ...args) => {
     trust(event, options.webContents);
@@ -46,6 +48,13 @@ export function registerGovernanceIpc(options: {
       throw new TypeError("Invalid Governance conflicts query");
     }
     return cloneDepartureConflictList(await options.controller.getDepartureConflicts(args[0]));
+  });
+  options.ipcMain.handle(GOVERNANCE_IPC_CHANNELS.clearCache, async (event, ...args) => {
+    trust(event, options.webContents);
+    if (args.length !== 1 || !isGovernanceSurfaceQuery(args[0])) {
+      throw new TypeError("Invalid Governance clear-cache query");
+    }
+    return cloneGovernanceRemoteState(await options.clearCache(args[0].roomId));
   });
   options.ipcMain.handle(GOVERNANCE_IPC_CHANNELS.submit, async (event, ...args) => {
     trust(event, options.webContents);
@@ -64,6 +73,7 @@ export function registerGovernanceIpc(options: {
   const channels = [
     GOVERNANCE_IPC_CHANNELS.getSurface,
     GOVERNANCE_IPC_CHANNELS.getDepartureConflicts,
+    GOVERNANCE_IPC_CHANNELS.clearCache,
     GOVERNANCE_IPC_CHANNELS.submit,
   ] as const;
   let active = true;

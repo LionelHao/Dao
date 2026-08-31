@@ -32,6 +32,14 @@ export function createGovernanceBridge(ipcRenderer: GovernanceIpcRenderer): Gove
         await ipcRenderer.invoke(GOVERNANCE_IPC_CHANNELS.getSurface, query),
       );
     },
+    async clearCache(query: GovernanceSurfaceQuery) {
+      if (!isGovernanceSurfaceQuery(query)) {
+        throw new TypeError("Invalid Governance clear-cache query");
+      }
+      return cloneGovernanceRemoteState(
+        await ipcRenderer.invoke(GOVERNANCE_IPC_CHANNELS.clearCache, query),
+      );
+    },
     async getDepartureConflicts(query: GovernanceDepartureQuery) {
       if (!isGovernanceDepartureQuery(query)) {
         throw new TypeError("Invalid Governance conflicts query");

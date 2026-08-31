@@ -201,6 +201,7 @@ async function createWindow(): Promise<void> {
       ipcMain,
       webContents: window.webContents,
       controller: governance.controller,
+      clearCache: (roomId) => governance!.clearCache(roomId),
     });
     disposeInvocationIpc = registerInvocationIpc({
       ipcMain, webContents: window.webContents, controller: governance.invocations,
@@ -328,6 +329,7 @@ async function createWindow(): Promise<void> {
       "revokeSession",
     ];
     const expectedGovernanceMethods = [
+      "clearCache",
       "getDepartureConflicts",
       "getSurface",
       "onStateChanged",

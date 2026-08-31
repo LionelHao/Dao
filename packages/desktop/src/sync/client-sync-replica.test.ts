@@ -720,6 +720,19 @@ describe("ClientSyncReplica", () => {
     expect(transport.subscriptions[0]?.closed).toBe(true);
   });
 
+  it("reopens protected cache storage after clear before authority writes a new generation", async () => {
+    const transport = new FakeTransport();
+    const cache = new MemoryCache();
+    const replica = createClientSyncReplica({ transport, cache });
+    await replica.restoreWorkspace();
+    const afterClear = vi.fn(async () => undefined);
+
+    await replica.clearAndRestore(afterClear);
+
+    expect(afterClear).toHaveBeenCalledOnce();
+    expect(cache.liveRoom("room-1")?.records).toEqual([roomRecord]);
+  });
+
   it("durably resyncs from a subscription retry cursor before resubscribing", async () => {
     const transport = new FakeTransport();
     const cache = new MemoryCache();

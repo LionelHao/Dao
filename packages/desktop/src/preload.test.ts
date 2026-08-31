@@ -35,7 +35,7 @@ describe("Desktop preload entry", () => {
       "revokeSession",
     ]);
     expect(Object.keys((value as { governance: object }).governance).sort()).toEqual([
-      "getDepartureConflicts", "getSurface", "onStateChanged", "submit",
+      "clearCache", "getDepartureConflicts", "getSurface", "onStateChanged", "submit",
     ]);
     expect(Object.keys((value as { messageAuthority: object }).messageAuthority).sort()).toEqual([
       "historyV2", "onAuthorityInput", "recall", "revise", "revisionsQuery", "sendV2",

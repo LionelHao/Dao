@@ -286,6 +286,7 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     const observed: GovernanceRemoteState[] = [];
     runtime.controller.subscribe(({ state }) => observed.push(state));
     const bridge: GovernanceBridge = {
+      clearCache: (query) => runtime.clearCache(query.roomId),
       getSurface: (query) => runtime.controller.getSurface(query),
       getDepartureConflicts: (query) => runtime.controller.getDepartureConflicts(query),
       submit: async (mutation) => runtime.controller.submit(mutation),
