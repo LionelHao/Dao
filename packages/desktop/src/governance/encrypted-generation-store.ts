@@ -382,6 +382,7 @@ type EncryptedGenerationStoreOptions = Readonly<{
     | "after-rebuild-main"
     | "after-rebuild-initialize"
   ) => void;
+  clearAccountFault?: () => void;
 }>;
 
 function syncDirectory(directory: string): void {
@@ -436,6 +437,17 @@ function removeGenerationStoreFiles(
   rmSync(databasePath, { force: true });
   syncDirectory(directory);
   fault?.("after-rebuild-main");
+}
+
+function removeGenerationStoreFilesFenced(
+  databasePath: string,
+  fault?: EncryptedGenerationStoreOptions["recoveryFault"],
+): void {
+  ensureRebuildMarker(databasePath);
+  fault?.("after-rebuild-marker");
+  removeGenerationStoreFiles(databasePath, fault);
+  rmSync(rebuildMarkerPath(databasePath), { force: true });
+  syncDirectory(dirname(databasePath));
 }
 
 export function createEncryptedAuthorityGenerationStore(
@@ -1002,6 +1014,7 @@ export function createEncryptedAuthorityGenerationStore(
           DELETE FROM cache_generations;
           DELETE FROM cache_metadata;
         `);
+        options.clearAccountFault?.();
       });
       dataKey.fill(0);
       try { database.close(); }
@@ -1011,7 +1024,7 @@ export function createEncryptedAuthorityGenerationStore(
         );
       }
       closed = true;
-      removeGenerationStoreFiles(options.databasePath);
+      removeGenerationStoreFilesFenced(options.databasePath, options.recoveryFault);
     },
     close() {
       if (closed) return;
@@ -1038,7 +1051,7 @@ export function createEncryptedAuthorityGenerationStore(
     },
     destroy() {
       if (!closed) api.close();
-      removeGenerationStoreFiles(options.databasePath);
+      removeGenerationStoreFilesFenced(options.databasePath, options.recoveryFault);
     },
   };
   return Object.freeze(api);

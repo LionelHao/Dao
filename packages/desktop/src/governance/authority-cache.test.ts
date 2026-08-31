@@ -8,7 +8,10 @@ import {
   createDesktopAuthorityCache,
   DESKTOP_ROOM_EVENT_PROJECTION_ACTIONS_FOR_TEST,
 } from "./authority-cache.js";
-import { createEncryptedAuthorityGenerationStore } from "./encrypted-generation-store.js";
+import {
+  createEncryptedAuthorityGenerationStore,
+  createRecoverableEncryptedAuthorityGenerationStore,
+} from "./encrypted-generation-store.js";
 import type { CredentialEncryption } from "../identity/credential-vault.js";
 import { projectSnapshot } from "../project-loop/test-fixture.js";
 import type { DesktopOfflineReadLeaseClaims } from "./offline-read-lease.js";
@@ -213,6 +216,49 @@ describe("production Desktop authority cache", () => {
       restarted.authorizeOfflineRead("room-1", 10_000);
       expect(published).toHaveBeenCalledOnce();
       restarted.close();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    "after-rebuild-marker",
+    "after-rebuild-sidecars",
+    "after-rebuild-main",
+  ] as const)("fences an interrupted clear-account fallback destroy at %s", async (failurePoint) => {
+    const directory = await mkdtemp(join(tmpdir(), "dao-ft13-clear-fallback-"));
+    const databasePath = join(directory, "authority-cache.sqlite");
+    let faulted = false;
+    const failingFactory = (actorId: string) => createEncryptedAuthorityGenerationStore({
+      databasePath, accountId: actorId, encryption: wrapping,
+      clearAccountFault: () => { throw new Error("logical-clear-rollback"); },
+      recoveryFault(point) {
+        if (!faulted && point === failurePoint) {
+          faulted = true;
+          throw new Error(`physical-clear-crash:${point}`);
+        }
+      },
+    });
+    try {
+      const first = createDesktopAuthorityCache(undefined, undefined, failingFactory);
+      await first.restore("human-1");
+      const repair = page();
+      first.beginRoom("room-1", repair.snapshotId);
+      first.stageRoomPage(repair);
+      expect(await first.finalizeRoom(repair.snapshotId, repair.snapshotChecksum)).toBe(true);
+      first.commitRoom("room-1", repair.watermark, repair.snapshotChecksum);
+      first.installOfflineReadLease("room-1", { token: "lease-before-clear", claims: offlineClaims() });
+      expect(() => first.clear()).toThrow("Authority cache account purge");
+
+      const recovered = createDesktopAuthorityCache(undefined, undefined, (actorId) =>
+        createRecoverableEncryptedAuthorityGenerationStore({
+          databasePath, accountId: actorId, encryption: wrapping,
+        }));
+      await expect(recovered.restore("human-1")).resolves.toBe(false);
+      expect(recovered.roomIds()).toEqual([]);
+      expect(recovered.offlineReadLease("room-1")).toBeUndefined();
+      expect(recovered.activeGenerationBinding("room-1")).toBeUndefined();
+      recovered.close();
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
