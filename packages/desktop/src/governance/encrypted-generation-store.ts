@@ -1,0 +1,700 @@
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHmac,
+  randomBytes,
+  randomUUID,
+} from "node:crypto";
+import { chmodSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import type { CredentialEncryption } from "../identity/credential-vault.js";
+
+type StoreErrorCode =
+  | "encryption_unavailable"
+  | "key_unwrap_failed"
+  | "integrity_failed"
+  | "invalid_store"
+  | "invalid_generation"
+  | "bound_exceeded"
+  | "repair_required"
+  | "closed";
+
+export class EncryptedGenerationStoreError extends Error {
+  constructor(readonly code: StoreErrorCode, message: string) {
+    super(message);
+    this.name = "EncryptedGenerationStoreError";
+  }
+}
+
+export interface EncryptedGenerationRecord {
+  readonly identity: string;
+  readonly value: unknown;
+}
+
+export interface EncryptedGenerationEvent {
+  readonly eventId: string;
+  readonly streamSeq: number;
+}
+
+export interface EncryptedAuthorityGenerationStore {
+  beginRoomGeneration(input: Readonly<{
+    roomId: string;
+    snapshotId: string;
+    watermark: number;
+    expectedCount: number;
+    checksum: string;
+  }>): void;
+  stageRoomRecords(
+    roomId: string,
+    snapshotId: string,
+    records: readonly EncryptedGenerationRecord[],
+  ): void;
+  commitRoomGeneration(input: Readonly<{
+    roomId: string;
+    snapshotId: string;
+    watermark: number;
+    expectedCount: number;
+    checksum: string;
+  }>): void;
+  discardRoomGeneration(roomId: string, snapshotId: string): void;
+  readActiveRoom(roomId: string): Readonly<{
+    generationId: string;
+    records: readonly EncryptedGenerationRecord[];
+    cursor: Readonly<{ version: 1; roomId: string; afterSeq: number }>;
+  }> | undefined;
+  applyRoomEventBatch(input: Readonly<{
+    roomId: string;
+    events: readonly EncryptedGenerationEvent[];
+    nextCursor: number;
+    upserts: readonly EncryptedGenerationRecord[];
+    deletes: readonly string[];
+  }>): Readonly<{ appliedEventIds: readonly string[]; replayedEventIds: readonly string[] }>;
+  classifyRoomEvent(
+    roomId: string,
+    eventId: string,
+    streamSeq: number,
+  ): "unseen" | "exact" | "conflict";
+  clearRoom(roomId: string): void;
+  clearAccount(): void;
+  close(): void;
+  destroy(): void;
+}
+
+interface Limits {
+  readonly maxRecordsPerRoom: number;
+  readonly maxRecordBytes: number;
+  readonly maxBatchEvents: number;
+}
+
+const DEFAULT_LIMITS: Limits = Object.freeze({
+  maxRecordsPerRoom: 100_000,
+  maxRecordBytes: 1024 * 1024,
+  maxBatchEvents: 1_024,
+});
+const DATA_KEY_BYTES = 32;
+const NONCE_BYTES = 12;
+const TAG_BYTES = 16;
+const SCHEMA_VERSION = "1";
+
+const SCHEMA = `
+  PRAGMA foreign_keys = ON;
+  PRAGMA journal_mode = WAL;
+  PRAGMA synchronous = FULL;
+  PRAGMA secure_delete = ON;
+  CREATE TABLE IF NOT EXISTS cache_metadata (
+    metadata_key TEXT PRIMARY KEY,
+    metadata_value BLOB NOT NULL
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS cache_generations (
+    generation_id TEXT PRIMARY KEY,
+    room_hash TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    generation_state TEXT NOT NULL CHECK (generation_state IN ('staging', 'active')),
+    watermark INTEGER NOT NULL CHECK (watermark >= 0),
+    cursor INTEGER NOT NULL CHECK (cursor >= 0),
+    expected_count INTEGER NOT NULL CHECK (expected_count >= 0),
+    checksum TEXT NOT NULL,
+    UNIQUE (room_hash, snapshot_hash)
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS cache_generations_room_state
+    ON cache_generations(room_hash, generation_state);
+  CREATE TABLE IF NOT EXISTS cache_room_heads (
+    room_hash TEXT PRIMARY KEY,
+    active_generation_id TEXT NOT NULL UNIQUE
+      REFERENCES cache_generations(generation_id) ON DELETE CASCADE
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS cache_records (
+    generation_id TEXT NOT NULL REFERENCES cache_generations(generation_id) ON DELETE CASCADE,
+    identity_hash TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    sealed_record BLOB NOT NULL,
+    PRIMARY KEY (generation_id, identity_hash),
+    UNIQUE (generation_id, ordinal)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS cache_event_ledger (
+    generation_id TEXT NOT NULL REFERENCES cache_generations(generation_id) ON DELETE CASCADE,
+    room_hash TEXT NOT NULL,
+    event_hash TEXT NOT NULL,
+    stream_seq INTEGER NOT NULL CHECK (stream_seq > 0),
+    PRIMARY KEY (room_hash, event_hash),
+    UNIQUE (room_hash, stream_seq)
+  ) STRICT;
+`;
+
+function positiveSafeInteger(value: number): boolean {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+function nonnegativeSafeInteger(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function validateText(value: string, label: string): void {
+  if (value.length === 0 || value.length > 1_024) {
+    throw new EncryptedGenerationStoreError("invalid_store", `${label} is invalid`);
+  }
+}
+
+function validateLimits(value: Partial<Limits> | undefined): Limits {
+  const limits = { ...DEFAULT_LIMITS, ...value };
+  if (!positiveSafeInteger(limits.maxRecordsPerRoom) ||
+      !positiveSafeInteger(limits.maxRecordBytes) ||
+      !positiveSafeInteger(limits.maxBatchEvents)) {
+    throw new EncryptedGenerationStoreError("bound_exceeded", "Generation store limits are invalid");
+  }
+  return Object.freeze(limits);
+}
+
+function transaction<T>(database: DatabaseSync, operation: () => T): T {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const result = operation();
+    database.exec("COMMIT");
+    return result;
+  } catch (cause: unknown) {
+    try { database.exec("ROLLBACK"); } catch { /* preserve the original failure */ }
+    throw cause;
+  }
+}
+
+function blob(value: unknown): Buffer {
+  if (ArrayBuffer.isView(value)) {
+    return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (value instanceof ArrayBuffer) return Buffer.from(value);
+  throw new EncryptedGenerationStoreError("invalid_store", "Generation store blob is invalid");
+}
+
+function count(value: unknown): number {
+  if (typeof value !== "number" || !nonnegativeSafeInteger(value)) {
+    throw new EncryptedGenerationStoreError("invalid_store", "Generation store count is invalid");
+  }
+  return value;
+}
+
+function wrapKey(encryption: CredentialEncryption, key: Buffer): Buffer {
+  try {
+    const wrapped = encryption.encryptString(key.toString("base64"));
+    if (!(wrapped instanceof Uint8Array) || wrapped.byteLength === 0) throw new Error("empty key");
+    return Buffer.from(wrapped);
+  } catch {
+    throw new EncryptedGenerationStoreError("key_unwrap_failed", "Data key could not be wrapped");
+  }
+}
+
+function unwrapKey(encryption: CredentialEncryption, wrapped: Uint8Array): Buffer {
+  try {
+    const value = encryption.decryptString(Uint8Array.from(wrapped));
+    const decoded = Buffer.from(value, "base64");
+    if (decoded.byteLength !== DATA_KEY_BYTES || decoded.toString("base64") !== value) {
+      throw new Error("invalid key");
+    }
+    return decoded;
+  } catch {
+    throw new EncryptedGenerationStoreError("key_unwrap_failed", "Data key could not be unwrapped");
+  }
+}
+
+function identifierHash(key: Buffer, namespace: string, value: string): string {
+  return createHmac("sha256", key).update(namespace).update("\0").update(value).digest("hex");
+}
+
+function recordAad(
+  accountHash: string,
+  roomHash: string,
+  generationId: string,
+  identityHash: string,
+): Buffer {
+  return Buffer.from([
+    "dao.desktop.authority-generation",
+    SCHEMA_VERSION,
+    accountHash,
+    roomHash,
+    generationId,
+    identityHash,
+  ].join("\0"), "utf8");
+}
+
+function sealRecord(
+  key: Buffer,
+  aad: Buffer,
+  record: EncryptedGenerationRecord,
+  maxBytes: number,
+): Buffer {
+  let plaintext: Buffer;
+  try { plaintext = Buffer.from(JSON.stringify(record), "utf8"); }
+  catch { throw new EncryptedGenerationStoreError("invalid_store", "Record is not JSON serializable"); }
+  if (plaintext.byteLength === 0 || plaintext.byteLength > maxBytes) {
+    plaintext.fill(0);
+    throw new EncryptedGenerationStoreError("bound_exceeded", "Record exceeded the encrypted bound");
+  }
+  try {
+    const nonce = randomBytes(NONCE_BYTES);
+    const cipher = createCipheriv("aes-256-gcm", key, nonce);
+    cipher.setAAD(aad);
+    const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    return Buffer.concat([nonce, cipher.getAuthTag(), ciphertext]);
+  } finally {
+    plaintext.fill(0);
+  }
+}
+
+function openRecord(
+  key: Buffer,
+  aad: Buffer,
+  sealed: Uint8Array,
+  maxBytes: number,
+): EncryptedGenerationRecord {
+  const bytes = Buffer.from(sealed);
+  if (bytes.byteLength <= NONCE_BYTES + TAG_BYTES ||
+      bytes.byteLength > maxBytes + NONCE_BYTES + TAG_BYTES) {
+    throw new EncryptedGenerationStoreError("integrity_failed", "Encrypted record size is invalid");
+  }
+  let plaintext: Buffer;
+  try {
+    const decipher = createDecipheriv("aes-256-gcm", key, bytes.subarray(0, NONCE_BYTES));
+    decipher.setAAD(aad);
+    decipher.setAuthTag(bytes.subarray(NONCE_BYTES, NONCE_BYTES + TAG_BYTES));
+    plaintext = Buffer.concat([decipher.update(bytes.subarray(NONCE_BYTES + TAG_BYTES)), decipher.final()]);
+  } catch {
+    throw new EncryptedGenerationStoreError("integrity_failed", "Encrypted record authentication failed");
+  }
+  try {
+    const value: unknown = JSON.parse(plaintext.toString("utf8"));
+    if (typeof value !== "object" || value === null || Array.isArray(value) ||
+        Reflect.ownKeys(value).length !== 2 ||
+        typeof (value as { identity?: unknown }).identity !== "string" ||
+        !Object.hasOwn(value, "value")) {
+      throw new Error("invalid record");
+    }
+    return value as EncryptedGenerationRecord;
+  } catch {
+    throw new EncryptedGenerationStoreError("integrity_failed", "Encrypted record payload is invalid");
+  } finally {
+    plaintext.fill(0);
+  }
+}
+
+export function createEncryptedAuthorityGenerationStore(options: Readonly<{
+  databasePath: string;
+  accountId: string;
+  encryption: CredentialEncryption;
+  limits?: Partial<Limits>;
+  fault?: (point: "before-active-flip" | "after-active-flip") => void;
+}>): EncryptedAuthorityGenerationStore {
+  validateText(options.databasePath, "databasePath");
+  validateText(options.accountId, "accountId");
+  const limits = validateLimits(options.limits);
+  try {
+    if (!options.encryption.isEncryptionAvailable()) {
+      throw new EncryptedGenerationStoreError(
+        "encryption_unavailable",
+        "Secure safeStorage is unavailable",
+      );
+    }
+  } catch (cause: unknown) {
+    if (cause instanceof EncryptedGenerationStoreError) throw cause;
+    throw new EncryptedGenerationStoreError("encryption_unavailable", "Secure safeStorage is unavailable");
+  }
+
+  mkdirSync(dirname(options.databasePath), { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") chmodSync(dirname(options.databasePath), 0o700);
+  let database: DatabaseSync;
+  try {
+    database = new DatabaseSync(options.databasePath);
+    database.exec(SCHEMA);
+  } catch (cause: unknown) {
+    throw new EncryptedGenerationStoreError(
+      "invalid_store",
+      cause instanceof Error ? cause.message : "Generation store could not be opened",
+    );
+  }
+
+  let dataKey: Buffer;
+  try {
+    const wrappedRow = database.prepare(
+      "SELECT metadata_value FROM cache_metadata WHERE metadata_key = 'wrapped_data_key'",
+    ).get() as { metadata_value?: unknown } | undefined;
+    if (wrappedRow === undefined) {
+      dataKey = randomBytes(DATA_KEY_BYTES);
+      const wrapped = wrapKey(options.encryption, dataKey);
+      transaction(database, () => {
+        database.prepare("INSERT INTO cache_metadata(metadata_key, metadata_value) VALUES (?, ?)")
+          .run("schema_version", Buffer.from(SCHEMA_VERSION, "utf8"));
+        database.prepare("INSERT INTO cache_metadata(metadata_key, metadata_value) VALUES (?, ?)")
+          .run("wrapped_data_key", wrapped);
+        database.prepare("INSERT INTO cache_metadata(metadata_key, metadata_value) VALUES (?, ?)")
+          .run("account_hash", Buffer.from(identifierHash(dataKey, "account", options.accountId), "utf8"));
+      });
+    } else {
+      dataKey = unwrapKey(options.encryption, blob(wrappedRow.metadata_value));
+      const schemaRow = database.prepare(
+        "SELECT metadata_value FROM cache_metadata WHERE metadata_key = 'schema_version'",
+      ).get() as { metadata_value?: unknown } | undefined;
+      const accountRow = database.prepare(
+        "SELECT metadata_value FROM cache_metadata WHERE metadata_key = 'account_hash'",
+      ).get() as { metadata_value?: unknown } | undefined;
+      if (schemaRow === undefined || blob(schemaRow.metadata_value).toString("utf8") !== SCHEMA_VERSION ||
+          accountRow === undefined || blob(accountRow.metadata_value).toString("utf8") !==
+            identifierHash(dataKey, "account", options.accountId)) {
+        dataKey.fill(0);
+        throw new EncryptedGenerationStoreError("integrity_failed", "Cache binding is invalid");
+      }
+    }
+    if (process.platform !== "win32") chmodSync(options.databasePath, 0o600);
+  } catch (cause: unknown) {
+    database.close();
+    if (cause instanceof EncryptedGenerationStoreError) throw cause;
+    throw new EncryptedGenerationStoreError("invalid_store", "Generation metadata is invalid");
+  }
+
+  const accountHash = identifierHash(dataKey, "account", options.accountId);
+  let closed = false;
+  const requireOpen = (): void => {
+    if (closed) throw new EncryptedGenerationStoreError("closed", "Generation store is closed");
+  };
+  const roomHash = (roomId: string): string => {
+    validateText(roomId, "roomId");
+    return identifierHash(dataKey, "room", roomId);
+  };
+  const snapshotHash = (snapshotId: string): string => {
+    validateText(snapshotId, "snapshotId");
+    return identifierHash(dataKey, "snapshot", snapshotId);
+  };
+  const identityHash = (identity: string): string => {
+    validateText(identity, "identity");
+    return identifierHash(dataKey, "record", identity);
+  };
+  const eventHash = (eventId: string): string => {
+    validateText(eventId, "eventId");
+    return identifierHash(dataKey, "event", eventId);
+  };
+
+  const generation = (roomId: string, snapshotId: string, state?: "staging" | "active") => {
+    const row = database.prepare(`
+      SELECT generation_id, watermark, cursor, expected_count, checksum, generation_state
+      FROM cache_generations
+      WHERE room_hash = ? AND snapshot_hash = ?${state === undefined ? "" : " AND generation_state = ?"}
+    `).get(...(state === undefined
+      ? [roomHash(roomId), snapshotHash(snapshotId)]
+      : [roomHash(roomId), snapshotHash(snapshotId), state])) as Record<string, unknown> | undefined;
+    return row;
+  };
+
+  const active = (roomId: string) => database.prepare(`
+    SELECT g.generation_id, g.watermark, g.cursor
+    FROM cache_room_heads h
+    JOIN cache_generations g ON g.generation_id = h.active_generation_id
+    WHERE h.room_hash = ? AND g.generation_state = 'active'
+  `).get(roomHash(roomId)) as Record<string, unknown> | undefined;
+
+  const api: EncryptedAuthorityGenerationStore = {
+    beginRoomGeneration(input) {
+      requireOpen();
+      validateText(input.checksum, "checksum");
+      if (!nonnegativeSafeInteger(input.watermark) || !nonnegativeSafeInteger(input.expectedCount) ||
+          input.expectedCount > limits.maxRecordsPerRoom) {
+        throw new EncryptedGenerationStoreError("bound_exceeded", "Generation metadata exceeded bounds");
+      }
+      const room = roomHash(input.roomId);
+      const snapshot = snapshotHash(input.snapshotId);
+      transaction(database, () => {
+        database.prepare("DELETE FROM cache_generations WHERE room_hash = ? AND generation_state = 'staging'")
+          .run(room);
+        database.prepare(`
+          INSERT INTO cache_generations(
+            generation_id, room_hash, snapshot_hash, generation_state,
+            watermark, cursor, expected_count, checksum
+          ) VALUES (?, ?, ?, 'staging', ?, ?, ?, ?)
+        `).run(randomUUID(), room, snapshot, input.watermark, input.watermark,
+          input.expectedCount, input.checksum);
+      });
+    },
+    stageRoomRecords(roomId, snapshotId, records) {
+      requireOpen();
+      if (records.length > limits.maxRecordsPerRoom) {
+        throw new EncryptedGenerationStoreError("bound_exceeded", "Record page exceeded bounds");
+      }
+      const stage = generation(roomId, snapshotId, "staging");
+      if (stage === undefined || typeof stage.generation_id !== "string") {
+        throw new EncryptedGenerationStoreError("invalid_generation", "Staging generation is absent");
+      }
+      const total = database.prepare("SELECT COUNT(*) AS total FROM cache_records WHERE generation_id = ?")
+        .get(stage.generation_id) as { total?: unknown };
+      if (count(total.total) + records.length > limits.maxRecordsPerRoom) {
+        throw new EncryptedGenerationStoreError("bound_exceeded", "Room record bound was exceeded");
+      }
+      const room = roomHash(roomId);
+      const existingCount = count(total.total);
+      transaction(database, () => {
+        records.forEach((record, index) => {
+          const hashedIdentity = identityHash(record.identity);
+          const sealed = sealRecord(dataKey,
+            recordAad(accountHash, room, stage.generation_id as string, hashedIdentity),
+            record, limits.maxRecordBytes);
+          database.prepare(`
+            INSERT INTO cache_records(generation_id, identity_hash, ordinal, sealed_record)
+            VALUES (?, ?, ?, ?)
+          `).run(stage.generation_id as string, hashedIdentity, existingCount + index, sealed);
+        });
+      });
+    },
+    commitRoomGeneration(input) {
+      requireOpen();
+      const room = roomHash(input.roomId);
+      const stage = generation(input.roomId, input.snapshotId, "staging");
+      if (stage === undefined || typeof stage.generation_id !== "string" ||
+          stage.watermark !== input.watermark || stage.expected_count !== input.expectedCount ||
+          stage.checksum !== input.checksum) {
+        throw new EncryptedGenerationStoreError("invalid_generation", "Generation completion did not match");
+      }
+      const total = database.prepare("SELECT COUNT(*) AS total FROM cache_records WHERE generation_id = ?")
+        .get(stage.generation_id) as { total?: unknown };
+      if (count(total.total) !== input.expectedCount) {
+        throw new EncryptedGenerationStoreError("invalid_generation", "Generation record count did not match");
+      }
+      transaction(database, () => {
+        const oldHead = active(input.roomId);
+        options.fault?.("before-active-flip");
+        database.prepare("UPDATE cache_generations SET generation_state = 'active' WHERE generation_id = ?")
+          .run(stage.generation_id as string);
+        database.prepare(`
+          INSERT INTO cache_room_heads(room_hash, active_generation_id) VALUES (?, ?)
+          ON CONFLICT(room_hash) DO UPDATE SET active_generation_id = excluded.active_generation_id
+        `).run(room, stage.generation_id as string);
+        options.fault?.("after-active-flip");
+        if (oldHead !== undefined && typeof oldHead.generation_id === "string" &&
+            oldHead.generation_id !== stage.generation_id) {
+          database.prepare("DELETE FROM cache_generations WHERE generation_id = ?")
+            .run(oldHead.generation_id);
+        }
+      });
+    },
+    discardRoomGeneration(roomId, snapshotId) {
+      requireOpen();
+      database.prepare(`
+        DELETE FROM cache_generations
+        WHERE room_hash = ? AND snapshot_hash = ? AND generation_state = 'staging'
+      `).run(roomHash(roomId), snapshotHash(snapshotId));
+    },
+    readActiveRoom(roomId) {
+      requireOpen();
+      const head = active(roomId);
+      if (head === undefined || typeof head.generation_id !== "string") return undefined;
+      const room = roomHash(roomId);
+      const rows = database.prepare(`
+        SELECT identity_hash, sealed_record FROM cache_records
+        WHERE generation_id = ? ORDER BY ordinal ASC
+      `).all(head.generation_id) as Record<string, unknown>[];
+      const records = rows.map((row) => {
+        if (typeof row.identity_hash !== "string") {
+          throw new EncryptedGenerationStoreError("integrity_failed", "Record identity is invalid");
+        }
+        const result = openRecord(dataKey,
+          recordAad(accountHash, room, head.generation_id as string, row.identity_hash),
+          blob(row.sealed_record), limits.maxRecordBytes);
+        if (identityHash(result.identity) !== row.identity_hash) {
+          throw new EncryptedGenerationStoreError("integrity_failed", "Record identity binding failed");
+        }
+        return result;
+      });
+      return Object.freeze({
+        generationId: head.generation_id,
+        records: Object.freeze(records),
+        cursor: Object.freeze({ version: 1 as const, roomId, afterSeq: count(head.cursor) }),
+      });
+    },
+    applyRoomEventBatch(input) {
+      requireOpen();
+      if (!nonnegativeSafeInteger(input.nextCursor) || input.events.length > limits.maxBatchEvents ||
+          input.upserts.length > limits.maxRecordsPerRoom || input.deletes.length > limits.maxRecordsPerRoom) {
+        throw new EncryptedGenerationStoreError("bound_exceeded", "Event batch exceeded bounds");
+      }
+      const head = active(input.roomId);
+      if (head === undefined || typeof head.generation_id !== "string") {
+        throw new EncryptedGenerationStoreError("invalid_generation", "Active generation is absent");
+      }
+      const current = count(head.cursor);
+      const watermark = count(head.watermark);
+      if (input.nextCursor < current) {
+        throw new EncryptedGenerationStoreError("repair_required", "Room cursor moved backwards");
+      }
+      const room = roomHash(input.roomId);
+      const applied: string[] = [];
+      const replayed: string[] = [];
+      const fresh: { event: EncryptedGenerationEvent; hash: string }[] = [];
+      const batchEvents = new Map<string, number>();
+      const batchSequences = new Map<number, string>();
+      for (const event of input.events) {
+        validateText(event.eventId, "eventId");
+        if (!positiveSafeInteger(event.streamSeq)) {
+          throw new EncryptedGenerationStoreError("repair_required", "Event sequence is invalid");
+        }
+        const hashedEvent = eventHash(event.eventId);
+        const duplicateSequence = batchEvents.get(hashedEvent);
+        const duplicateEvent = batchSequences.get(event.streamSeq);
+        if (duplicateSequence !== undefined && duplicateSequence !== event.streamSeq ||
+            duplicateEvent !== undefined && duplicateEvent !== hashedEvent) {
+          throw new EncryptedGenerationStoreError("repair_required", "Event ledger conflict in batch");
+        }
+        batchEvents.set(hashedEvent, event.streamSeq);
+        batchSequences.set(event.streamSeq, hashedEvent);
+        const byEvent = database.prepare(`
+          SELECT stream_seq FROM cache_event_ledger WHERE room_hash = ? AND event_hash = ?
+        `).get(room, hashedEvent) as { stream_seq?: unknown } | undefined;
+        const bySequence = database.prepare(`
+          SELECT event_hash FROM cache_event_ledger WHERE room_hash = ? AND stream_seq = ?
+        `).get(room, event.streamSeq) as { event_hash?: unknown } | undefined;
+        if (byEvent !== undefined && byEvent.stream_seq !== event.streamSeq ||
+            bySequence !== undefined && bySequence.event_hash !== hashedEvent) {
+          throw new EncryptedGenerationStoreError("repair_required", "Durable event ledger conflict");
+        }
+        if (byEvent !== undefined) replayed.push(event.eventId);
+        else if (event.streamSeq <= watermark) replayed.push(event.eventId);
+        else fresh.push({ event, hash: hashedEvent });
+      }
+      let expected = current + 1;
+      for (const item of fresh) {
+        if (item.event.streamSeq !== expected) {
+          throw new EncryptedGenerationStoreError("repair_required", "Room event stream has a gap");
+        }
+        expected += 1;
+      }
+      const expectedCursor = fresh.length === 0 ? current : expected - 1;
+      if (input.nextCursor !== expectedCursor) {
+        throw new EncryptedGenerationStoreError("repair_required", "Cursor did not match event batch");
+      }
+
+      transaction(database, () => {
+        for (const item of fresh) {
+          database.prepare(`
+            INSERT INTO cache_event_ledger(generation_id, room_hash, event_hash, stream_seq)
+            VALUES (?, ?, ?, ?)
+          `).run(head.generation_id as string, room, item.hash, item.event.streamSeq);
+          applied.push(item.event.eventId);
+        }
+        if (fresh.length > 0) {
+          for (const identity of input.deletes) {
+            database.prepare("DELETE FROM cache_records WHERE generation_id = ? AND identity_hash = ?")
+              .run(head.generation_id as string, identityHash(identity));
+          }
+          for (const record of input.upserts) {
+            const hashedIdentity = identityHash(record.identity);
+            const existing = database.prepare(`
+              SELECT ordinal FROM cache_records WHERE generation_id = ? AND identity_hash = ?
+            `).get(head.generation_id as string, hashedIdentity) as { ordinal?: unknown } | undefined;
+            const ordinal = existing === undefined
+              ? count((database.prepare(`
+                  SELECT COALESCE(MAX(ordinal), -1) + 1 AS ordinal
+                  FROM cache_records WHERE generation_id = ?
+                `).get(head.generation_id as string) as { ordinal?: unknown }).ordinal)
+              : count(existing.ordinal);
+            const sealed = sealRecord(dataKey,
+              recordAad(accountHash, room, head.generation_id as string, hashedIdentity),
+              record, limits.maxRecordBytes);
+            database.prepare(`
+              INSERT INTO cache_records(generation_id, identity_hash, ordinal, sealed_record)
+              VALUES (?, ?, ?, ?)
+              ON CONFLICT(generation_id, identity_hash) DO UPDATE SET sealed_record = excluded.sealed_record
+            `).run(head.generation_id as string, hashedIdentity, ordinal, sealed);
+          }
+          const total = database.prepare("SELECT COUNT(*) AS total FROM cache_records WHERE generation_id = ?")
+            .get(head.generation_id as string) as { total?: unknown };
+          if (count(total.total) > limits.maxRecordsPerRoom) {
+            throw new EncryptedGenerationStoreError("bound_exceeded", "Room record bound was exceeded");
+          }
+          database.prepare("UPDATE cache_generations SET cursor = ? WHERE generation_id = ?")
+            .run(input.nextCursor, head.generation_id as string);
+        }
+      });
+      return Object.freeze({
+        appliedEventIds: Object.freeze(applied),
+        replayedEventIds: Object.freeze(replayed),
+      });
+    },
+    classifyRoomEvent(roomId, eventId, streamSeq) {
+      requireOpen();
+      if (!positiveSafeInteger(streamSeq)) return "conflict";
+      const room = roomHash(roomId);
+      const event = eventHash(eventId);
+      const byEvent = database.prepare(`
+        SELECT stream_seq FROM cache_event_ledger WHERE room_hash = ? AND event_hash = ?
+      `).get(room, event) as { stream_seq?: unknown } | undefined;
+      const bySequence = database.prepare(`
+        SELECT event_hash FROM cache_event_ledger WHERE room_hash = ? AND stream_seq = ?
+      `).get(room, streamSeq) as { event_hash?: unknown } | undefined;
+      if (byEvent === undefined && bySequence === undefined) return "unseen";
+      return byEvent?.stream_seq === streamSeq && bySequence?.event_hash === event
+        ? "exact"
+        : "conflict";
+    },
+    clearRoom(roomId) {
+      requireOpen();
+      transaction(database, () => {
+        database.prepare("DELETE FROM cache_room_heads WHERE room_hash = ?").run(roomHash(roomId));
+        database.prepare("DELETE FROM cache_generations WHERE room_hash = ?").run(roomHash(roomId));
+      });
+    },
+    clearAccount() {
+      requireOpen();
+      transaction(database, () => {
+        database.exec(`
+          DELETE FROM cache_room_heads;
+          DELETE FROM cache_event_ledger;
+          DELETE FROM cache_records;
+          DELETE FROM cache_generations;
+          DELETE FROM cache_metadata;
+        `);
+      });
+      dataKey.fill(0);
+      closed = true;
+      database.close();
+      api.destroy();
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      try { database.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } finally {
+        database.close();
+        dataKey.fill(0);
+      }
+    },
+    destroy() {
+      if (!closed) api.close();
+      const directory = dirname(options.databasePath);
+      const file = basename(options.databasePath);
+      let entries: string[] = [];
+      try { entries = readdirSync(directory); } catch { /* already absent */ }
+      const targets = entries.filter((entry) => entry === file || entry === `${file}-wal` ||
+        entry === `${file}-shm` || entry === `${file}-journal` ||
+        entry.startsWith(`${file}.`) &&
+          (entry.endsWith(".tmp") || entry.endsWith(".bak") || entry.endsWith(".crash")));
+      if (targets.length > 4_096) {
+        throw new EncryptedGenerationStoreError("bound_exceeded", "Too many cache residuals");
+      }
+      for (const entry of targets) rmSync(join(directory, entry), { force: true });
+    },
+  };
+  return Object.freeze(api);
+}

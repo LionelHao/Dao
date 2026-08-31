@@ -108,12 +108,6 @@ export function createDesktopAgentSettingsRuntime(options: {
     pending.clear();
   };
 
-  const publishOffline = (): void => {
-    const asOf = new Date().toISOString();
-    publish({ type: "offline", asOf,
-      leaseExpiresAt: new Date(Date.parse(asOf) + 30_000).toISOString() });
-  };
-
   const purgeAuthority = (scope: "room" | "session"): void => {
     authorityEpoch += 1;
     const candidate = socket;
@@ -291,6 +285,12 @@ export function createDesktopAgentSettingsRuntime(options: {
 
   const disconnect = (candidate: AgentSettingsWebSocketLike, error: Error): void => {
     if (socket !== candidate) return;
+    if (!closed) {
+      // A transport loss is not permission to mint or extend an OfflineReadLease. Until a
+      // server-signed lease is wired into this runtime, discard the in-memory projection.
+      purgeAuthority("session");
+      return;
+    }
     socket = undefined;
     authenticated = false;
     connection = undefined;
@@ -300,7 +300,6 @@ export function createDesktopAgentSettingsRuntime(options: {
     settleSubscription = undefined;
     subscriptionRequestId = undefined;
     rejectPending(error);
-    if (!closed) publishOffline();
   };
 
   async function ensureConnection(): Promise<void> {

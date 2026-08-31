@@ -45,6 +45,8 @@ function recordIdentity(record: RoomRepairRecord): string {
     case "room": return "room";
     case "governance": return "governance";
     case "membership": return `membership\0${record.value.actorId}`;
+    case "room-agent-assignment":
+      return `room-agent-assignment\0${record.value.assignmentId}`;
     case "message": return `message\0${record.value.id}`;
     case "timeline-message": return `timeline-message\0${record.value.id}`;
     case "message-revision": return `message-revision\0${record.value.messageId}\0${record.value.revision}`;
@@ -138,6 +140,21 @@ function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEve
     case "agent.configured":
       replaceRecord(records, { kind: "membership", value: event.payload.membership });
       return;
+    case "room.agent-assignment.changed": {
+      const payload = event.payload;
+      if (payload.change === "removed") {
+        const index = records.findIndex((record) =>
+          record.kind === "room-agent-assignment" &&
+          record.value.assignmentId === payload.assignmentId);
+        if (index !== -1) records.splice(index, 1);
+      } else {
+        replaceRecord(records, {
+          kind: "room-agent-assignment",
+          value: payload.assignment,
+        });
+      }
+      return;
+    }
     case "member.removed": {
       const index = records.findIndex((record) =>
         record.kind === "membership" && record.value.actorId === event.payload.targetActorId);

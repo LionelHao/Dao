@@ -35,17 +35,20 @@ function fixture(fault?: (point: "before-active-flip" | "after-active-flip") => 
   return create();
 }
 
-const oldRecords = [{ identity: "room", value: { roomId: "room-secret", body: "old-corpus" } }];
-const newRecords = [{ identity: "room", value: { roomId: "room-secret", body: "new-corpus" } }];
+const oldRecords = [{ identity: "record-identity-secret",
+  value: { roomId: "room-secret", body: "old-corpus" } }];
+const newRecords = [{ identity: "record-identity-secret",
+  value: { roomId: "room-secret", body: "new-corpus" } }];
 
 function install(store: ReturnType<typeof createEncryptedAuthorityGenerationStore>, input: Readonly<{
   snapshotId: string; watermark: number; records: typeof oldRecords;
 }>): void {
+  const checksum = "f".repeat(64);
   store.beginRoomGeneration({ roomId: "room-secret", snapshotId: input.snapshotId,
-    watermark: input.watermark, expectedCount: input.records.length, checksum: `${input.snapshotId}-sum` });
+    watermark: input.watermark, expectedCount: input.records.length, checksum });
   store.stageRoomRecords("room-secret", input.snapshotId, input.records);
   store.commitRoomGeneration({ roomId: "room-secret", snapshotId: input.snapshotId,
-    watermark: input.watermark, expectedCount: input.records.length, checksum: `${input.snapshotId}-sum` });
+    watermark: input.watermark, expectedCount: input.records.length, checksum });
 }
 
 describe("encrypted Desktop authority generation store", () => {
@@ -93,7 +96,8 @@ describe("encrypted Desktop authority generation store", () => {
     install(store, { snapshotId: "old", watermark: 9, records: oldRecords });
     expect(store.applyRoomEventBatch({ roomId: "room-secret", nextCursor: 10,
       events: [{ eventId: "event-secret", streamSeq: 10 }],
-      upserts: [{ identity: "room", value: { roomId: "room-secret", body: "event-corpus" } }],
+      upserts: [{ identity: "record-identity-secret",
+        value: { roomId: "room-secret", body: "event-corpus" } }],
       deletes: [] })).toEqual({ appliedEventIds: ["event-secret"], replayedEventIds: [] });
     store.close();
 
@@ -110,7 +114,7 @@ describe("encrypted Desktop authority generation store", () => {
       events: [{ eventId: "different-event", streamSeq: 10 }], upserts: [], deletes: [] }))
       .toThrowError(EncryptedGenerationStoreError);
     expect(reopened.readActiveRoom("room-secret")).toMatchObject({
-      records: [{ identity: "room", value: { body: "event-corpus" } }],
+      records: [{ identity: "record-identity-secret", value: { body: "event-corpus" } }],
       cursor: { afterSeq: 10 },
     });
     reopened.close();
@@ -136,10 +140,14 @@ describe("encrypted Desktop authority generation store", () => {
       events: [{ eventId: "event-secret", streamSeq: 10 }], upserts: [], deletes: [] });
     store.close();
     const files = await readdir(directory);
-    const disk = Buffer.concat(await Promise.all(files.map((file) => readFile(join(directory, file)))));
+    const fileBytes = await Promise.all(files.map((file) => readFile(join(directory, file))));
+    const disk = Buffer.concat(fileBytes);
     for (const sentinel of ["account-secret", "room-secret", "snapshot-secret", "event-secret",
-      "old-corpus", "identity"]) {
-      expect(disk.includes(Buffer.from(sentinel, "utf8")), `${sentinel} leaked`).toBe(false);
+      "old-corpus", "record-identity-secret"]) {
+      const leakingFiles = files.filter((_file, index) =>
+        fileBytes[index]!.includes(Buffer.from(sentinel, "utf8")));
+      expect(disk.includes(Buffer.from(sentinel, "utf8")),
+        `${sentinel} leaked in ${leakingFiles.join(",")}`).toBe(false);
     }
   });
 
@@ -153,12 +161,28 @@ describe("encrypted Desktop authority generation store", () => {
     const store = createEncryptedAuthorityGenerationStore({ databasePath,
       accountId: "account-secret", encryption: wrapping, limits: { maxRecordsPerRoom: 1,
         maxRecordBytes: 64, maxBatchEvents: 1 } });
-    store.beginRoomGeneration({ roomId: "room-secret", snapshotId: "bounded", watermark: 0,
-      expectedCount: 2, checksum: "bounded-sum" });
-    expect(() => store.stageRoomRecords("room-secret", "bounded", [
-      { identity: "one", value: { value: "one" } }, { identity: "two", value: { value: "two" } },
-    ])).toThrowError(EncryptedGenerationStoreError);
+    expect(() => store.beginRoomGeneration({ roomId: "room-secret", snapshotId: "bounded",
+      watermark: 0, expectedCount: 2, checksum: "bounded-sum" }))
+      .toThrowError(EncryptedGenerationStoreError);
     store.destroy();
     await expect(readdir(directory)).resolves.toEqual([]);
+  });
+
+  it("clears only a revoked Room and physically removes account state on logout", async () => {
+    const { directory, store } = await fixture();
+    install(store, { snapshotId: "room-one", watermark: 9, records: oldRecords });
+    store.beginRoomGeneration({ roomId: "room-two", snapshotId: "room-two-snapshot",
+      watermark: 4, expectedCount: 1, checksum: "e".repeat(64) });
+    store.stageRoomRecords("room-two", "room-two-snapshot", [{ identity: "other-record",
+      value: { roomId: "room-two", body: "other-corpus" } }]);
+    store.commitRoomGeneration({ roomId: "room-two", snapshotId: "room-two-snapshot",
+      watermark: 4, expectedCount: 1, checksum: "e".repeat(64) });
+
+    store.clearRoom("room-secret");
+    expect(store.readActiveRoom("room-secret")).toBeUndefined();
+    expect(store.readActiveRoom("room-two")?.cursor.afterSeq).toBe(4);
+    store.clearAccount();
+    await expect(readdir(directory)).resolves.toEqual([]);
+    expect(() => store.readActiveRoom("room-two")).toThrowError(EncryptedGenerationStoreError);
   });
 });

@@ -172,6 +172,58 @@ describe("production Desktop authority cache", () => {
     expect(published).toHaveBeenCalledWith("room-1", expect.arrayContaining([confirmation]));
   });
 
+  it("converges Room Agent Assignment repair records with stable upsert and removal events", async () => {
+    const assignment = {
+      recordVersion: "room-agent-assignment.v1" as const,
+      assignmentId: "assignment-1", roomId: "room-1", profileId: "profile-1",
+      actorId: "agent-1", displayName: "Researcher",
+      globalResponsibility: "Verify evidence", roomResponsibility: "Review this Room",
+      participation: "active" as const, availability: "ready" as const, paused: false,
+      capabilityCeiling: ["room.respond"] as const,
+      capabilitySubset: ["room.respond"] as const,
+      effectiveCapabilities: ["room.respond"] as const,
+      toolCeiling: ["repository.git-status"] as const,
+      toolSubset: ["repository.git-status"] as const,
+      effectiveTools: ["repository.git-status"] as const,
+      profileRevision: 1, assignmentRevision: 1, accessRevision: 1,
+      updatedAt: "2026-08-31T00:00:00.000Z",
+    };
+    const repairedRecords: readonly RoomRepairRecord[] = [
+      ...records, { kind: "room-agent-assignment", value: assignment },
+    ];
+    const checksum = authoritySnapshotChecksum("room", repairedRecords);
+    const cache = createDesktopAuthorityCache();
+    cache.beginRoom("room-1", "assignment-snapshot");
+    cache.stageRoomPage({ ...page(), snapshotId: "assignment-snapshot", records: repairedRecords,
+      snapshotChecksum: checksum });
+    expect(await cache.finalizeRoom("assignment-snapshot", checksum)).toBe(true);
+    cache.commitRoom("room-1", 9, checksum);
+    expect(cache.roomRepairRecords("room-1")).toContainEqual({
+      kind: "room-agent-assignment", value: assignment,
+    });
+
+    const paused = { ...assignment, availability: "paused" as const, paused: true,
+      assignmentRevision: 2, updatedAt: "2026-08-31T00:01:00.000Z" };
+    cache.applyRoomEvents("room-1", [{
+      eventId: "assignment-paused", streamKind: "room", streamId: "room-1", streamSeq: 10,
+      roomId: "room-1", actorId: "owner-1", occurredAt: "2026-08-31T00:01:00.000Z",
+      type: "room.agent-assignment.changed",
+      payload: { change: "availability-changed", roomRevision: 8, assignment: paused },
+    }], { version: 1, roomId: "room-1", afterSeq: 10 });
+    expect(cache.roomRepairRecords("room-1")).toContainEqual({
+      kind: "room-agent-assignment", value: paused,
+    });
+
+    cache.applyRoomEvents("room-1", [{
+      eventId: "assignment-removed", streamKind: "room", streamId: "room-1", streamSeq: 11,
+      roomId: "room-1", actorId: "owner-1", occurredAt: "2026-08-31T00:02:00.000Z",
+      type: "room.agent-assignment.changed", payload: { change: "removed", roomRevision: 9,
+        assignmentId: "assignment-1", actorId: "agent-1", assignmentRevision: 3 },
+    }], { version: 1, roomId: "room-1", afterSeq: 11 });
+    expect(cache.roomRepairRecords("room-1")?.some((record) =>
+      record.kind === "room-agent-assignment")).toBe(false);
+  });
+
   it("invalidates the Project repair record on a stable Project event for fixed-watermark repair", async () => {
     const snapshot = projectSnapshot();
     const projectRecords: readonly RoomRepairRecord[] = [

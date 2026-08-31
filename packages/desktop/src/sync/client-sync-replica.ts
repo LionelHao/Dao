@@ -61,6 +61,11 @@ export interface ClientAuthorityCache {
     events: readonly DesktopRoomEvent[],
     cursor: RoomCursor,
   ): void;
+  classifyRoomEvent?(
+    roomId: string,
+    eventId: string,
+    streamSeq: number,
+  ): "unseen" | "exact" | "conflict";
   discardSnapshot(snapshotId: string): void;
   clear(): void;
 }
@@ -209,16 +214,38 @@ function validateRoomPage(
   }
 }
 
+interface EventLedger {
+  readonly byEvent: Map<string, number>;
+  readonly bySequence: Map<number, string>;
+}
+
+function cloneLedger(value?: EventLedger): EventLedger {
+  return {
+    byEvent: new Map(value?.byEvent),
+    bySequence: new Map(value?.bySequence),
+  };
+}
+
 function deduplicateEvents(
   events: readonly DesktopRoomEvent[],
-  seen: Set<string>,
+  ledger: EventLedger,
+  classify?: (event: DesktopRoomEvent) => "unseen" | "exact" | "conflict",
 ): readonly DesktopRoomEvent[] {
   const result: DesktopRoomEvent[] = [];
   for (const event of events) {
-    if (!seen.has(event.eventId)) {
-      seen.add(event.eventId);
-      result.push(event);
+    const mappedSequence = ledger.byEvent.get(event.eventId);
+    const mappedEventId = ledger.bySequence.get(event.streamSeq);
+    if (mappedSequence !== undefined || mappedEventId !== undefined) {
+      if (mappedSequence !== event.streamSeq || mappedEventId !== event.eventId) {
+        throw invalid("Room event ledger mapping conflicted");
+      }
+      continue;
     }
+    const durable = classify?.(event) ?? "unseen";
+    if (durable === "conflict") throw invalid("Durable Room event ledger mapping conflicted");
+    ledger.byEvent.set(event.eventId, event.streamSeq);
+    ledger.bySequence.set(event.streamSeq, event.eventId);
+    if (durable === "unseen") result.push(event);
   }
   return result;
 }
@@ -280,7 +307,7 @@ export function createClientSyncReplica(options: {
   const subscriptions = new Map<string, RoomSubscription>();
   const subscriptionGenerations = new Map<string, number>();
   const roomOperationGenerations = new Map<string, number>();
-  const seenByRoom = new Map<string, Set<string>>();
+  const ledgersByRoom = new Map<string, EventLedger>();
   const roomRepairs = new Map<string, Promise<void>>();
   let workspaceRestore: Promise<void> | undefined;
   let requestSequence = 0;
@@ -307,10 +334,12 @@ export function createClientSyncReplica(options: {
     cursor: RoomCursor,
   ): void => {
     const current = cache.roomCursor(roomId) ?? { version: 1, roomId, afterSeq: 0 };
-    const seen = seenByRoom.get(roomId) ?? new Set<string>();
+    const ledger = ledgersByRoom.get(roomId) ?? cloneLedger();
     for (const event of events) validateEventShape(roomId, event);
-    const candidateSeen = new Set(seen);
-    const fresh = deduplicateEvents(events, candidateSeen);
+    const candidateLedger = cloneLedger(ledger);
+    const fresh = deduplicateEvents(events, candidateLedger, cache.classifyRoomEvent === undefined
+      ? undefined
+      : (event) => cache.classifyRoomEvent!(roomId, event.eventId, event.streamSeq));
     validateEventAdvance(roomId, current, fresh, cursor);
     cache.applyRoomEvents(roomId, fresh, cursor);
     if (fresh.length > 0) {
@@ -332,8 +361,7 @@ export function createClientSyncReplica(options: {
         // Projection listeners cannot roll back an already committed authority cache update.
       }
     }
-    for (const event of fresh) seen.add(event.eventId);
-    seenByRoom.set(roomId, seen);
+    ledgersByRoom.set(roomId, candidateLedger);
   };
 
   const syncFrom = async (
@@ -448,7 +476,7 @@ export function createClientSyncReplica(options: {
       closeSubscription(subscription);
       throw invalid("Room subscription returned an invalid cursor");
     }
-    const bufferedSeen = new Set(seenByRoom.get(roomId) ?? []);
+    const bufferedLedger = cloneLedger(ledgersByRoom.get(roomId));
     let bufferedCursor = cursor;
     const prepared: { events: readonly DesktopRoomEvent[]; cursor: RoomCursor }[] = [];
     try {
@@ -457,9 +485,13 @@ export function createClientSyncReplica(options: {
         const whollyStaleBatch = item.events.length > 0 &&
           isRoomCursor(item.cursor) && sameCursorRoom(item.cursor, roomId) &&
           item.cursor.afterSeq <= bufferedCursor.afterSeq &&
-          item.events.every((event) => event.streamSeq <= bufferedCursor.afterSeq);
+          item.events.every((event) => event.streamSeq <= cursor.afterSeq ||
+            bufferedLedger.byEvent.get(event.eventId) === event.streamSeq &&
+            bufferedLedger.bySequence.get(event.streamSeq) === event.eventId);
         if (whollyStaleBatch) continue;
-        const fresh = deduplicateEvents(item.events, bufferedSeen);
+        const fresh = deduplicateEvents(item.events, bufferedLedger, cache.classifyRoomEvent === undefined
+          ? undefined
+          : (event) => cache.classifyRoomEvent!(roomId, event.eventId, event.streamSeq));
         validateEventAdvance(roomId, bufferedCursor, fresh, item.cursor);
         prepared.push({ events: fresh, cursor: item.cursor });
         bufferedCursor = item.cursor;
@@ -582,7 +614,7 @@ export function createClientSyncReplica(options: {
           // Projection listeners cannot roll back an atomically committed repair generation.
         }
       }
-      seenByRoom.set(roomId, new Set<string>());
+      ledgersByRoom.set(roomId, cloneLedger());
       const cursor = await syncFrom(
         roomId,
         { version: 1, roomId, afterSeq: first.watermark },
@@ -695,7 +727,7 @@ export function createClientSyncReplica(options: {
       subscriptions.clear();
       subscriptionGenerations.clear();
       roomOperationGenerations.clear();
-      seenByRoom.clear();
+      ledgersByRoom.clear();
       const pendingRepairs = [...roomRepairs.values()];
       const pendingWorkspace = workspaceRestore;
       await Promise.allSettled([
@@ -713,7 +745,7 @@ export function createClientSyncReplica(options: {
       subscriptions.clear();
       subscriptionGenerations.clear();
       roomOperationGenerations.clear();
-      seenByRoom.clear();
+      ledgersByRoom.clear();
     },
   };
 }
