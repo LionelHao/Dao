@@ -59,8 +59,10 @@ function revision(value: unknown, allowZero = false): value is number {
 }
 
 function context(value: unknown): value is AuthenticatedSessionContext {
-  return record(value) && exact(value, ["sessionId", "sessionFamilyId", "principal"]) &&
+  return record(value) && exact(value, ["sessionId", "sessionFamilyId", "principal",
+    ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : [])]) &&
     text(value.sessionId) && text(value.sessionFamilyId) && record(value.principal) &&
+    (!Object.hasOwn(value, "deviceId") || text(value.deviceId)) &&
     exact(value.principal, ["accountId", "actorId"]) && text(value.principal.accountId) &&
     text(value.principal.actorId);
 }

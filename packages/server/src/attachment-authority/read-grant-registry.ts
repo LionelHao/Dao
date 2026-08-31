@@ -17,6 +17,7 @@ export type AttachmentReadAuthorization = Readonly<{
 export type AttachmentReadGrantContext = Readonly<{
   sessionId: string;
   sessionFamilyId: string;
+  deviceId?: string;
   principal: Readonly<{ accountId: string; actorId: string }>;
 }>;
 
@@ -68,8 +69,10 @@ function nonnegative(value: unknown): value is number {
 }
 
 function validateContext(value: AttachmentReadGrantContext): void {
-  if (!record(value) || !exact(value, ["sessionId", "sessionFamilyId", "principal"]) ||
+  if (!record(value) || !exact(value, ["sessionId", "sessionFamilyId", "principal",
+    ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : [])]) ||
       !identifier(value.sessionId) || !identifier(value.sessionFamilyId) || !record(value.principal) ||
+      (Object.hasOwn(value, "deviceId") && !identifier(value.deviceId)) ||
       !exact(value.principal, ["accountId", "actorId"]) ||
       !identifier(value.principal.accountId) || !identifier(value.principal.actorId)) {
     throw new TypeError("Attachment read grant context is invalid");
@@ -102,6 +105,7 @@ function validateAuthorization(value: AttachmentReadAuthorization): void {
 
 function sameContext(left: AttachmentReadGrantContext, right: AttachmentReadGrantContext): boolean {
   return left.sessionId === right.sessionId && left.sessionFamilyId === right.sessionFamilyId &&
+    left.deviceId === right.deviceId &&
     left.principal.accountId === right.principal.accountId &&
     left.principal.actorId === right.principal.actorId;
 }

@@ -112,9 +112,12 @@ function context(value: unknown, command: boolean): value is AuthenticatedSessio
       !text(value.sessionId) || !text(value.sessionFamilyId) ||
       !text(value.principal.accountId) || !text(value.principal.actorId)) return false;
   const keys = command
-    ? ["sessionId", "sessionFamilyId", "principal", "kind", "requestId", "idempotencyKey"]
-    : ["sessionId", "sessionFamilyId", "principal"];
+    ? ["sessionId", "sessionFamilyId", "principal", "kind", "requestId", "idempotencyKey",
+      ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : [])]
+    : ["sessionId", "sessionFamilyId", "principal",
+      ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : [])];
   return exact(value, keys) && exact(value.principal, ["accountId", "actorId"]) &&
+    (!Object.hasOwn(value, "deviceId") || text(value.deviceId)) &&
     (!command || (value.kind === "human" && text(value.requestId) && text(value.idempotencyKey)));
 }
 

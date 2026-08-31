@@ -4226,7 +4226,7 @@ describe("authoritative server real-process harness", () => {
       expect(serializedRendererBoundary).not.toContain(issued.accessToken);
       expect(root.textContent).not.toContain(issued.accessToken);
       expect(Object.keys(bridge)).toEqual([
-        "getSurface", "getDepartureConflicts", "submit", "onStateChanged",
+        "getSurface", "clearCache", "getDepartureConflicts", "submit", "onStateChanged",
       ]);
     } finally {
       unmountRenderer?.();

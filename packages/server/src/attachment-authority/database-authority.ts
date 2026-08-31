@@ -127,8 +127,10 @@ function now(clock: AttachmentAuthorityClock): Readonly<{ ms: number; iso: strin
 function requireHumanContext(value: AttachmentHumanContext): void {
   if (!isRecord(value) || !exact(value, [
     "kind", "sessionId", "sessionFamilyId", "principal",
+    ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : []),
   ]) || value.kind !== "human" || !identifier(value.sessionId) ||
       !identifier(value.sessionFamilyId) || !isRecord(value.principal) ||
+      (Object.hasOwn(value, "deviceId") && !identifier(value.deviceId)) ||
       !exact(value.principal, ["accountId", "actorId"]) ||
       !identifier(value.principal.accountId) || !identifier(value.principal.actorId)) {
     throw new TypeError("Attachment Human context is invalid");

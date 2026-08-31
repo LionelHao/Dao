@@ -3897,6 +3897,7 @@ describe("SQLite authoritative sessions", () => {
     await expect(auth.authenticateSession("legacy-access")).resolves.toEqual({
       sessionId: tokenHash("legacy-access"),
       sessionFamilyId: tokenHash("legacy-family"),
+      deviceId: "legacy",
       principal: { accountId: "account-li", actorId: "human-li" },
     });
     await client.close();

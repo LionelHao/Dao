@@ -175,8 +175,10 @@ function timestamp(value: unknown): value is string {
 }
 
 function session(value: unknown): value is AuthenticatedSessionContext {
-  if (!record(value) || !exact(value, ["sessionId", "sessionFamilyId", "principal"]) ||
+  if (!record(value) || !exact(value, ["sessionId", "sessionFamilyId", "principal",
+    ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : [])]) ||
       typeof value.sessionId !== "string" || typeof value.sessionFamilyId !== "string" || !record(value.principal)) return false;
+  if (Object.hasOwn(value, "deviceId") && !identifier(value.deviceId)) return false;
   return exact(value.principal, ["accountId", "actorId"]) &&
     identifier(value.principal.accountId) && identifier(value.principal.actorId);
 }
