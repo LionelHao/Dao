@@ -18,7 +18,8 @@
     "src/room-memory.ts",
     "src/context-compiler.ts",
     "src/project-loop.ts",
-    "src/tool-safety.ts"
+    "src/tool-safety.ts",
+    "src/notification.ts"
   ],
   "exclude": ["src/**/*.test.ts", "src/**/*.type-test.ts"]
 }

@@ -38,6 +38,16 @@ import { createDesktopProjectLoopRuntime } from "./project-loop/production-runti
 import { registerProjectLoopIpc } from "./project-loop/ipc.js";
 import { createDesktopToolSafetyRuntime } from "./tool-safety/production-runtime.js";
 import { registerToolSafetyIpc } from "./tool-safety/ipc.js";
+import { createDesktopNotificationCenterRuntime } from "./notification-center/production-runtime.js";
+import { registerNotificationCenterIpc } from "./notification-center/ipc.js";
+import { createNotificationToolResultActionRuntime } from
+  "./notification-center/tool-result-action-runtime.js";
+import { registerNotificationToolResultActionIpc } from
+  "./notification-center/tool-result-action-ipc.js";
+import { createNotificationExecutionResultActionRuntime } from
+  "./notification-center/execution-result-action-runtime.js";
+import { registerNotificationExecutionResultActionIpc } from
+  "./notification-center/execution-result-action-ipc.js";
 import { createEncryptedAuthorityCachePersistence } from "./governance/encrypted-authority-cache.js";
 import {
   createRecoverableEncryptedAuthorityGenerationStore,
@@ -105,6 +115,10 @@ async function createWindow(): Promise<void> {
   let disposeAttachmentGovernanceState: (() => void) | undefined;
   let agentSettings: ReturnType<typeof createDesktopAgentSettingsRuntime> | undefined;
   let disposeAgentSettingsIpc: (() => void) | undefined;
+  let notificationCenter: ReturnType<typeof createDesktopNotificationCenterRuntime> | undefined;
+  let disposeNotificationCenterIpc: (() => void) | undefined;
+  let disposeNotificationToolResultIpc: (() => void) | undefined;
+  let disposeNotificationExecutionResultIpc: (() => void) | undefined;
   const attachmentRuntimeHost = createElectronAttachmentRuntimeHost({
     createRuntime: () => {
       const ports = createElectronAttachmentPorts({
@@ -167,6 +181,7 @@ async function createWindow(): Promise<void> {
           messageAuthorityRuntime?.invalidateAuthorizedState();
           memoryAuthorityRuntime?.invalidateAuthorizedState();
           projectLoop?.invalidateAuthorizedState();
+          notificationCenter?.invalidateAuthorizedState();
           attachmentRuntimeHost.invalidateIdentity();
         },
       },
@@ -246,6 +261,32 @@ async function createWindow(): Promise<void> {
       webContents: window.webContents,
       controller: messageAuthority,
     });
+    notificationCenter = createDesktopNotificationCenterRuntime({
+      session: () => identity?.getCurrentAuthoritySession(),
+      transport: messageAuthorityRuntime.transport,
+      cache: governance.cache,
+      restoreWorkspace: () => governance!.restoreWorkspace(),
+      createRequestId: (operation) => `notification-${operation}-${randomUUID()}`,
+    });
+    disposeNotificationCenterIpc = registerNotificationCenterIpc({
+      ipcMain, webContents: window.webContents, runtime: notificationCenter,
+    });
+    const notificationToolResult = createNotificationToolResultActionRuntime({
+      session: () => identity?.getCurrentAuthoritySession(),
+      transport: messageAuthorityRuntime.transport,
+      createRequestId: () => `notification-tool-result-${randomUUID()}`,
+    });
+    disposeNotificationToolResultIpc = registerNotificationToolResultActionIpc({
+      ipcMain, webContents: window.webContents, runtime: notificationToolResult,
+    });
+    const notificationExecutionResult = createNotificationExecutionResultActionRuntime({
+      session: () => identity?.getCurrentAuthoritySession(),
+      transport: messageAuthorityRuntime.transport,
+      createRequestId: () => `notification-execution-result-${randomUUID()}`,
+    });
+    disposeNotificationExecutionResultIpc = registerNotificationExecutionResultActionIpc({
+      ipcMain, webContents: window.webContents, runtime: notificationExecutionResult,
+    });
     memoryAuthorityRuntime = createDesktopMemoryAuthorityRuntime({
       endpoint: process.env.NATIVE_IM_IDENTITY_WS_URL ?? "ws://127.0.0.1:8787",
       session: () => identity?.getCurrentAuthoritySession(),
@@ -291,6 +332,9 @@ async function createWindow(): Promise<void> {
       disposeProjectLoopIpc?.();
       disposeToolSafetyIpc?.();
       disposeAgentSettingsIpc?.();
+      disposeNotificationCenterIpc?.();
+      disposeNotificationToolResultIpc?.();
+      disposeNotificationExecutionResultIpc?.();
       disposeAttachmentGovernanceState?.();
       attachmentRuntimeHost.close();
       identity?.close();
@@ -301,6 +345,7 @@ async function createWindow(): Promise<void> {
       projectLoop?.close();
       toolSafety?.close();
       agentSettings?.close();
+      notificationCenter?.close();
     });
 
     await Promise.all([window.loadFile(rendererPath), identity.initialize()]);
@@ -315,6 +360,9 @@ async function createWindow(): Promise<void> {
         invocationMethods: Object.keys(globalThis.dao?.invocation ?? {}).sort(),
         projectLoopMethods: Object.keys(globalThis.dao?.projectLoop ?? {}).sort(),
         toolSafetyMethods: Object.keys(globalThis.dao?.toolSafety ?? {}).sort(),
+        notificationCenterMethods: Object.keys(globalThis.dao?.notificationCenter ?? {}).sort(),
+        notificationToolResultMethods: Object.keys(globalThis.dao?.notificationToolResult ?? {}).sort(),
+        notificationExecutionResultMethods: Object.keys(globalThis.dao?.notificationExecutionResult ?? {}).sort(),
         namespaces: Object.keys(globalThis.dao ?? {}).sort(),
         bridgeMissing: document.querySelector("[data-identity-bridge-missing]") !== null,
         governanceRouteContract: document.querySelector("#app")?.dataset.governanceRouteContract ?? "",
@@ -361,6 +409,10 @@ async function createWindow(): Promise<void> {
     const expectedInvocationMethods = ["cancel", "getSurface", "onStateChanged", "retry"];
     const expectedProjectLoopMethods = ["getSurface", "onStateChanged", "submit"];
     const expectedToolSafetyMethods = ["getSurface", "onStateChanged", "repair", "submit"];
+    const expectedNotificationCenterMethods = [
+      "getState", "list", "markRead", "onStateChanged", "resolveSource", "retryRepair",
+    ];
+    const expectedNotificationSourceActionMethods = ["acknowledge"];
     let startupProbe: unknown;
     try {
       startupProbe = typeof startupProbeJson === "string"
@@ -401,9 +453,20 @@ async function createWindow(): Promise<void> {
         startupProbe.projectLoopMethods.join(",") !== expectedProjectLoopMethods.join(",") ||
         !("toolSafetyMethods" in startupProbe) || !Array.isArray(startupProbe.toolSafetyMethods) ||
         startupProbe.toolSafetyMethods.join(",") !== expectedToolSafetyMethods.join(",") ||
+        !("notificationCenterMethods" in startupProbe) ||
+        !Array.isArray(startupProbe.notificationCenterMethods) ||
+        startupProbe.notificationCenterMethods.join(",") !== expectedNotificationCenterMethods.join(",") ||
+        !("notificationToolResultMethods" in startupProbe) ||
+        !Array.isArray(startupProbe.notificationToolResultMethods) ||
+        startupProbe.notificationToolResultMethods.join(",") !==
+          expectedNotificationSourceActionMethods.join(",") ||
+        !("notificationExecutionResultMethods" in startupProbe) ||
+        !Array.isArray(startupProbe.notificationExecutionResultMethods) ||
+        startupProbe.notificationExecutionResultMethods.join(",") !==
+          expectedNotificationSourceActionMethods.join(",") ||
         !("namespaces" in startupProbe) || !Array.isArray(startupProbe.namespaces) ||
         startupProbe.namespaces.join(",") !==
-          "agentSettings,attachmentAuthority,governance,identity,invocation,memoryAuthority,messageAuthority,projectLoop,toolSafety" ||
+          "agentSettings,attachmentAuthority,governance,identity,invocation,memoryAuthority,messageAuthority,notificationCenter,notificationExecutionResult,notificationToolResult,projectLoop,toolSafety" ||
         !("governanceRouteContract" in startupProbe) ||
         startupProbe.governanceRouteContract !== "closed-v1" ||
         !("bridgeMissing" in startupProbe) || startupProbe.bridgeMissing !== false ||
@@ -430,6 +493,9 @@ async function createWindow(): Promise<void> {
     disposeProjectLoopIpc?.();
     disposeToolSafetyIpc?.();
     disposeAgentSettingsIpc?.();
+    disposeNotificationCenterIpc?.();
+    disposeNotificationToolResultIpc?.();
+    disposeNotificationExecutionResultIpc?.();
     disposeAttachmentGovernanceState?.();
     attachmentRuntimeHost.close();
     identity?.close();
@@ -440,6 +506,7 @@ async function createWindow(): Promise<void> {
     projectLoop?.close();
     toolSafety?.close();
     agentSettings?.close();
+    notificationCenter?.close();
     if (!window.isDestroyed()) window.destroy();
     throw error;
   }

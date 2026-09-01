@@ -25,6 +25,8 @@ import {
   PROJECT_REMINDER_SCAN_LIMITS,
 } from "./project-boundary-runtime-service.js";
 import { createHash } from "node:crypto";
+import { persistNotificationProducerEvidenceInTransaction } from
+  "../notifications/source-transaction-adapter.js";
 
 export type EligibleProjectBoundary = Readonly<{
   boundaryId: string;
@@ -457,30 +459,24 @@ export function claimProjectReminderBucketInTransaction(
     return Object.freeze({ status: "duplicate" as const, ...base });
   }
   if (current.holder.kind === "human") {
-    const stream = database.prepare(
-      `SELECT head_seq AS headSeq FROM streams WHERE stream_kind = 'identity' AND stream_id = ?`,
-    ).get(input.recipientActorId);
-    if (typeof stream?.headSeq !== "number") throw new Error("Human reminder stream is unavailable");
-    const seq = stream.headSeq + 1;
-    const advanced = database.prepare(
-      `UPDATE streams SET head_seq = ? WHERE stream_kind = 'identity' AND stream_id = ?
-         AND head_seq = ?`,
-    ).run(seq, input.recipientActorId, stream.headSeq);
-    if (advanced.changes !== 1) throw new Error("Human reminder stream compare-and-set failed");
-    database.prepare(
-      `INSERT INTO events (event_id, stream_kind, stream_id, stream_seq, room_id, actor_id,
-         event_type, occurred_at, payload_json)
-       VALUES (?, 'identity', ?, ?, NULL, ?, 'project.reminder.due', ?, json(?))`,
-    ).run(claimId, input.recipientActorId, seq, input.recipientActorId, input.claimedAt,
-      JSON.stringify({ roomId: input.roomId, boundaryId: input.boundaryId,
-        sourceKind: current.sourceKind, sourceId: current.sourceId,
-        sourceRevision: current.sourceRevision, reminderOrdinal: input.reminderOrdinal }));
-    const outboxId = `outbox:${claimId}`;
-    database.prepare(
-      `INSERT INTO outbox_deliveries (id, event_id, target_kind, target_id, stream_seq,
-         status, attempts, available_at, delivered_at, last_error)
-       VALUES (?, ?, 'principal', ?, ?, 'pending', 0, ?, NULL, NULL)`,
-    ).run(outboxId, claimId, input.recipientActorId, seq, input.claimedAt);
+    const notification = persistNotificationProducerEvidenceInTransaction(database, {
+      kind: "project_due",
+      roomId: input.roomId,
+      roomLifecycle: "active",
+      createdAt: input.claimedAt,
+      actorId: null,
+      boundaryId: input.boundaryId,
+      sourceFactId: current.sourceId,
+      sourceRevision: current.sourceRevision,
+      lifecycleGeneration: current.lifecycleGeneration,
+      reminderOrdinal: input.reminderOrdinal,
+      holder: Object.freeze({ kind: "human", actorId: input.recipientActorId,
+        membership: "active" }),
+    });
+    if (notification === null) {
+      throw new Error("Eligible Human reminder did not produce a notification");
+    }
+    const outboxId = `outbox:${notification.eventId}`;
     database.prepare(
       `UPDATE project_due_reminder_claims SET status = 'dispatched', dispatched_at = ?
        WHERE claim_id = ?`,

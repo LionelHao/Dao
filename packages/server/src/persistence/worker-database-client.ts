@@ -89,6 +89,10 @@ import type { RuntimeAuthorityOperation } from "../agent-runtime/runtime-authori
 import type { RouteAuthorityOperation } from "../route-runtime/route-authority-protocol.js";
 import type { MemoryAuthorityOperation } from "../room-memory/authority-protocol.js";
 import type {
+  NotificationAuthorityOperation,
+  NotificationAuthorityResult,
+} from "../notifications/authority-protocol.js";
+import type {
   BallAuthorityOperation,
   BallDeadlinePolicy,
 } from "../ball-runtime/ball-authority-protocol.js";
@@ -122,7 +126,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 27;
+  readonly version: 28;
 }
 
 export interface WorkerDatabaseClient {
@@ -325,6 +329,9 @@ export interface WorkerDatabaseClient {
   executeBall(operation: BallAuthorityOperation): Promise<unknown>;
   executeMemory(operation: MemoryAuthorityOperation): Promise<unknown>;
   executeProjectLoop(operation: ProjectLoopAuthorityOperation): Promise<ProjectLoopAuthorityResult>;
+  executeNotification(
+    operation: NotificationAuthorityOperation,
+  ): Promise<NotificationAuthorityResult>;
   executeTenantAdministration(
     operation: TenantAdministrationOperation,
   ): Promise<TenantAdministrationResult>;
@@ -1662,6 +1669,19 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
     });
   }
 
+  executeNotification(operation: NotificationAuthorityOperation): Promise<NotificationAuthorityResult> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.notification", operation }).then((response) => {
+      if (response.type !== "authority.notification-result") {
+        this.#failProtocol("Authority worker returned the wrong Notification response");
+        throw this.#terminalError;
+      }
+      return response.result;
+    });
+  }
+
   readHistory(
     context: AuthenticatedSessionContext,
     roomId: string,
@@ -2288,6 +2308,8 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
         responseType === "authority.memory-result") ||
       (requestType === "authority.project-loop" &&
         responseType === "authority.project-loop-result") ||
+      (requestType === "authority.notification" &&
+        responseType === "authority.notification-result") ||
       (requestType === "authority.read-history" &&
         responseType === "authority.history") ||
       (requestType === "authority.read-actor" && responseType === "authority.actor") ||

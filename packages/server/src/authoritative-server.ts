@@ -1355,6 +1355,9 @@ async function start(
       messageAuthority,
       memoryAuthority: publicMemoryAuthority,
       projectLoopAuthority,
+      notificationAuthority: {
+        execute: (operation) => authorityWorker.executeNotification(operation),
+      },
       agentSettingsAuthority: agentSettings,
       ...(attachmentAuthority === undefined ? {} : { attachmentAuthority }),
       governance: governanceStore,

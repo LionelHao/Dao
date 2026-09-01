@@ -1,6 +1,9 @@
 import {
   isRoomCursor,
   isRoomRepairPage,
+  isNotificationStableEvent,
+  type NotificationProjection,
+  type NotificationStableEvent,
   type RoomCursor,
   type RoomRepairRecord,
   type RoomSummary,
@@ -79,6 +82,7 @@ function recordIdentity(record: RoomRepairRecord): string {
     case "tool-review": return `tool-review\0${record.value.reviewId}`;
     case "tool-handoff": return `tool-handoff\0${record.value.handoffId}`;
     case "tool-compensation": return `tool-compensation\0${record.value.lineageId}`;
+    case "notification": return `notification\0${record.value.notificationId}`;
   }
 }
 
@@ -390,6 +394,11 @@ export interface DesktopAuthorityCache extends ClientAuthorityCache {
   isOfflineReadAuthorized(roomId: string, nowMs?: number): boolean;
   revokeOfflineRead(roomId: string): void;
   toolSafetyRepairRequired(roomId: string): boolean;
+  notificationProjections(recipientActorId: string): readonly NotificationProjection[];
+  establishNotificationIdentityCursor(identityWatermark: number): void;
+  advanceNotificationIdentityCursor(event: Readonly<{ eventId: string; streamSeq: number }> ):
+    "applied" | "replayed";
+  applyNotificationEvent(event: NotificationStableEvent): "applied" | "replayed";
   close(): void;
 }
 
@@ -709,6 +718,53 @@ export function createDesktopAuthorityCache(
     },
     toolSafetyRepairRequired(roomId) {
       return toolSafetyRepairRequired.has(roomId);
+    },
+    notificationProjections(recipientActorId) {
+      const notifications = [...rooms.values()].flatMap((room) => room.records
+        .filter((record): record is Extract<RoomRepairRecord, { kind: "notification" }> =>
+          record.kind === "notification")
+        .map((record) => record.value)
+        .filter((value) => value.recipientActorId === recipientActorId));
+      return structuredClone(notifications.sort((left, right) =>
+        right.createdAt.localeCompare(left.createdAt) ||
+        left.notificationId.localeCompare(right.notificationId)));
+    },
+    establishNotificationIdentityCursor(identityWatermark) {
+      if (!Number.isSafeInteger(identityWatermark) || identityWatermark < 0) {
+        throw new TypeError("Notification identity watermark is invalid");
+      }
+      generationStore?.establishIdentityCursor(identityWatermark);
+    },
+    advanceNotificationIdentityCursor(event) {
+      if (typeof event.eventId !== "string" || event.eventId.length === 0 ||
+          !Number.isSafeInteger(event.streamSeq) || event.streamSeq <= 0) {
+        throw new TypeError("Notification identity event position is invalid");
+      }
+      return generationStore?.advanceIdentityCursor(event) ?? "applied";
+    },
+    applyNotificationEvent(event) {
+      if (!isNotificationStableEvent(event)) throw new TypeError("Notification stable event is invalid");
+      const roomId = event.payload.roomId;
+      const notificationId = event.payload.notificationId;
+      const record = event.type === "notification.revoked" ? undefined : {
+        kind: "notification" as const, value: event.payload,
+      };
+      const outcome = generationStore?.applyIdentityEvent({ roomId,
+        event: { eventId: event.eventId, streamSeq: event.streamSeq },
+        ...(record === undefined
+          ? { deleteIdentity: `notification\0${notificationId}` }
+          : { upsert: { identity: `notification\0${notificationId}`, value: record } }) }) ?? "applied";
+      if (outcome === "replayed") return outcome;
+      const room = rooms.get(roomId);
+      if (room !== undefined) {
+        if (record === undefined) removeRecord(room.records, (candidate) =>
+          candidate.kind === "notification" && candidate.value.notificationId === notificationId);
+        else replaceRecord(room.records, record);
+        room.updatedAt = now();
+        publishRoom(roomId);
+        persist();
+      }
+      return outcome;
     },
     async restore(actorId) {
       if (activeActorId === actorId) return rooms.size > 0;

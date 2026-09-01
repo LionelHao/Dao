@@ -1221,7 +1221,7 @@ describe("SQLite authoritative sessions", () => {
       accountId: "account-li",
       actorId: "human-li",
     });
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 27 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 28 });
     await client.close();
   });
 
@@ -2718,6 +2718,20 @@ describe("SQLite authoritative sessions", () => {
       ).get()).toEqual({ count: 2 });
       expect(database.prepare("SELECT COUNT(*) AS count FROM agent_executions").get())
         .toEqual({ count: 1 });
+      expect(database.prepare(
+        `SELECT notification_kind AS notificationKind, source_kind AS sourceKind,
+                source_boundary_id AS sourceBoundaryId,
+                recipient_actor_id AS recipientActorId, read_at AS readAt,
+                handled_at AS handledAt
+         FROM notifications WHERE source_boundary_id = ?`,
+      ).get("execution-review-1")).toEqual({
+        notificationKind: "agent_execution_completed",
+        sourceKind: "agent_execution",
+        sourceBoundaryId: "execution-review-1",
+        recipientActorId: "human-li",
+        readAt: null,
+        handledAt: null,
+      });
       database.close();
     });
   });

@@ -959,6 +959,28 @@ describe("real AuthorityWorker runtime authority", () => {
         `SELECT COUNT(*) AS count FROM events
          WHERE event_type = 'room.open_item.agent_attempt_failed'`,
       ).get()).toEqual({ count: 1 });
+      expect(failedItem.prepare(
+        `SELECT notification_kind AS notificationKind,
+                recipient_actor_id AS recipientActorId,
+                read_at AS readAt, handled_at AS handledAt
+         FROM notifications WHERE source_boundary_id = ?`,
+      ).get(runningThird.id)).toEqual({
+        notificationKind: "agent_execution_completed",
+        recipientActorId: "human-runtime",
+        readAt: null,
+        handledAt: null,
+      });
+      expect(failedItem.prepare(
+        `SELECT notification_kind AS notificationKind,
+                recipient_actor_id AS recipientActorId,
+                read_at AS readAt, handled_at AS handledAt
+         FROM notifications WHERE source_boundary_id = ?`,
+      ).get(fifth.execution.id)).toEqual({
+        notificationKind: "agent_execution_failed",
+        recipientActorId: "human-runtime",
+        readAt: null,
+        handledAt: null,
+      });
       failedItem.close();
       await expect(authority.retry(
         { ...context, requestId: "request-manual-retry", idempotencyKey: "key-manual-retry" },

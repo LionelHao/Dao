@@ -13,6 +13,7 @@ import {
   type MessageAuthorityEvent,
   type MessageRevision,
   type MessageTargetOutcome,
+  type NotificationStableEvent,
   type TimelineMessage,
   type PersistedIdentityEvent,
   type PersistedRoomEvent,
@@ -72,6 +73,12 @@ import {
   type ProjectLoopClientFrame,
   type ProjectLoopServerFrame,
 } from "./project-loop-protocol.js";
+import {
+  isNotificationFrameType,
+  parseNotificationClientFrame,
+  type NotificationClientFrame,
+  type NotificationServerFrame,
+} from "./notifications/protocol.js";
 
 const AUTH_LOGIN_FIELDS = new Set(["type", "requestId", "accountId", "secret", "device"]);
 const AUTH_LOGIN_DEVICE_FIELDS = new Set(["id", "label", "platform"]);
@@ -592,7 +599,8 @@ export type ClientFrame =
   | AttachmentClientFrame
   | RoomMemoryRequest
   | Ft07AgentSettingsClientFrame
-  | ProjectLoopClientFrame;
+  | ProjectLoopClientFrame
+  | NotificationClientFrame;
 
 export interface AuthenticatedFrame {
   readonly type: "auth.authenticated";
@@ -1001,6 +1009,11 @@ export type ProtocolErrorCode =
   | "tool_source_gone"
   | "tool_needs_review"
   | "tool_capacity_limited"
+  | "notification_forbidden"
+  | "notification_not_found"
+  | "notification_source_gone"
+  | "notification_revision_conflict"
+  | "rate_limited"
   | "internal_error";
 
 export type ProtocolErrorFrame =
@@ -1036,6 +1049,7 @@ export type ServerFrame =
   | RoomEventFrame
   | MessageAuthorityRoomEventFrame
   | IdentityRoomAccessChangedFrame
+  | NotificationStableEvent
   | RoomHistoryFrame
   | RoomHistoryV2Frame
   | MessageRevisionsFrame
@@ -1063,6 +1077,7 @@ export type ServerFrame =
   | RoomMemorySuccessFrame
   | Ft07AgentSettingsServerFrame
   | ProjectLoopServerFrame
+  | NotificationServerFrame
   | ProtocolErrorFrame;
 
 export type ClientFrameParseResult =
@@ -1237,6 +1252,16 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
       ok: false,
       error: protocolError(
         "FT-09 Project Loop request must use a closed authority frame",
+        parsed.requestId,
+      ),
+    };
+  }
+  if (isNotificationFrameType(value.type)) {
+    const parsed = parseNotificationClientFrame(value);
+    return parsed.ok ? parsed : {
+      ok: false,
+      error: protocolError(
+        "FT-12 Notification request must use a closed recipient frame",
         parsed.requestId,
       ),
     };

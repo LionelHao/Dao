@@ -1,15 +1,22 @@
 import {
+  isAttachmentPrivateEvent,
   isMessageRevision,
   isRoomMemoryError,
   isRoomMemoryProtocolFrame,
   isRoomMemoryRequest,
   isRoomCursor,
+  isNotificationReadAck,
+  isNotificationExecutionResultAcknowledgeAck,
+  isNotificationStableEvent,
   isTimelineMessage,
   type MessageRevision,
   type RoomMemoryError,
   type RoomMemoryRequest,
   type RoomMemorySuccessFrame,
   type RoomCursor,
+  type NotificationStableEvent,
+  type NotificationExecutionResultAcknowledgeAck,
+  type NotificationExecutionResultAcknowledgeCommand,
   type TimelineMessage,
 } from "@native-im/core";
 
@@ -48,6 +55,22 @@ import {
   type ProjectLoopWireResponse,
 } from "../project-loop/contracts.js";
 import type { ToolSafetyCommand } from "../tool-safety/contracts.js";
+import {
+  isNotificationListWireResult,
+  isNotificationSourceWireResult,
+  type NotificationClosedError,
+  type NotificationListCommand,
+  type NotificationListWireResult,
+  type NotificationMarkReadCommand,
+  type NotificationResolveSourceCommand,
+  type NotificationSourceWireResult,
+} from "../notification-center/contracts.js";
+import type { NotificationReadAck } from "@native-im/core";
+import {
+  isNotificationToolResultAcknowledgeWireResult,
+  type NotificationToolResultAcknowledgeCommand,
+  type NotificationToolResultAcknowledgeWireResult,
+} from "../notification-center/tool-result-action-contracts.js";
 
 type SocketEvent = "open" | "message" | "close" | "error";
 
@@ -70,6 +93,12 @@ export type MessageAuthorityTransportErrorCode =
   | "client_closed"
   | "request_capacity_exceeded";
 
+export type PrincipalIdentityCursorAdvance = Readonly<{
+  eventId: string;
+  streamId: string;
+  streamSeq: number;
+}>;
+
 export class MessageAuthorityTransportError extends Error {
   constructor(
     readonly code: MessageAuthorityTransportErrorCode,
@@ -86,6 +115,7 @@ export class MessageAuthorityTransportError extends Error {
       code: string;
       retryAfterSeconds?: number;
     }>,
+    readonly notificationError?: NotificationClosedError,
   ) {
     super(`Message Authority transport failed: ${code}`);
     this.name = "MessageAuthorityTransportError";
@@ -118,6 +148,13 @@ export interface MessageAuthorityWireTransport {
     version: number;
     replayed: boolean;
   }>>;
+  notificationList(command: NotificationListCommand): Promise<NotificationListWireResult>;
+  notificationMarkRead(command: NotificationMarkReadCommand): Promise<NotificationReadAck>;
+  notificationResolveSource(command: NotificationResolveSourceCommand): Promise<NotificationSourceWireResult>;
+  notificationAcknowledgeToolResult(command: NotificationToolResultAcknowledgeCommand):
+    Promise<NotificationToolResultAcknowledgeWireResult>;
+  notificationAcknowledgeExecutionResult(command: NotificationExecutionResultAcknowledgeCommand):
+    Promise<NotificationExecutionResultAcknowledgeAck>;
   subscribeRoom(
     roomId: string,
     cursor: RoomCursor,
@@ -132,6 +169,8 @@ export interface MessageAuthorityWireTransport {
     change: "joined" | "updated" | "removed" | "archived",
   ) => void): () => void;
   onConnectionFailure(listener: (error: MessageAuthorityTransportError) => void): () => void;
+  onPrincipalIdentityAdvance(listener: (event: PrincipalIdentityCursorAdvance) => void): () => void;
+  onNotificationEvent(listener: (event: NotificationStableEvent) => void): () => void;
   resetSession(): void;
   close(): void;
 }
@@ -234,10 +273,19 @@ type ParsedFrame =
   | Readonly<{
       type: "identity.room-access.changed";
       eventId: string;
+      streamId: string;
+      streamSeq: number;
       actorId: string;
       roomId: string;
       change: "joined" | "updated" | "removed" | "archived";
     }>
+  | (PrincipalIdentityCursorAdvance & Readonly<{ type: "identity.cursor.advance" }>)
+  | NotificationListWireResult
+  | NotificationReadAck
+  | NotificationSourceWireResult
+  | NotificationToolResultAcknowledgeWireResult
+  | NotificationExecutionResultAcknowledgeAck
+  | NotificationStableEvent
   | Readonly<{
       type: "error";
       requestId?: string;
@@ -324,6 +372,21 @@ export function parseMessageAuthorityServerFrame(raw: string): ParsedFrame | und
     return structuredClone(value) as RoomMemorySuccessFrame;
   }
   switch (value.type) {
+    case "notification.list.result":
+      return isNotificationListWireResult(value) ? structuredClone(value) : undefined;
+    case "notification.read.ack":
+      return isNotificationReadAck(value) ? structuredClone(value) : undefined;
+    case "notification.source.result":
+      return isNotificationSourceWireResult(value) ? structuredClone(value) : undefined;
+    case "notification.tool-result.ack":
+      return isNotificationToolResultAcknowledgeWireResult(value) ? structuredClone(value) : undefined;
+    case "notification.execution-result.ack":
+      return isNotificationExecutionResultAcknowledgeAck(value) ? structuredClone(value) : undefined;
+    case "notification.created":
+    case "notification.read":
+    case "notification.handled":
+    case "notification.revoked":
+      return isNotificationStableEvent(value) ? structuredClone(value) : undefined;
     case "auth.authenticated":
       return exact(value, ["type", "requestId", "accountId", "actorId", "sessionId"],
         ["sessionFamilyId", "deviceId"]) &&
@@ -434,11 +497,24 @@ export function parseMessageAuthorityServerFrame(raw: string): ParsedFrame | und
         text(value.payload.roomId, 256) &&
         (value.payload.change === "joined" || value.payload.change === "updated" ||
           value.payload.change === "removed" || value.payload.change === "archived")
-        ? { type: value.type, eventId: value.eventId, actorId: value.actorId,
+        ? { type: value.type, eventId: value.eventId, streamId: value.streamId,
+          streamSeq: value.streamSeq, actorId: value.actorId,
           roomId: value.payload.roomId, change: value.payload.change }
+        : undefined;
+    case "attachment.private.status-changed":
+      return isAttachmentPrivateEvent(value)
+        ? { type: "identity.cursor.advance", eventId: value.eventId,
+          streamId: value.streamId, streamSeq: value.streamSeq }
         : undefined;
     case "error": {
       if (isProjectLoopWireError(value)) {
+        const notificationError = value.status === 503 && value.code === "storage_unavailable"
+          ? { status: 503 as const, code: "storage_unavailable" as const }
+          : value.status === 429 && value.code === "rate_limited"
+            ? { status: 429 as const, code: "rate_limited" as const,
+                ...(count(value.retryAfterSeconds) && value.retryAfterSeconds > 0
+                  ? { retryAfterMs: value.retryAfterSeconds * 1_000 } : {}) }
+            : undefined;
         return {
           type: "error",
           requestId: value.requestId,
@@ -448,7 +524,12 @@ export function parseMessageAuthorityServerFrame(raw: string): ParsedFrame | und
             undefined,
             undefined,
             undefined,
-            structuredClone(value),
+            structuredClone(notificationError === undefined ? value : {
+              ...value,
+              message: "Service unavailable",
+            }),
+            undefined,
+            notificationError,
           ),
         };
       }
@@ -465,26 +546,48 @@ export function parseMessageAuthorityServerFrame(raw: string): ParsedFrame | und
           ),
         };
       }
-      if (!exact(value, ["type", "status", "code", "message"], ["requestId", "details"]) ||
+      if (!exact(value, ["type", "status", "code", "message"],
+        ["requestId", "details", "retryAfterSeconds"]) ||
           typeof value.status !== "number" || !text(value.code, 128) || !text(value.message) ||
-          (value.requestId !== undefined && !text(value.requestId, 128))) return undefined;
+          (value.requestId !== undefined && !text(value.requestId, 128)) ||
+          (value.retryAfterSeconds !== undefined &&
+            (!count(value.retryAfterSeconds) || value.retryAfterSeconds <= 0))) return undefined;
       const toolStatus = [401, 403, 409, 410, 429, 503].includes(value.status)
         ? value.status as 401 | 403 | 409 | 410 | 429 | 503 : undefined;
-      const retryAfterSeconds = record(value.details) && count(value.details.retryAfterSeconds) &&
-        value.details.retryAfterSeconds > 0 ? value.details.retryAfterSeconds : undefined;
+      const retryAfterSeconds = count(value.retryAfterSeconds) && value.retryAfterSeconds > 0
+        ? value.retryAfterSeconds
+        : record(value.details) && count(value.details.retryAfterSeconds) &&
+            value.details.retryAfterSeconds > 0 ? value.details.retryAfterSeconds : undefined;
       const toolSafetyError = toolStatus === undefined ? undefined : {
         status: toolStatus, code: value.code,
         ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
       };
+      const notificationStatus = [401, 403, 409, 410, 429, 503].includes(value.status)
+        ? value.status as 401 | 403 | 409 | 410 | 429 | 503 : undefined;
+      const notificationCode = value.code === "invalid_token" || value.code === "unauthenticated"
+        ? "authentication_required" as const
+        : value.code === "notification_forbidden" ? "notification_forbidden" as const
+          : value.code === "notification_revision_conflict" ? "notification_revision_conflict" as const
+            : value.code === "notification_not_found" ? "notification_gone" as const
+              : value.code === "notification_source_gone" ? "notification_source_gone" as const
+                : value.code === "rate_limited" ? "rate_limited" as const
+                  : value.code === "storage_unavailable" ? "storage_unavailable" as const
+                    : undefined;
+      const retryAfterMs = record(value.details) && count(value.details.retryAfterMs)
+        ? value.details.retryAfterMs : retryAfterSeconds === undefined ? undefined : retryAfterSeconds * 1_000;
+      const notificationError = notificationStatus === undefined || notificationCode === undefined
+        ? undefined : { status: notificationStatus, code: notificationCode,
+            ...(retryAfterMs === undefined ? {} : { retryAfterMs }) };
       const closedError = closedWireError(value.status, value.code);
-      if (closedError === undefined && toolSafetyError === undefined) return undefined;
+      if (closedError === undefined && toolSafetyError === undefined &&
+          notificationError === undefined) return undefined;
       const code: MessageAuthorityTransportErrorCode = (closedError?.status ?? toolSafetyError?.status) === 401
         ? closedError?.code === "identity_forbidden" ? "session_revoked" : "authentication_required"
         : (closedError?.status ?? toolSafetyError?.status) === 403 ? "access_revoked" : "protocol_error";
       return { type: "error",
         ...(value.requestId === undefined ? {} : { requestId: value.requestId }),
         error: new MessageAuthorityTransportError(code, closedError, undefined, undefined, undefined,
-          toolSafetyError) };
+          toolSafetyError, notificationError) };
     }
     default: return undefined;
   }
@@ -542,6 +645,8 @@ export function createMessageAuthorityWebSocketTransport(options: {
     input: AgentExecutionPreviewInput | AgentExecutionPreviewResetInput,
   ) => void>();
   const failureListeners = new Set<(error: MessageAuthorityTransportError) => void>();
+  const identityAdvanceListeners = new Set<(event: PrincipalIdentityCursorAdvance) => void>();
+  const notificationListeners = new Set<(event: NotificationStableEvent) => void>();
 
   const rememberExpired = (requestId: string): void => {
     expiredRequestIds.add(requestId);
@@ -621,7 +726,32 @@ export function createMessageAuthorityWebSocketTransport(options: {
         protocolFailure();
         return;
       }
+      for (const listener of [...identityAdvanceListeners]) {
+        try { listener({ eventId: frame.eventId, streamId: frame.streamId,
+          streamSeq: frame.streamSeq }); } catch { /* observer failure is isolated */ }
+      }
       for (const listener of [...roomAccessListeners]) listener(frame.roomId, frame.change);
+      return;
+    }
+    if (frame.type === "identity.cursor.advance") {
+      if (frame.streamId !== options.session()?.actorId) {
+        protocolFailure();
+        return;
+      }
+      for (const listener of [...identityAdvanceListeners]) {
+        try { listener(structuredClone(frame)); } catch { /* observer failure is isolated */ }
+      }
+      return;
+    }
+    if (frame.type === "notification.created" || frame.type === "notification.read" ||
+        frame.type === "notification.handled" || frame.type === "notification.revoked") {
+      if (frame.streamId !== options.session()?.actorId) {
+        protocolFailure();
+        return;
+      }
+      for (const listener of [...notificationListeners]) {
+        try { listener(structuredClone(frame)); } catch { /* observer failure is isolated */ }
+      }
       return;
     }
     if (frame.type === "room.event") {
@@ -920,6 +1050,28 @@ export function createMessageAuthorityWebSocketTransport(options: {
       }
       return structuredClone(response);
     },
+    notificationList: (command) => exactRequest<NotificationListWireResult>(
+      { ...command },
+      "notification.list.result",
+    ),
+    notificationMarkRead: (command) => exactRequest<NotificationReadAck>(
+      { ...command },
+      "notification.read.ack",
+    ),
+    notificationResolveSource: (command) => exactRequest<NotificationSourceWireResult>(
+      { ...command },
+      "notification.source.result",
+    ),
+    notificationAcknowledgeToolResult: (command) =>
+      exactRequest<NotificationToolResultAcknowledgeWireResult>(
+        { ...command },
+        "notification.tool-result.ack",
+      ),
+    notificationAcknowledgeExecutionResult: (command) =>
+      exactRequest<NotificationExecutionResultAcknowledgeAck>(
+        { ...command },
+        "notification.execution-result.ack",
+      ),
     async subscribeRoom(roomId, cursor, observer) {
       if (!isRoomCursor(cursor) || cursor.roomId !== roomId) {
         throw new MessageAuthorityTransportError("protocol_error");
@@ -972,6 +1124,14 @@ export function createMessageAuthorityWebSocketTransport(options: {
       failureListeners.add(listener);
       return () => failureListeners.delete(listener);
     },
+    onPrincipalIdentityAdvance(listener) {
+      identityAdvanceListeners.add(listener);
+      return () => identityAdvanceListeners.delete(listener);
+    },
+    onNotificationEvent(listener) {
+      notificationListeners.add(listener);
+      return () => notificationListeners.delete(listener);
+    },
     resetSession() {
       terminal = false;
       rejectAll(new MessageAuthorityTransportError(
@@ -990,6 +1150,8 @@ export function createMessageAuthorityWebSocketTransport(options: {
       roomAccessListeners.clear();
       previewListeners.clear();
       failureListeners.clear();
+      identityAdvanceListeners.clear();
+      notificationListeners.clear();
       disposeSocket(1000, "client closed");
     },
   };

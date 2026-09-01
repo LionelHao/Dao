@@ -80,6 +80,17 @@ import {
   executeProjectLoopFrame,
   type ProjectLoopAuthorityTransport,
 } from "./project-loop-websocket.js";
+import type {
+  NotificationAuthorityOperation,
+  NotificationAuthorityResult,
+} from "./notifications/authority-protocol.js";
+import { createNotificationRecallOutboxPreparation } from
+  "./notifications/outbox-recall-preparation.js";
+import {
+  consumeNotificationRateLimit,
+  createNotificationRateLimitState,
+  type NotificationRateLimitState,
+} from "./notifications/rate-limit.js";
 import {
   createSubscriptionRegistry,
   type RegisteredConnection,
@@ -211,6 +222,10 @@ export interface ToolSafetyAuthorityTransport {
   }>>;
 }
 
+export interface NotificationAuthorityTransport {
+  execute(operation: NotificationAuthorityOperation): Promise<NotificationAuthorityResult>;
+}
+
 export interface StartMessageWebSocketServerOptions {
   readonly auth: AuthenticationService;
   readonly service: MessageService;
@@ -251,6 +266,7 @@ export interface StartMessageWebSocketServerOptions {
   readonly agentSettingsAuthority?: Ft07AgentSettingsAuthorityTransport;
   readonly previewAuthority?: AgentPreviewDeliveryAuthority;
   readonly projectLoopAuthority?: ProjectLoopAuthorityTransport;
+  readonly notificationAuthority?: NotificationAuthorityTransport;
   readonly governance?: Pick<CommandStore, "executeHuman"> &
     Pick<SyncQueryStore, "readRoomGovernance"> &
     Partial<ClosedRoomGovernanceTransportStore>;
@@ -314,6 +330,7 @@ interface ConnectionContext {
   readonly ownedStreamingSnapshots: Map<string, AuthenticatedSessionContext>;
   readonly connectionId: string;
   readonly v2GatesByRoom: Map<string, V2SubscriptionGate>;
+  readonly notificationRateLimit: NotificationRateLimitState;
   readonly clearLiveSubscriptions: () => void;
   readonly clearRoomSubscriptions: () => void;
   readonly releaseSnapshotOwners: () => void;
@@ -1553,7 +1570,12 @@ function isCorrelatedRecoveryResponse(
       | "tool.confirmation.handoff.offer"
       | "tool.confirmation.handoff.accept"
       | "tool.outcome.review"
-      | "tool.compensation.propose";
+      | "tool.compensation.propose"
+      | "notification.list"
+      | "notification.mark-read"
+      | "notification.source.resolve"
+      | "notification.tool-result.acknowledge"
+      | "notification.execution-result.acknowledge";
   }>,
   response: unknown,
 ): response is ServerFrame {
@@ -1704,7 +1726,12 @@ async function handleRecoveryFrame(
       | "tool.confirmation.handoff.offer"
       | "tool.confirmation.handoff.accept"
       | "tool.outcome.review"
-      | "tool.compensation.propose";
+      | "tool.compensation.propose"
+      | "notification.list"
+      | "notification.mark-read"
+      | "notification.source.resolve"
+      | "notification.tool-result.acknowledge"
+      | "notification.execution-result.acknowledge";
   }>,
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
@@ -2562,6 +2589,96 @@ async function handleFrame(
     return;
   }
   switch (frame.type) {
+    case "notification.list":
+    case "notification.mark-read":
+    case "notification.source.resolve":
+    case "notification.tool-result.acknowledge":
+    case "notification.execution-result.acknowledge": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      const generation = context.credentialGeneration;
+      if (options.notificationAuthority === undefined) {
+        sendCurrentGeneration(socket, { type: "error", status: 503,
+          code: "storage_unavailable", message: "Notification authority is unavailable",
+          requestId: frame.requestId }, generation, context);
+        return;
+      }
+      const now = Date.now();
+      const rateLimit = consumeNotificationRateLimit(context.notificationRateLimit, now);
+      if (!rateLimit.allowed) {
+        sendCurrentGeneration(socket, {
+          type: "error",
+          status: 429,
+          code: "rate_limited",
+          message: "rate_limited",
+          requestId: frame.requestId,
+          retryAfterSeconds: Math.max(1, Math.ceil(rateLimit.retryAfterMs / 1_000)),
+        }, generation, context);
+        return;
+      }
+      const operation: NotificationAuthorityOperation = frame.type === "notification.list"
+        ? { type: "notification.list", context: session, roomId: frame.roomId,
+            before: frame.before, limit: frame.limit, now }
+        : frame.type === "notification.mark-read"
+          ? { type: "notification.mark-read", context: session,
+              commandRequestId: frame.requestId, notificationId: frame.notificationId,
+              expectedReadRevision: frame.expectedReadRevision,
+              occurredAt: new Date(now).toISOString(), now }
+          : frame.type === "notification.source.resolve"
+            ? { type: "notification.resolve-source", context: session,
+                notificationId: frame.notificationId, now }
+            : frame.type === "notification.tool-result.acknowledge"
+              ? { type: "notification.acknowledge-tool-result", context: session,
+                  commandRequestId: frame.requestId, notificationId: frame.notificationId,
+                  occurredAt: new Date(now).toISOString(), now }
+              : { type: "notification.acknowledge-execution-result", context: session,
+                  commandRequestId: frame.requestId, notificationId: frame.notificationId,
+                  occurredAt: new Date(now).toISOString(), now };
+      try {
+        const result = await options.notificationAuthority.execute(operation);
+        if (result.kind === "failure") {
+          const code = result.code === "forbidden" ? "notification_forbidden"
+            : result.code === "not_found" ? "notification_not_found"
+              : result.code === "source_inaccessible" ? "notification_source_gone"
+                : result.code === "revision_conflict" ? "notification_revision_conflict"
+                  : result.code === "unauthenticated" ? "invalid_token"
+                    : result.code === "room_archived" ? "room_archived" : "invalid_parameters";
+          sendCurrentGeneration(socket, { type: "error", status: result.status, code,
+            message: "Notification operation was rejected", requestId: frame.requestId },
+          generation, context);
+          return;
+        }
+        if (result.kind === "list") {
+          sendCurrentGeneration(socket, { type: "notification.list.result",
+            requestId: frame.requestId, notifications: result.notifications,
+            hasMore: result.hasMore, roomBadges: result.roomBadges,
+            identityWatermark: result.identityWatermark }, generation, context);
+          return;
+        }
+        if (result.kind === "read") {
+          sendCurrentGeneration(socket, result.ack, generation, context);
+          return;
+        }
+        if (result.kind === "source") {
+          sendCurrentGeneration(socket, { type: "notification.source.result",
+            requestId: frame.requestId, projection: result.projection }, generation, context);
+          return;
+        }
+        if (result.kind === "acknowledged") {
+          sendCurrentGeneration(socket, { type: frame.type === "notification.tool-result.acknowledge"
+            ? "notification.tool-result.ack" : "notification.execution-result.ack",
+            requestId: frame.requestId, outcome: result.outcome,
+            projection: result.projection }, generation, context);
+          return;
+        }
+        sendCurrentGeneration(socket, { type: "error", status: 503,
+          code: "storage_unavailable", message: "Notification authority returned an internal result",
+          requestId: frame.requestId }, generation, context);
+      } catch (error: unknown) {
+        sendCurrentGeneration(socket, mappedError(error, frame.requestId), generation, context);
+      }
+      return;
+    }
     case "project.snapshot.read":
     case "project.proposal.create":
     case "project.proposal.resolve":
@@ -3396,6 +3513,11 @@ export async function startMessageWebSocketServer(
           ? {}
           : { failureLifecycle: options.outboxFailureLifecycle }),
         ...(options.outboxAlertSink === undefined ? {} : { alertSink: options.outboxAlertSink }),
+        ...(options.notificationAuthority === undefined ? {} : {
+          prepareDelivery: createNotificationRecallOutboxPreparation(
+            options.notificationAuthority,
+          ),
+        }),
         async send(candidate, frame: OutboxDispatchFrame, delivery: OutboxDelivery) {
           const live = liveConnections.get(candidate.connectionId);
           const session = live?.context.session;
@@ -3587,6 +3709,7 @@ export async function startMessageWebSocketServer(
       ownedStreamingSnapshots,
       connectionId,
       v2GatesByRoom,
+      notificationRateLimit: createNotificationRateLimitState(),
       clearRoomSubscriptions,
       clearLiveSubscriptions,
       releaseSnapshotOwners,

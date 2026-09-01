@@ -10,6 +10,11 @@ import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js"
 import type { InvocationBridge } from "../invocation-runtime/contracts.js";
 import type { ProjectLoopBridge } from "../project-loop/contracts.js";
 import type { ToolSafetyBridge } from "../tool-safety/contracts.js";
+import type { NotificationCenterBridge } from "../notification-center/contracts.js";
+import type { NotificationToolResultActionBridge } from
+  "../notification-center/tool-result-action-contracts.js";
+import type { NotificationExecutionResultActionBridge } from
+  "../notification-center/execution-result-action-contracts.js";
 import { mountDesktopRendererEntry } from "./entry.js";
 
 const bridge = {} as IdentityBridge;
@@ -21,6 +26,9 @@ const agentSettings = {} as AgentSettingsBridge;
 const invocation = {} as InvocationBridge;
 const projectLoop = {} as ProjectLoopBridge;
 const toolSafety = {} as ToolSafetyBridge;
+const notificationCenter = {} as NotificationCenterBridge;
+const notificationToolResult = {} as NotificationToolResultActionBridge;
+const notificationExecutionResult = {} as NotificationExecutionResultActionBridge;
 
 function ports() {
   return {
@@ -35,6 +43,7 @@ function ports() {
     mountInvocationSurface: vi.fn(() => vi.fn()),
     mountProjectLoopSurface: vi.fn(() => vi.fn()),
     mountToolSafetySurface: vi.fn(() => vi.fn()),
+    mountNotificationCenterShell: vi.fn(() => vi.fn()),
   };
 }
 
@@ -164,6 +173,35 @@ describe("Desktop renderer route entry", () => {
     expect(renderers.mountMessageAuthoritySurface).toHaveBeenCalledWith(
       root, messageAuthority, "room-1", attachmentAuthority,
     );
+  });
+
+  it("passes both source-specific notification action bridges to the J-07 shell", () => {
+    const root = document.createElement("main");
+    const renderers = ports();
+    mountDesktopRendererEntry(
+      root,
+      "?message-room=room-1",
+      bridge,
+      governance,
+      messageAuthority,
+      renderers,
+      attachmentAuthority,
+      memoryAuthority,
+      agentSettings,
+      invocation,
+      projectLoop,
+      toolSafety,
+      notificationCenter,
+      notificationToolResult,
+      notificationExecutionResult,
+    );
+    expect(renderers.mountNotificationCenterShell).toHaveBeenCalledOnce();
+    expect(renderers.mountNotificationCenterShell.mock.calls[0]?.[0]).toMatchObject({
+      bridge: notificationCenter,
+      roomId: "room-1",
+      toolResultAction: notificationToolResult,
+      executionResultAction: notificationExecutionResult,
+    });
   });
 
   it("mounts Memory Authority in the current Room right rail without blocking chat", () => {

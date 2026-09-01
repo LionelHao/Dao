@@ -5,6 +5,8 @@ import type {
   ProjectBoundaryInvocationResult,
 } from "@native-im/core";
 import type { JsonValue } from "../persistence/contracts.js";
+import { persistNotificationProducerEvidenceInTransaction } from
+  "../notifications/source-transaction-adapter.js";
 
 type Row = Record<string, unknown>;
 
@@ -597,5 +599,55 @@ export function finishProjectBoundaryExecutionInTransaction(database: DatabaseSy
   if (current === undefined) return null;
   const result = publicExecution(current);
   appendExecutionStateEvent(database, result, input.now);
+  const recipient = database.prepare(
+    `WITH candidates(actor_id, priority) AS (
+       SELECT action.verifier_human_actor_id, 1
+       FROM project_next_actions AS action
+       WHERE ? = 'next_action' AND action.room_id = ? AND action.id = ?
+         AND action.verifier_human_actor_id IS NOT NULL
+       UNION ALL
+       SELECT room.owner_actor_id, 2 FROM rooms AS room WHERE room.id = ?
+       UNION ALL
+       SELECT membership.actor_id, 3
+       FROM room_memberships AS membership
+       WHERE membership.room_id = ? AND membership.kind = 'human'
+         AND membership.role = 'admin'
+     )
+     SELECT candidate.actor_id AS actorId
+     FROM candidates AS candidate
+     JOIN actors AS actor ON actor.id = candidate.actor_id AND actor.kind = 'human'
+     JOIN room_memberships AS membership
+       ON membership.room_id = ? AND membership.actor_id = candidate.actor_id
+      AND membership.kind = 'human'
+     JOIN rooms AS room ON room.id = membership.room_id AND room.status = 'active'
+     ORDER BY candidate.priority, candidate.actor_id LIMIT 1`,
+  ).get(result.sourceKind, result.roomId, result.sourceId,
+    result.roomId, result.roomId, result.roomId);
+  if (typeof recipient?.actorId === "string") {
+    const notificationBase = {
+      roomId: result.roomId,
+      roomLifecycle: "active" as const,
+      createdAt: input.now,
+      actorId: result.agentId,
+      executionId: result.executionId,
+      executionVersion: result.version,
+      sourceHumanRecipientActorId: recipient.actorId,
+      recipientRelation: "project_boundary_owner" as const,
+    };
+    const notification = input.outcome === "completed"
+      ? persistNotificationProducerEvidenceInTransaction(database, {
+          ...notificationBase,
+          kind: "agent_execution_completed",
+          executionStatus: "completed",
+        })
+      : persistNotificationProducerEvidenceInTransaction(database, {
+          ...notificationBase,
+          kind: "agent_execution_failed",
+          executionStatus: "failed",
+        });
+    if (notification === null) {
+      throw new Error("Project boundary terminal execution notification was not persisted");
+    }
+  }
   return result;
 }

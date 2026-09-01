@@ -4,6 +4,7 @@
 @import "./agent-settings/agent-settings.css";
 @import "./invocation-runtime/invocation-runtime.css";
 @import "./project-loop/project-loop.css";
+@import "./notification-center/notification-center.css";
 
 :root {
   --app-background: #f8fafc;

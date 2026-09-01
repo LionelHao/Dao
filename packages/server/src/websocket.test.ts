@@ -12,6 +12,7 @@ import {
   type Actor,
   type DepartureConflictList,
   type Message,
+  type NotificationProjection,
   type MessageDraft,
   type PersistedIdentityEvent,
   type PersistedRoomEvent,
@@ -49,6 +50,7 @@ import {
   type AgentPreviewDeliveryAuthority,
   type ProjectLoopAuthorityTransport,
   type RoomMemoryAuthorityTransport,
+  type NotificationAuthorityTransport,
 } from "./websocket.js";
 
 const humans = [
@@ -107,6 +109,54 @@ const testLoginDevice = Object.freeze({
   id: "websocket-test-installation",
   label: "WebSocket test device",
   platform: "unknown" as const,
+});
+
+const executionNotification: NotificationProjection = {
+  recordVersion: "notification.v1", notificationId: "notification-execution-1", roomId: "room-1",
+  recipientActorId: "human-1", notificationKind: "agent_execution_completed",
+  source: { sourceKind: "agent_execution", sourceId: "execution-1", sourceRevision: 2,
+    sourceBoundaryId: "execution-1", ordinal: 0 }, dedupeKey: "d".repeat(64),
+  createdAt: "2026-09-01T00:00:00.000Z", readAt: null, readRevision: 0,
+  handled: true, handledAt: "2026-09-01T00:01:00.000Z", sourceAccessible: true,
+  deepLink: { kind: "agent_execution", targetId: "execution-1" },
+  safeProjection: { titleKey: "agent_execution_completed", actorId: "agent-1" },
+};
+
+describe("FT-12 execution-result Notification WebSocket", () => {
+  it("derives the recipient session and returns only the source-specific correlated ACK", async () => {
+    const execute = vi.fn<NotificationAuthorityTransport["execute"]>(async (operation) => {
+      if (operation.type !== "notification.acknowledge-execution-result") {
+        return { kind: "failure", code: "invalid_request", status: 400 };
+      }
+      return { kind: "acknowledged", outcome: "acknowledged", projection: executionNotification };
+    });
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(), service: idleMessageService(),
+      notificationAuthority: { execute },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    const command = { type: "notification.execution-result.acknowledge",
+      requestId: "execution-result-ack-1", notificationId: executionNotification.notificationId } as const;
+    try {
+      client.send(command);
+      await expect(client.waitForError("unauthenticated", command.requestId))
+        .resolves.toMatchObject({ frame: { status: 401 } });
+      await client.login(humans[0], "execution-result-login");
+      client.send(command);
+      await expect(client.waitForFrame((frame) => hasType(frame,
+        "notification.execution-result.ack") && frame.requestId === command.requestId,
+      "execution-result acknowledgement")).resolves.toMatchObject({ frame: {
+        type: "notification.execution-result.ack", requestId: command.requestId,
+        outcome: "acknowledged", projection: executionNotification,
+      } });
+      expect(execute).toHaveBeenCalledOnce();
+      expect(execute.mock.calls[0]?.[0]).toMatchObject({
+        type: "notification.acknowledge-execution-result",
+        commandRequestId: command.requestId, notificationId: command.notificationId,
+        context: { principal: { actorId: "human-1" } },
+      });
+    } finally { await client.close(); await server.close(); }
+  });
 });
 
 describe("FT-09 Project Loop WebSocket", () => {

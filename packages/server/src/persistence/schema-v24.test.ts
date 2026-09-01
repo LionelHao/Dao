@@ -152,8 +152,8 @@ describe("authority SQLite v24 Project boundary Agent intent lineage", () => {
   it("adds a message-independent durable Project boundary intent lineage", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(27);
-      expect(readSchemaVersion(database)).toBe(27);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(28);
+      expect(readSchemaVersion(database)).toBe(28);
       expect(listAuthorityTables(database)).toEqual(expect.arrayContaining([
         "project_boundary_agent_invocation_intents",
         "project_boundary_agent_executions",
@@ -164,7 +164,7 @@ describe("authority SQLite v24 Project boundary Agent intent lineage", () => {
   });
 
   it("upgrades every immutable v1-v23 contract without changing its migration history", () => {
-    expect(AUTHORITY_SCHEMA_VERSION).toBe(27);
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(28);
     for (let version = 1; version <= 23; version += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
@@ -172,7 +172,7 @@ describe("authority SQLite v24 Project boundary Agent intent lineage", () => {
           "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
         ).all();
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(27);
+        expect(readSchemaVersion(database)).toBe(28);
         expect(database.prepare(
           "SELECT version, name, checksum FROM schema_migrations WHERE version <= ? ORDER BY version",
         ).all(version)).toEqual(history);
@@ -387,7 +387,7 @@ describe("authority SQLite v24 Project boundary Agent intent lineage", () => {
       database = new DatabaseSync(path);
       expect(database.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(27);
+      expect(readSchemaVersion(database)).toBe(28);
       database.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });

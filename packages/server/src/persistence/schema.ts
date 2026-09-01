@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 27 as const;
+export const AUTHORITY_SCHEMA_VERSION = 28 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -79,6 +79,7 @@ const SCHEMA_FINGERPRINTS = {
   25: "e0cd0a610c4777209877535e0d5651498984681bf9b3c3f825724f4946191815",
   26: "a5c6c02245dfab5a054e5035898f6a81ee805424901bb57ff96eb8eeac74f6cb",
   27: "a7c507632ae5bd86f0e76df7be00f40d9872c4d7ff45e009fe51a166ec76717d",
+  28: "0d3bb2b28c616def17fea13a7875d08a3ede681fd1b862390ce48e5823453bc1",
 } as const;
 
 const V1_STATEMENTS = [
@@ -9775,6 +9776,110 @@ const V27_STATEMENTS = [
    ON project_event_outbox(status, dead_lettered_at, event_id)`,
 ] as const;
 
+const V28_STATEMENTS = [
+  `CREATE TABLE notifications (
+    notification_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    recipient_actor_id TEXT NOT NULL REFERENCES actors(id),
+    notification_kind TEXT NOT NULL CHECK (notification_kind IN (
+      'human_mention', 'human_request', 'tool_confirmation', 'project_due',
+      'tool_result', 'agent_execution_completed', 'agent_execution_failed',
+      'cannot_answer_escalation'
+    )),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'message_mention', 'project_request', 'tool_confirmation',
+      'project_boundary', 'tool_call', 'agent_execution', 'project_obstacle'
+    )),
+    source_id TEXT NOT NULL CHECK (length(source_id) BETWEEN 1 AND 256),
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 0),
+    source_boundary_id TEXT NOT NULL CHECK (length(source_boundary_id) BETWEEN 1 AND 256),
+    source_ordinal INTEGER NOT NULL CHECK (source_ordinal >= 0),
+    dedupe_key TEXT NOT NULL UNIQUE CHECK (
+      length(dedupe_key) = 64 AND dedupe_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    safe_actor_id TEXT REFERENCES actors(id),
+    created_at TEXT NOT NULL,
+    read_at TEXT,
+    read_revision INTEGER NOT NULL DEFAULT 0 CHECK (read_revision >= 0),
+    handled_at TEXT,
+    handled_revision INTEGER NOT NULL DEFAULT 0 CHECK (handled_revision >= 0),
+    revoked_at TEXT,
+    revoke_reason TEXT CHECK (
+      revoke_reason IS NULL OR revoke_reason IN ('membership_revoked', 'source_inaccessible')
+    ),
+    UNIQUE (recipient_actor_id, source_boundary_id, notification_kind, source_ordinal),
+    CHECK ((read_at IS NULL AND read_revision = 0) OR
+           (read_at IS NOT NULL AND read_revision >= 1)),
+    CHECK ((handled_at IS NULL AND handled_revision = 0) OR
+           (handled_at IS NOT NULL AND handled_revision >= 1)),
+    CHECK ((revoked_at IS NULL AND revoke_reason IS NULL) OR
+           (revoked_at IS NOT NULL AND revoke_reason IS NOT NULL))
+  ) STRICT`,
+  `CREATE TABLE notification_command_receipts (
+    recipient_actor_id TEXT NOT NULL REFERENCES actors(id),
+    request_id TEXT NOT NULL CHECK (length(request_id) BETWEEN 1 AND 256),
+    command_kind TEXT NOT NULL CHECK (command_kind = 'mark_read'),
+    request_sha256 TEXT NOT NULL CHECK (
+      length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    notification_id TEXT NOT NULL REFERENCES notifications(notification_id),
+    response_json TEXT NOT NULL CHECK (json_valid(response_json)),
+    committed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (recipient_actor_id, request_id),
+    CHECK (julianday(expires_at) > julianday(committed_at)
+      AND julianday(expires_at) <= julianday(committed_at) + 30)
+  ) STRICT`,
+  `CREATE INDEX notifications_recipient_page_v28
+   ON notifications(recipient_actor_id, created_at DESC, notification_id DESC)
+   WHERE revoked_at IS NULL`,
+  `CREATE INDEX notifications_recipient_room_badge_v28
+   ON notifications(recipient_actor_id, room_id, read_at, handled_at, notification_id)
+   WHERE revoked_at IS NULL`,
+  `CREATE INDEX notifications_source_boundary_v28
+   ON notifications(source_boundary_id, notification_kind, source_ordinal)`,
+  `CREATE INDEX notifications_revocation_scan_v28
+   ON notifications(recipient_actor_id, revoked_at, notification_id)`,
+  `CREATE INDEX notification_command_receipts_expiry_v28
+   ON notification_command_receipts(expires_at, recipient_actor_id, request_id)`,
+  `CREATE TRIGGER notifications_validate_recipient_insert
+   BEFORE INSERT ON notifications
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.recipient_actor_id), '') <> 'human'
+     OR NOT EXISTS (
+       SELECT 1 FROM room_memberships AS membership
+       WHERE membership.room_id = NEW.room_id
+         AND membership.actor_id = NEW.recipient_actor_id
+         AND membership.kind = 'human'
+     )
+     OR COALESCE((SELECT status FROM rooms WHERE id = NEW.room_id), '') <> 'active'
+   BEGIN SELECT RAISE(ABORT, 'notification recipient authority is invalid'); END`,
+  `CREATE TRIGGER notifications_binding_immutable_v28
+   BEFORE UPDATE OF notification_id, room_id, recipient_actor_id, notification_kind,
+     source_kind, source_id, source_revision, source_boundary_id, source_ordinal,
+     dedupe_key, safe_actor_id, created_at ON notifications
+   BEGIN SELECT RAISE(ABORT, 'notification binding is immutable'); END`,
+  `CREATE TRIGGER notifications_monotone_state_v28
+   BEFORE UPDATE OF read_at, read_revision, handled_at, handled_revision,
+     revoked_at, revoke_reason ON notifications
+   WHEN NEW.read_revision < OLD.read_revision
+     OR NEW.read_revision > OLD.read_revision + 1
+     OR (NEW.read_revision = OLD.read_revision AND NEW.read_at IS NOT OLD.read_at)
+     OR (NEW.read_revision = OLD.read_revision + 1 AND
+         (OLD.read_at IS NOT NULL OR NEW.read_at IS NULL))
+     OR NEW.handled_revision < OLD.handled_revision
+     OR NEW.handled_revision > OLD.handled_revision + 1
+     OR (NEW.handled_revision = OLD.handled_revision AND NEW.handled_at IS NOT OLD.handled_at)
+     OR (NEW.handled_revision = OLD.handled_revision + 1 AND
+         (OLD.handled_at IS NOT NULL OR NEW.handled_at IS NULL))
+     OR (OLD.revoked_at IS NOT NULL AND
+         (NEW.revoked_at IS NOT OLD.revoked_at OR NEW.revoke_reason IS NOT OLD.revoke_reason))
+     OR (OLD.revoked_at IS NULL AND NEW.revoked_at IS NULL AND NEW.revoke_reason IS NOT NULL)
+   BEGIN SELECT RAISE(ABORT, 'notification state must advance monotonically'); END`,
+  `CREATE TRIGGER notification_command_receipts_immutable_update_v28
+   BEFORE UPDATE ON notification_command_receipts
+   BEGIN SELECT RAISE(ABORT, 'notification command receipt is immutable'); END`,
+] as const;
+
 export const AUTHORITY_V26_STATEMENT_COUNT_FOR_TEST = V26_STATEMENTS.length;
 export const AUTHORITY_V26_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST =
   V26_STATEMENTS.filter((statement) => statement.startsWith("CREATE TRIGGER ")).length;
@@ -9787,6 +9892,12 @@ export const AUTHORITY_V27_STATEMENT_COUNT_FOR_TEST = V27_STATEMENTS.length;
 export const AUTHORITY_V27_ROLLBACK_ASSERTION_COUNT_FOR_TEST = V27_STATEMENTS.length;
 export const AUTHORITY_V27_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
   27, "sync-reliability-lifecycle", V27_STATEMENTS,
+);
+
+export const AUTHORITY_V28_STATEMENT_COUNT_FOR_TEST = V28_STATEMENTS.length;
+export const AUTHORITY_V28_ROLLBACK_ASSERTION_COUNT_FOR_TEST = V28_STATEMENTS.length;
+export const AUTHORITY_V28_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
+  28, "recipient-notification-authority", V28_STATEMENTS,
 );
 
 export const AUTHORITY_V22_STATEMENT_COUNT_FOR_TEST = V22_STATEMENTS.length;
@@ -10258,6 +10369,7 @@ const MIGRATIONS = [
   defineMigration(25, "project-transition-authority", V25_STATEMENTS),
   defineMigration(26, "tool-safety-authority", V26_STATEMENTS),
   defineMigration(27, "sync-reliability-lifecycle", V27_STATEMENTS),
+  defineMigration(28, "recipient-notification-authority", V28_STATEMENTS),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -11334,6 +11446,20 @@ const V27_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V28_SCHEMA_CONTRACT = {
+  ...V27_SCHEMA_CONTRACT,
+  notifications: [
+    "notification_id", "room_id", "recipient_actor_id", "notification_kind",
+    "source_kind", "source_id", "source_revision", "source_boundary_id",
+    "source_ordinal", "dedupe_key", "safe_actor_id", "created_at", "read_at",
+    "read_revision", "handled_at", "handled_revision", "revoked_at", "revoke_reason",
+  ],
+  notification_command_receipts: [
+    "recipient_actor_id", "request_id", "command_kind", "request_sha256",
+    "notification_id", "response_json", "committed_at", "expires_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -11362,6 +11488,7 @@ const SCHEMA_CONTRACTS = {
   25: V25_SCHEMA_CONTRACT,
   26: V26_SCHEMA_CONTRACT,
   27: V27_SCHEMA_CONTRACT,
+  28: V28_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -13650,6 +13777,28 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
           ))
        LIMIT 1`,
       "Human cancellation receipts must expire while internal producer facts remain durable",
+    );
+  }
+  if (schemaVersion >= 28) {
+    requireNoRows(
+      database,
+      `SELECT 1 FROM notifications AS notification
+       LEFT JOIN actors AS recipient ON recipient.id = notification.recipient_actor_id
+       LEFT JOIN rooms AS room ON room.id = notification.room_id
+       WHERE recipient.kind <> 'human' OR room.id IS NULL
+          OR (notification.read_at IS NULL) <> (notification.read_revision = 0)
+          OR (notification.handled_at IS NULL) <> (notification.handled_revision = 0)
+          OR (notification.revoked_at IS NULL) <> (notification.revoke_reason IS NULL)
+       LIMIT 1`,
+      "notifications must retain Human recipient and closed monotone state",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM notification_command_receipts
+       WHERE julianday(expires_at) <= julianday(committed_at)
+          OR julianday(expires_at) > julianday(committed_at) + 30
+       LIMIT 1`,
+      "notification command receipts must have a finite replay boundary",
     );
   }
 }

@@ -355,6 +355,20 @@ describe("FT-09 Project boundary adversarial authority", () => {
            AND json_extract(payload_json, '$.status') = 'execution-state'
          ORDER BY stream_seq`,
       ).all()).toEqual([{ status: "accepted" }, { status: "running" }, { status: "completed" }]);
+      expect(database.prepare(
+        `SELECT notification_kind AS notificationKind,
+                recipient_actor_id AS recipientActorId,
+                source_kind AS sourceKind, source_boundary_id AS sourceBoundaryId,
+                read_at AS readAt, handled_at AS handledAt
+         FROM notifications WHERE source_boundary_id = ?`,
+      ).get(accepted!.executionId)).toEqual({
+        notificationKind: "agent_execution_completed",
+        recipientActorId: "human-owner",
+        sourceKind: "agent_execution",
+        sourceBoundaryId: accepted!.executionId,
+        readAt: null,
+        handledAt: null,
+      });
     } finally {
       close(database);
     }

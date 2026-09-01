@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Actor } from "@native-im/core";
 import { createAuthenticationService, type IdentityAdapter } from "../auth.js";
+import { deriveNotificationProducerIntent } from "../notifications/producer-matrix.js";
 import { createSqliteAuthoritativeStore } from "./sqlite-authoritative-store.js";
 import { createWorkerDatabaseClient } from "./worker-database-client.js";
 import { migrateAuthorityDatabase } from "./schema.js";
@@ -234,6 +235,95 @@ describe("FT-02A room governance foundation", () => {
       "SELECT reason, target_actor_id AS targetActorId FROM room_cache_invalidation_intents WHERE reason = 'member_removed'",
     ).all()).toEqual([{ reason: "member_removed", targetActorId: "human-target" }]);
     database.close();
+    await restartedClient.close();
+  });
+
+  it("revokes the complete old notification boundary before removal so rejoin cannot revive it", async () => {
+    const value = await fixture();
+    const owner = value.sessions.get("human-owner")!;
+    const member = value.sessions.get("human-target")!;
+    for (let index = 0; index < 257; index += 1) {
+      const fact = deriveNotificationProducerIntent({
+        kind: "human_request",
+        roomId: value.roomId,
+        roomLifecycle: "active",
+        createdAt: "1970-01-01T00:00:01.500Z",
+        recipientRelation: "target_pending",
+        requestId: `departure-notification-${index}`,
+        requestRevision: 1,
+        requestBoundaryOrdinal: 0,
+        stableTargetHumanActorId: "human-target",
+        targetMembership: "active",
+        requestStatus: "pending_acceptance",
+        actorId: "human-owner",
+      });
+      if (fact === null) throw new Error("notification fixture was not derivable");
+      await value.client.executeNotification({ type: "notification.create", fact });
+    }
+
+    await value.authority.executeHumanGovernance({
+      ...owner,
+      kind: "human",
+      requestId: "remove-notification-recipient",
+      idempotencyKey: "remove-notification-recipient",
+    }, {
+      type: "room.member.remove",
+      roomId: value.roomId,
+      payload: { targetActorId: "human-target", expectedGovernanceRevision: 1 },
+    });
+    await value.client.close();
+
+    const database = new DatabaseSync(value.databasePath);
+    expect(database.prepare(
+      `SELECT COUNT(*) AS count FROM notifications
+       WHERE recipient_actor_id = 'human-target' AND revoked_at IS NULL`,
+    ).get()).toEqual({ count: 0 });
+    expect(database.prepare(
+      `SELECT COUNT(*) AS count FROM events
+       WHERE event_type = 'notification.revoked' AND actor_id = 'human-target'`,
+    ).get()).toEqual({ count: 256 });
+    expect(database.prepare(
+      `SELECT COUNT(*) AS count FROM outbox_deliveries AS delivery
+       JOIN events AS event ON event.event_id = delivery.event_id
+       WHERE event.event_type = 'notification.revoked' AND delivery.target_id = 'human-target'`,
+    ).get()).toEqual({ count: 256 });
+    database.prepare(
+      `INSERT INTO room_memberships (
+         room_id, actor_id, kind, role, participation, tool_permissions_json,
+         joined_at, configured_at, access_revision
+       ) VALUES (?, 'human-target', 'human', 'member', NULL, '[]', ?, NULL, 0)`,
+    ).run(value.roomId, "1970-01-01T00:00:03.000Z");
+    database.close();
+
+    const restartedClient = await createWorkerDatabaseClient({ databasePath: value.databasePath });
+    const postRejoin = deriveNotificationProducerIntent({
+      kind: "human_request",
+      roomId: value.roomId,
+      roomLifecycle: "active",
+      createdAt: "1970-01-01T00:00:04.000Z",
+      recipientRelation: "target_pending",
+      requestId: "post-rejoin-notification",
+      requestRevision: 1,
+      requestBoundaryOrdinal: 0,
+      stableTargetHumanActorId: "human-target",
+      targetMembership: "active",
+      requestStatus: "pending_acceptance",
+      actorId: "human-owner",
+    });
+    if (postRejoin === null) throw new Error("post-rejoin notification was not derivable");
+    await restartedClient.executeNotification({ type: "notification.create", fact: postRejoin });
+    await expect(restartedClient.executeNotification({
+      type: "notification.list",
+      context: member,
+      roomId: value.roomId,
+      before: null,
+      limit: 256,
+      now: 3_000,
+    })).resolves.toMatchObject({
+      kind: "list",
+      notifications: [postRejoin],
+      roomBadges: [{ roomId: value.roomId, unreadCount: 1, unhandledCount: 1 }],
+    });
     await restartedClient.close();
   });
 

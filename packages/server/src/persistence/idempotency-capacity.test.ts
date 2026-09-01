@@ -52,6 +52,36 @@ describe("idempotency janitor PR capacity", () => {
       }
       database.exec("COMMIT");
       expect(count(database)).toBe(TOTAL_RECEIPTS);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name) VALUES
+          ('notification-cleanup-human', 'human', 'Notification cleanup');
+        INSERT INTO rooms (id, name, status, created_at, owner_actor_id)
+          VALUES ('notification-cleanup-room', 'Cleanup', 'active',
+            '2026-08-01T00:00:00.000Z', 'notification-cleanup-human');
+        INSERT INTO room_memberships (
+          room_id, actor_id, kind, role, joined_at
+        ) VALUES (
+          'notification-cleanup-room', 'notification-cleanup-human', 'human', 'owner',
+          '2026-08-01T00:00:00.000Z'
+        );
+        INSERT INTO notifications (
+          notification_id, room_id, recipient_actor_id, notification_kind, source_kind,
+          source_id, source_revision, source_boundary_id, source_ordinal, dedupe_key, created_at
+        ) VALUES (
+          'notification-cleanup-1', 'notification-cleanup-room',
+          'notification-cleanup-human', 'human_request', 'project_request',
+          'request-cleanup-1', 1, 'request-cleanup-1', 0,
+          '${"a".repeat(64)}', '2026-08-01T00:00:00.000Z'
+        );
+        INSERT INTO notification_command_receipts (
+          recipient_actor_id, request_id, command_kind, request_sha256,
+          notification_id, response_json, committed_at, expires_at
+        ) VALUES (
+          'notification-cleanup-human', 'notification-cleanup-command', 'mark_read',
+          '${"b".repeat(64)}', 'notification-cleanup-1', '{}',
+          '2026-08-02T00:00:00.000Z', '2026-08-31T00:00:00.000Z'
+        );
+      `);
 
       let deleted = 0;
       let batches = 0;
@@ -75,13 +105,16 @@ describe("idempotency janitor PR capacity", () => {
         if (!result.hasMore) break;
       }
 
-      expect(deleted).toBe(EXPIRED_RECEIPTS);
-      expect(batches).toBe(Math.ceil(EXPIRED_RECEIPTS / CLEANUP_BATCH_SIZE));
+      expect(deleted).toBe(EXPIRED_RECEIPTS + 1);
+      expect(batches).toBe(Math.ceil((EXPIRED_RECEIPTS + 1) / CLEANUP_BATCH_SIZE));
       expect(yielded).toBe(batches);
       expect(count(database)).toBe(TOTAL_RECEIPTS - EXPIRED_RECEIPTS);
       expect(database.prepare(
         "SELECT MIN(expires_at) AS earliest FROM idempotency_records",
       ).get()).toEqual({ earliest: liveAt });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM notification_command_receipts",
+      ).get()).toEqual({ count: 0 });
       expect(cleanupExpiredIdempotencyDatabaseCommand(
         database,
         NOW_MS,

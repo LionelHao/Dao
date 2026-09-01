@@ -2,6 +2,11 @@ import { createHash } from "node:crypto";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import type { JsonValue } from "../persistence/contracts.js";
 import {
+  persistNotificationProducerEvidenceBatchInTransaction,
+  projectNotificationSourceTerminalInTransaction,
+} from "../notifications/source-transaction-adapter.js";
+import type { NotificationProducerEvidence } from "../notifications/producer-matrix.js";
+import {
   isProjectLoopAuthorityOperation,
   type ProjectLoopActorCommandContext,
   type ProjectLoopAuthorityOperation,
@@ -588,6 +593,62 @@ function transferEscalationHolder(fact: ProjectLoopStoredFact): string {
 }
 
 function refreshBallBoundary(database: DatabaseSync, fact: ProjectLoopStoredFact, now: string): void {
+  const escalationRows = database.prepare(
+    `SELECT boundary_id AS boundaryId
+     FROM project_ball_boundaries
+     WHERE room_id = ? AND source_kind = ? AND source_id = ?
+       AND reason = 'escalation' AND status = 'active'
+     ORDER BY boundary_id LIMIT 257`,
+  ).all(fact.roomId, fact.kind, fact.id) as unknown as readonly Readonly<{
+    boundaryId: string;
+  }>[];
+  if (escalationRows.length > 256) {
+    throw new ProjectLoopAuthorityError("storage_unavailable",
+      "Project escalation notification release exceeded its transaction bound");
+  }
+  for (const row of escalationRows) {
+    if (typeof row.boundaryId !== "string") {
+      throw new ProjectLoopAuthorityError("storage_unavailable",
+        "Project escalation notification boundary is corrupt");
+    }
+    projectNotificationSourceTerminalInTransaction(database, {
+      sourceKind: "project_obstacle",
+      sourceBoundaryId: row.boundaryId,
+      sourceTerminal: "escalation_resolved",
+      occurredAt: now,
+    });
+  }
+  const dueRows = database.prepare(
+    `SELECT due.boundary_id AS boundaryId
+     FROM project_ball_boundaries AS due
+     JOIN project_ball_boundaries AS source ON source.boundary_id = due.source_id
+     WHERE due.room_id = ? AND due.source_kind = 'due' AND due.status = 'active'
+       AND source.room_id = ? AND source.source_kind = ? AND source.source_id = ?
+       AND source.status = 'active'
+     ORDER BY due.boundary_id LIMIT 257`,
+  ).all(fact.roomId, fact.roomId, fact.kind, fact.id) as unknown as readonly Readonly<{
+    boundaryId: string;
+  }>[];
+  if (dueRows.length > 256) {
+    throw new ProjectLoopAuthorityError("storage_unavailable",
+      "Project due notification release exceeded its transaction bound");
+  }
+  for (const row of dueRows) {
+    if (typeof row.boundaryId !== "string") {
+      throw new ProjectLoopAuthorityError("storage_unavailable",
+        "Project due notification boundary is corrupt");
+    }
+    projectNotificationSourceTerminalInTransaction(database, {
+      sourceKind: "project_boundary",
+      sourceBoundaryId: row.boundaryId,
+      sourceTerminal: "project_boundary_released",
+      occurredAt: now,
+    });
+    database.prepare(
+      `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
+       WHERE boundary_id = ? AND status = 'active'`,
+    ).run(now, row.boundaryId);
+  }
   database.prepare(
     `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
      WHERE room_id = ? AND source_kind = ? AND source_id = ? AND status = 'active'`,
@@ -1125,6 +1186,88 @@ function targetStatus(kind: ProjectLoopFactKind, current: string, transition: st
   return target;
 }
 
+function currentHumanNotificationMembership(database: DatabaseSync,
+  roomId: string, actorId: string): "active" | "revoked" {
+  const row = database.prepare(
+    `SELECT membership.access_revision AS accessRevision
+     FROM room_memberships AS membership
+     JOIN actors AS actor ON actor.id = membership.actor_id AND actor.kind = 'human'
+     WHERE membership.room_id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
+  ).get(roomId, actorId);
+  return typeof row?.accessRevision === "number" ? "active" : "revoked";
+}
+
+function projectRequestNotificationsInTransaction(database: DatabaseSync, input: Readonly<{
+  before: ProjectLoopStoredFact;
+  after: ProjectLoopStoredFact;
+  transition: string;
+  actorId: string;
+  occurredAt: string;
+}>): void {
+  const requesterHumanActorId = input.before.details.requesterActorId;
+  if (typeof requesterHumanActorId !== "string" || requesterHumanActorId.length === 0) {
+    throw new ProjectLoopAuthorityError("storage_unavailable", "Request requester is unavailable");
+  }
+  const requestStatus = input.transition === "request.accept" ? "accepted" as const
+    : input.transition === "request.reject" ? "rejected" as const
+      : input.transition === "request.cancel" ? "cancelled" as const
+        : input.transition === "request.transfer" ? "transferred" as const
+          : null;
+  if (requestStatus === null) {
+    throw new ProjectLoopAuthorityError("storage_unavailable",
+      "Request notification transition is unavailable");
+  }
+
+  // Close all notifications attached to the old Request boundary before creating a transferred
+  // target's next pending item. This ordering prevents the new pending item from being handled by
+  // the transition that created it.
+  projectNotificationSourceTerminalInTransaction(database, {
+    sourceKind: "project_request",
+    sourceBoundaryId: input.before.id,
+    sourceTerminal: "request_terminal",
+    occurredAt: input.occurredAt,
+  });
+
+  const requestBoundaryOrdinal = input.after.revision - 1;
+  const evidence: NotificationProducerEvidence[] = [{
+    kind: "human_request",
+    roomId: input.before.roomId,
+    roomLifecycle: "active",
+    createdAt: input.occurredAt,
+    actorId: input.actorId,
+    recipientRelation: "requester_result",
+    requestId: input.before.id,
+    requestRevision: input.after.revision,
+    requestBoundaryOrdinal,
+    requesterHumanActorId,
+    requesterMembership: currentHumanNotificationMembership(database,
+      input.before.roomId, requesterHumanActorId),
+    requestStatus,
+  }];
+  if (input.transition === "request.transfer") {
+    const stableTargetHumanActorId = input.after.details.targetActorId;
+    if (typeof stableTargetHumanActorId !== "string" || stableTargetHumanActorId.length === 0) {
+      throw new ProjectLoopAuthorityError("storage_unavailable", "Request target is unavailable");
+    }
+    evidence.push({
+      kind: "human_request",
+      roomId: input.before.roomId,
+      roomLifecycle: "active",
+      createdAt: input.occurredAt,
+      actorId: input.actorId,
+      recipientRelation: "target_pending",
+      requestId: input.before.id,
+      requestRevision: input.after.revision,
+      requestBoundaryOrdinal,
+      stableTargetHumanActorId,
+      targetMembership: currentHumanNotificationMembership(database,
+        input.before.roomId, stableTargetHumanActorId),
+      requestStatus: "pending_acceptance",
+    });
+  }
+  persistNotificationProducerEvidenceBatchInTransaction(database, evidence);
+}
+
 function transitionFact(database: DatabaseSync,
   operation: Extract<ProjectLoopAuthorityOperation, { type: "project-loop.fact.transition" }>,
 ): ProjectLoopAuthorityResult {
@@ -1546,6 +1689,15 @@ function transitionFact(database: DatabaseSync,
     }
   }
   let updated = readFact(database, operation.command.factKind, fact.id, fact.roomId);
+  if (fact.kind === "request" && updated.revision !== fact.revision) {
+    projectRequestNotificationsInTransaction(database, {
+      before: fact,
+      after: updated,
+      transition,
+      actorId: principal.actorId,
+      occurredAt: timestamp,
+    });
+  }
   if (updated.revision !== fact.revision) refreshBallBoundary(database, updated, timestamp);
   if (transition === "obstacle.cannot_answer") {
     const escalation = database.prepare(
@@ -1560,6 +1712,37 @@ function transitionFact(database: DatabaseSync,
       `UPDATE project_obstacles SET escalation_boundary_id = ? WHERE id = ? AND room_id = ?`,
     ).run(escalation.boundaryId, fact.id, fact.roomId);
     updated = readFact(database, operation.command.factKind, fact.id, fact.roomId);
+    const escalationOwnerKind = String(updated.details.ownerKind);
+    const escalationOwnerId = String(updated.details.ownerActorId);
+    const recipient = database.prepare(
+      `SELECT actor.id AS actorId
+       FROM rooms AS room
+       JOIN actors AS actor ON actor.id = CASE WHEN ? = 'human' THEN ? ELSE room.owner_actor_id END
+       JOIN room_memberships AS membership
+         ON membership.room_id = room.id AND membership.actor_id = actor.id
+       WHERE room.id = ? AND room.status = 'active' AND actor.kind = 'human'
+         AND membership.kind = 'human'`,
+    ).get(escalationOwnerKind, escalationOwnerId, fact.roomId);
+    if (typeof recipient?.actorId !== "string") {
+      throw new ProjectLoopAuthorityError("storage_unavailable",
+        "Obstacle escalation Human recipient is unavailable");
+    }
+    const notification = persistNotificationProducerEvidenceBatchInTransaction(database, [{
+      kind: "cannot_answer_escalation",
+      roomId: fact.roomId,
+      roomLifecycle: "active",
+      createdAt: timestamp,
+      actorId: principal.actorId,
+      obstacleId: fact.id,
+      obstacleRevision: updated.revision,
+      escalationBoundaryId: escalation.boundaryId,
+      exactEscalationHumanActorId: recipient.actorId,
+      obstacleStatus: "cannot_answer",
+    }]);
+    if (notification.length !== 1) {
+      throw new ProjectLoopAuthorityError("storage_unavailable",
+        "Obstacle escalation notification did not commit");
+    }
   }
   const source = fact.source;
   if (changedTransfer !== null) {
