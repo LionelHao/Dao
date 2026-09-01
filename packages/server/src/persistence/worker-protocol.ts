@@ -54,6 +54,18 @@ import {
   isMemoryAuthorityOperation,
   type MemoryAuthorityOperation,
 } from "../room-memory/authority-protocol.js";
+import {
+  isPrivacyRetentionAuthorityResult,
+  isPrivacyRetentionRunBatchOperation,
+  type PrivacyRetentionAuthorityResult,
+  type PrivacyRetentionRunBatchOperation,
+} from "../privacy-operations/retention-authority-protocol.js";
+import {
+  isPrivacyDataAuthorityOperation,
+  isPrivacyDataAuthorityResult,
+  type PrivacyDataAuthorityOperation,
+  type PrivacyDataAuthorityResult,
+} from "../privacy-operations/data-authority-protocol.js";
 import type { CommittedRoomCacheInvalidationIntent } from "../access/room-cache-invalidation-port.js";
 import {
   isOfflineReadLeaseClaims,
@@ -129,6 +141,12 @@ import {
   type ProjectLoopAuthorityOperation,
   type ProjectLoopAuthorityResult,
 } from "../project-loop/authority-protocol.js";
+import {
+  isNotificationAuthorityOperation,
+  isNotificationAuthorityResult,
+  type NotificationAuthorityOperation,
+  type NotificationAuthorityResult,
+} from "../notifications/authority-protocol.js";
 
 export type ContextWorkerOperation = ContextSnapshotAuthorityOperation | {
   readonly type: "context.finalize-agent-message";
@@ -739,18 +757,33 @@ export type AuthorityWorkerRequest =
       readonly requestId: string;
       readonly operation: ProjectLoopAuthorityOperation;
     }
+  | {
+      readonly type: "authority.notification";
+      readonly requestId: string;
+      readonly operation: NotificationAuthorityOperation;
+    }
+  | {
+      readonly type: "authority.privacy-retention";
+      readonly requestId: string;
+      readonly operation: PrivacyRetentionRunBatchOperation;
+    }
+  | {
+      readonly type: "authority.privacy-data";
+      readonly requestId: string;
+      readonly operation: PrivacyDataAuthorityOperation;
+    }
   | { readonly type: "authority.close"; readonly requestId: string };
 
 export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 27;
+      readonly schemaVersion: 29;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 27;
+      readonly schemaVersion: 29;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -969,6 +1002,21 @@ export type AuthorityWorkerResponse =
       readonly type: "authority.project-loop-result";
       readonly requestId: string;
       readonly result: ProjectLoopAuthorityResult;
+    }
+  | {
+      readonly type: "authority.notification-result";
+      readonly requestId: string;
+      readonly result: NotificationAuthorityResult;
+    }
+  | {
+      readonly type: "authority.privacy-retention-result";
+      readonly requestId: string;
+      readonly result: PrivacyRetentionAuthorityResult;
+    }
+  | {
+      readonly type: "authority.privacy-data-result";
+      readonly requestId: string;
+      readonly result: PrivacyDataAuthorityResult;
     }
   | { readonly type: "authority.closed"; readonly requestId: string }
   | {
@@ -1540,7 +1588,11 @@ function isOutboxDelivery(value: unknown): value is OutboxDelivery {
     return event.streamKind === "identity" &&
       event.streamId === value.targetId &&
       (event.type === "identity.room-access.changed" ||
-        event.type === "attachment.private.status-changed");
+        event.type === "attachment.private.status-changed" ||
+        event.type === "notification.created" ||
+        event.type === "notification.read" ||
+        event.type === "notification.handled" ||
+        event.type === "notification.revoked");
   }
   return event.streamKind === "identity" &&
     event.type === "identity.session.revoked" &&
@@ -1862,6 +1914,15 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
     case "authority.project-loop":
       return hasExactKeys(value, ["type", "requestId", "operation"]) &&
         isProjectLoopAuthorityOperation(value.operation);
+    case "authority.notification":
+      return hasExactKeys(value, ["type", "requestId", "operation"]) &&
+        isNotificationAuthorityOperation(value.operation);
+    case "authority.privacy-retention":
+      return hasExactKeys(value, ["type", "requestId", "operation"]) &&
+        isPrivacyRetentionRunBatchOperation(value.operation);
+    case "authority.privacy-data":
+      return hasExactKeys(value, ["type", "requestId", "operation"]) &&
+        isPrivacyDataAuthorityOperation(value.operation);
     default:
       return false;
   }
@@ -1879,7 +1940,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 27
+        value.schemaVersion === 29
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -2036,6 +2097,15 @@ export function isAuthorityWorkerResponse(
     case "authority.project-loop-result":
       return hasExactKeys(value, ["type", "requestId", "result"]) &&
         isProjectLoopAuthorityResult(value.result);
+    case "authority.notification-result":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isNotificationAuthorityResult(value.result);
+    case "authority.privacy-retention-result":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isPrivacyRetentionAuthorityResult(value.result);
+    case "authority.privacy-data-result":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isPrivacyDataAuthorityResult(value.result);
     case "authority.legacy-imported":
       return (
         hasExactKeys(value, [

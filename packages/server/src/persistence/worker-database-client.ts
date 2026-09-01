@@ -81,6 +81,16 @@ import type {
   Ft07AgentSettingsClientFrame,
   Ft07AgentSettingsServerFrame,
 } from "../ft07-agent-settings-protocol.js";
+import type {
+  HostedRetentionBatchPort,
+  HostedRetentionBatchResult,
+} from "../privacy-operations/operations-runtime.js";
+import { isPrivacyRetentionRunBatchOperation } from
+  "../privacy-operations/retention-authority-protocol.js";
+import type {
+  PrivacyDataAuthorityOperation,
+  PrivacyDataAuthorityResult,
+} from "../privacy-operations/data-authority-protocol.js";
 import {
   toAgentMessageWorkerContext,
   type InternalAgentMessageCommitContext,
@@ -88,6 +98,10 @@ import {
 import type { RuntimeAuthorityOperation } from "../agent-runtime/runtime-authority-protocol.js";
 import type { RouteAuthorityOperation } from "../route-runtime/route-authority-protocol.js";
 import type { MemoryAuthorityOperation } from "../room-memory/authority-protocol.js";
+import type {
+  NotificationAuthorityOperation,
+  NotificationAuthorityResult,
+} from "../notifications/authority-protocol.js";
 import type {
   BallAuthorityOperation,
   BallDeadlinePolicy,
@@ -122,7 +136,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 27;
+  readonly version: 29;
 }
 
 export interface WorkerDatabaseClient {
@@ -325,6 +339,9 @@ export interface WorkerDatabaseClient {
   executeBall(operation: BallAuthorityOperation): Promise<unknown>;
   executeMemory(operation: MemoryAuthorityOperation): Promise<unknown>;
   executeProjectLoop(operation: ProjectLoopAuthorityOperation): Promise<ProjectLoopAuthorityResult>;
+  executeNotification(
+    operation: NotificationAuthorityOperation,
+  ): Promise<NotificationAuthorityResult>;
   executeTenantAdministration(
     operation: TenantAdministrationOperation,
   ): Promise<TenantAdministrationResult>;
@@ -341,6 +358,12 @@ export interface ContextAuthorityWorkerDatabaseClient {
   executeContext(operation: ContextWorkerOperation): Promise<unknown>;
 }
 
+export type PrivacyRetentionWorkerDatabaseClient = HostedRetentionBatchPort;
+
+export interface PrivacyDataAuthorityWorkerDatabaseClient {
+  executePrivacyData(operation: PrivacyDataAuthorityOperation): Promise<PrivacyDataAuthorityResult>;
+}
+
 export interface RuntimeDeliveryBarrierWorkerDatabaseClient {
   /**
    * Runs the authority read and a synchronous local delivery continuation in
@@ -355,7 +378,8 @@ export interface RuntimeDeliveryBarrierWorkerDatabaseClient {
 
 export type CompleteWorkerDatabaseClient = WorkerDatabaseClient &
   MessageAuthorityWorkerDatabaseClient & ContextAuthorityWorkerDatabaseClient &
-  RuntimeDeliveryBarrierWorkerDatabaseClient;
+  RuntimeDeliveryBarrierWorkerDatabaseClient & PrivacyRetentionWorkerDatabaseClient &
+  PrivacyDataAuthorityWorkerDatabaseClient;
 
 export interface AuthorityWorkerTransport {
   postMessage(message: AuthorityWorkerRequest): void;
@@ -1662,6 +1686,71 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
     });
   }
 
+  executeNotification(operation: NotificationAuthorityOperation): Promise<NotificationAuthorityResult> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.notification", operation }).then((response) => {
+      if (response.type !== "authority.notification-result") {
+        this.#failProtocol("Authority worker returned the wrong Notification response");
+        throw this.#terminalError;
+      }
+      return response.result;
+    });
+  }
+
+  runBatch(input: Parameters<HostedRetentionBatchPort["runBatch"]>[0]): Promise<HostedRetentionBatchResult> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    if (input.signal.aborted) {
+      return Promise.reject(new AuthorityWorkerClientError(
+        "storage_unavailable",
+        "Authority privacy retention batch was cancelled",
+      ));
+    }
+    const operation = {
+      version: 1 as const,
+      type: "privacy.retention.run-batch" as const,
+      trigger: input.trigger,
+      now: input.nowMs,
+      limit: input.limit,
+    };
+    if (input.workerId !== "retention_janitor" ||
+        !isPrivacyRetentionRunBatchOperation(operation)) {
+      return Promise.reject(new TypeError("Privacy retention batch input is invalid"));
+    }
+    return this.#send({ type: "authority.privacy-retention", operation }).then((response) => {
+      if (response.type !== "authority.privacy-retention-result") {
+        this.#failProtocol("Authority worker returned the wrong privacy retention response");
+        throw this.#terminalError;
+      }
+      return Object.freeze({
+        processed: response.result.processed,
+        purged: response.result.purged,
+        retained: response.result.retained,
+        retried: response.result.retried,
+        deadLettered: response.result.deadLettered,
+        hasMore: response.result.hasMore,
+        queueDepth: response.result.queueDepth,
+        oldestAgeMs: response.result.oldestAgeMs,
+      });
+    });
+  }
+
+  executePrivacyData(operation: PrivacyDataAuthorityOperation): Promise<PrivacyDataAuthorityResult> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.privacy-data", operation }).then((response) => {
+      if (response.type !== "authority.privacy-data-result") {
+        this.#failProtocol("Authority worker returned the wrong privacy data response");
+        throw this.#terminalError;
+      }
+      return response.result;
+    });
+  }
+
   readHistory(
     context: AuthenticatedSessionContext,
     roomId: string,
@@ -2288,6 +2377,12 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
         responseType === "authority.memory-result") ||
       (requestType === "authority.project-loop" &&
         responseType === "authority.project-loop-result") ||
+      (requestType === "authority.notification" &&
+        responseType === "authority.notification-result") ||
+      (requestType === "authority.privacy-retention" &&
+        responseType === "authority.privacy-retention-result") ||
+      (requestType === "authority.privacy-data" &&
+        responseType === "authority.privacy-data-result") ||
       (requestType === "authority.read-history" &&
         responseType === "authority.history") ||
       (requestType === "authority.read-actor" && responseType === "authority.actor") ||

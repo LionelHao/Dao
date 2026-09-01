@@ -188,6 +188,35 @@ describe("encrypted Desktop authority generation store", () => {
     store.close();
   });
 
+  it("commits identity event ledger and notification record in the existing encrypted Room generation", async () => {
+    const { databasePath, store } = await fixture();
+    install(store, { snapshotId: "room-repair", watermark: 9, records: oldRecords });
+    store.establishIdentityCursor(4);
+    expect(store.advanceIdentityCursor({ eventId: "room-access-event-5", streamSeq: 5 }))
+      .toBe("applied");
+    expect(store.advanceIdentityCursor({ eventId: "room-access-event-5", streamSeq: 5 }))
+      .toBe("replayed");
+    const notification = { identity: "notification\0notification-1", value: {
+      kind: "notification", value: { notificationId: "notification-1", readRevision: 1 },
+    } };
+    expect(store.applyIdentityEvent({ roomId: "room-secret",
+      event: { eventId: "identity-event-6", streamSeq: 6 }, upsert: notification })).toBe("applied");
+    expect(store.applyIdentityEvent({ roomId: "room-secret",
+      event: { eventId: "identity-event-6", streamSeq: 6 }, upsert: notification })).toBe("replayed");
+    expect(() => store.applyIdentityEvent({ roomId: "room-secret",
+      event: { eventId: "identity-event-8", streamSeq: 8 },
+      deleteIdentity: "notification\0notification-1" })).toThrow("Identity event stream has a gap");
+    expect(store.readActiveRoom("room-secret")).toMatchObject({
+      cursor: { afterSeq: 9 }, records: [...oldRecords, notification],
+    });
+    store.close();
+    const reopened = createEncryptedAuthorityGenerationStore({
+      databasePath, accountId: "account-secret", encryption: wrapping,
+    });
+    expect(reopened.readActiveRoom("room-secret")?.records).toEqual([...oldRecords, notification]);
+    reopened.close();
+  });
+
   it("atomically replaces an active generation when a valid repair repeats the same snapshot", async () => {
     const { store } = await fixture();
     install(store, { snapshotId: "same-fixed-snapshot", watermark: 9, records: oldRecords });

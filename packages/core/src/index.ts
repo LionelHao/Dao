@@ -2,6 +2,7 @@ export type ActorKind = "human" | "agent";
 
 export * from "./project-loop.js";
 export * from "./tool-safety.js";
+export * from "./notification.js";
 
 export type HumanReachability = "online" | "dnd" | "offline";
 export type AgentReadiness = "ready" | "busy" | "paused" | "noauth";
@@ -739,6 +740,18 @@ export {
   isContextCompilerInputV1,
   isContextManifestV1,
 } from "./context-compiler.js";
+export {
+  isRoomExportTransportFrameType,
+  isRoomExportTransportServerFrame,
+  parseRoomExportTransportClientFrame,
+  ROOM_EXPORT_TRANSPORT_MAX_CHUNK_BYTES,
+  ROOM_EXPORT_TRANSPORT_MAX_STREAMS_PER_CONNECTION,
+} from "./room-export-transport.js";
+export type {
+  RoomExportTransportClientFrame,
+  RoomExportTransportServerFrame,
+} from "./room-export-transport.js";
+export * from "./diagnostics-transport.js";
 export type {
   CompiledContextEnvelopeV1,
   CompiledContextGroupItemV1,

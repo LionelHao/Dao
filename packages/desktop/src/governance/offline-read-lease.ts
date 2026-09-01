@@ -8,6 +8,8 @@ export type DesktopOfflineReadLeaseReason =
   | "bad_signature"
   | "not_yet_valid"
   | "expired"
+  | "key_issuance_cutoff"
+  | "key_verification_cutoff"
   | "binding_mismatch"
   | "generation_mismatch"
   | "invalid_clock";
@@ -159,8 +161,19 @@ function bindingMatches(
 
 export function createDesktopOfflineReadLeaseVerifier(options: Readonly<{
   verificationKeys: ReadonlyMap<string, KeyObject>;
+  previousKeyWindows?: ReadonlyMap<string, Readonly<{
+    issuanceCutoffMs: number;
+    verificationCutoffMs: number;
+  }>>;
   now?: () => number;
 }>): DesktopOfflineReadLeaseVerifier {
+  for (const [keyId, window] of options.previousKeyWindows ?? []) {
+    if (!options.verificationKeys.has(keyId) || !nonnegativeInteger(window.issuanceCutoffMs) ||
+        !nonnegativeInteger(window.verificationCutoffMs) ||
+        window.verificationCutoffMs <= window.issuanceCutoffMs) {
+      throw new TypeError("Desktop OfflineReadLease previous-key window is invalid");
+    }
+  }
   const now = options.now ?? Date.now;
   const verify = (
     token: string,
@@ -194,6 +207,15 @@ export function createDesktopOfflineReadLeaseVerifier(options: Readonly<{
         !verifySignature(null, Buffer.from(text), key, signature)) reject("bad_signature");
     const instant = now();
     if (!nonnegativeInteger(instant)) reject("invalid_clock");
+    const previousWindow = options.previousKeyWindows?.get(value.keyId);
+    if (previousWindow !== undefined) {
+      if (value.issuedAtMs >= previousWindow.issuanceCutoffMs) {
+        reject("key_issuance_cutoff");
+      }
+      if (instant >= previousWindow.verificationCutoffMs) {
+        reject("key_verification_cutoff");
+      }
+    }
     if (instant < value.notBeforeMs) reject("not_yet_valid");
     if (instant >= value.expiresAtMs) reject("expired");
     if (!bindingMatches(value, expected)) reject("binding_mismatch");

@@ -22,8 +22,17 @@ import {
   type OpenAIMemoryStewardProviderConfig,
   type RoomMemoryKind,
 } from "./contracts.js";
+import { encodeNoRetentionOpenAIRequest } from "../privacy-operations/provider-security-policy.js";
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+async function cancelRejectedResponse(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Rejection remains closed even when the provider body cannot be cancelled.
+  }
+}
 
 export interface OpenAIMemoryStewardProviderOptions extends OpenAIMemoryStewardProviderConfig {
   /** Deep unit-test seam only. Production composition must leave this unset. */
@@ -486,28 +495,37 @@ export function createOpenAIMemoryStewardProvider(
             content: source.content,
           })),
         };
-        const requestBody = JSON.stringify({
-          model,
-          store: false,
-          input: [{
-            role: "user",
-            content: [{
-              type: "input_text",
-              text: "Return only schemaVersion 1 room-memory candidates supported by the supplied frozen sources. " +
-                "Never return authority, confirmer, tool, path, URL, secret, or reasoning fields. " +
-                `Frozen batch:\n${JSON.stringify(promptInput)}`,
-            }],
-          }],
-          text: {
-            format: {
-              type: "json_schema",
-              name: "room_memory_steward_plan_v1",
-              strict: true,
-              schema: responseSchema(frozenSources),
+        let requestBody: string;
+        try {
+          requestBody = encodeNoRetentionOpenAIRequest({
+            adapterId: "openai-memory-steward",
+            modelId: model,
+            maxBytes: MEMORY_STEWARD_MAX_REQUEST_BYTES,
+            body: {
+              model,
+              store: false,
+              input: [{
+                role: "user",
+                content: [{
+                  type: "input_text",
+                  text: "Return only schemaVersion 1 room-memory candidates supported by the supplied frozen sources. " +
+                    "Never return authority, confirmer, tool, path, URL, secret, or reasoning fields. " +
+                    `Frozen batch:\n${JSON.stringify(promptInput)}`,
+                }],
+              }],
+              text: {
+                format: {
+                  type: "json_schema",
+                  name: "room_memory_steward_plan_v1",
+                  strict: true,
+                  schema: responseSchema(frozenSources),
+                },
+              },
             },
-          },
-        });
-        if (byteLength(requestBody) > MEMORY_STEWARD_MAX_REQUEST_BYTES) invalidInput();
+          });
+        } catch {
+          invalidInput();
+        }
         throwIfAborted(signal);
 
         let response: Response;
@@ -532,9 +550,13 @@ export function createOpenAIMemoryStewardProvider(
             "Memory provider request could not be completed",
           );
         }
-        if (!response.ok) throw closedHttpError(response.status);
+        if (!response.ok) {
+          await cancelRejectedResponse(response);
+          throw closedHttpError(response.status);
+        }
         const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
         if (contentType !== "application/json") {
+          await cancelRejectedResponse(response);
           throw new MemoryStewardProviderError(
             "provider_malformed",
             "Memory provider response content type was rejected",

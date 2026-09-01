@@ -250,7 +250,7 @@ describe("authority SQLite v16 Message Authority", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion16ForTest(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(27);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(29);
       expect(AUTHORITY_V16_STATEMENT_COUNT_FOR_TEST).toBe(82);
       expect(readSchemaVersion(database)).toBe(16);
       for (const [table, columns] of Object.entries(V16_TABLE_COLUMNS)) {

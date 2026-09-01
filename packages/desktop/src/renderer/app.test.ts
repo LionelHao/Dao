@@ -468,6 +468,63 @@ describe("room governance projection", () => {
 });
 
 describe("live closed Governance surface", () => {
+  it("lets only the online owner explicitly save through the closed native Room export bridge", async () => {
+    const root = document.createElement("main");
+    document.body.append(root);
+    const projection = {
+      roomId: "room-1", projectId: "room-1", roomName: "Alpha", lifecycle: "archived" as const,
+      governanceRevision: 8, archiveGeneration: 1, ownerActorId: "owner-1",
+      archivedAt: "2026-08-19T08:00:00.000Z",
+      members: [
+        { kind: "human" as const, actorId: "owner-1", displayName: "Owner", role: "member" as const },
+        { kind: "human" as const, actorId: "member-1", displayName: "Member", role: "member" as const },
+      ],
+    };
+    const ready: GovernanceRemoteState = {
+      status: "ready", projection, viewerActorId: "owner-1",
+      connection: { status: "online" }, operation: { status: "idle" },
+    };
+    let listener: ((state: { readonly roomId: string; readonly state: GovernanceRemoteState }) => void) | undefined;
+    const bridge: GovernanceBridge = {
+      clearCache: vi.fn(async () => ready),
+      getSurface: vi.fn(async () => ready),
+      getDepartureConflicts: vi.fn(),
+      submit: vi.fn(),
+      onStateChanged(callback) { listener = callback; return vi.fn(); },
+    };
+    const save = vi.fn(async () => ({ status: "saved" as const, roomId: "room-1" }));
+    const dispose = importedApp.mountGovernanceSurface(root, bridge, {
+      roomId: "room-1", reducedMotion: true, onNavigateConflictResolution: vi.fn(),
+      roomExport: { save },
+    });
+
+    await vi.waitFor(() => expect(root.querySelector("[data-room-export-control]"))
+      .not.toBeNull());
+    const control = root.querySelector<HTMLButtonElement>("[data-action='save-room-export']")!;
+    expect(control.textContent).toContain("浏览 / 导出");
+    control.click();
+    await vi.waitFor(() => expect(save).toHaveBeenCalledWith({ roomId: "room-1" }));
+    await vi.waitFor(() => expect(root.querySelector("[data-room-export-status='saved']")?.textContent)
+      .toContain("已保存"));
+    expect(document.activeElement).toBe(root.querySelector("[data-room-export-status='saved']"));
+
+    listener?.({ roomId: "room-1", state: {
+      ...ready, connection: {
+        status: "offline", asOf: "2026-09-01T00:00:00.000Z",
+        leaseExpiresAt: "2026-09-01T08:00:00.000Z",
+      },
+    } });
+    const offline = root.querySelector<HTMLButtonElement>("[data-action='save-room-export']")!;
+    expect(offline.disabled).toBe(true);
+    offline.click();
+    expect(save).toHaveBeenCalledTimes(1);
+
+    listener?.({ roomId: "room-1", state: { ...ready, viewerActorId: "member-1" } });
+    expect(root.querySelector("[data-room-export-control]")).toBeNull();
+    dispose();
+    root.remove();
+  });
+
   it("renders submit/ACK/event projection convergence, final conflicts, and redacted revoke", async () => {
     const root = document.createElement("main");
     document.body.append(root);

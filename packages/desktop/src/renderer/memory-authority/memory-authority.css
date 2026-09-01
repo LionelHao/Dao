@@ -1,4 +1,5 @@
 .room-authority-workspace {
+  position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem);
   gap: 1rem;

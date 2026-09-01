@@ -14,6 +14,7 @@ import {
   isHumanPreemptionNotice,
   isLightTask,
   isMessageAuthorityEvent,
+  isNotificationStableEvent,
   isRoomCursor,
   isRoomGovernanceView,
   isRoomMemoryEvent,
@@ -792,6 +793,11 @@ type PersistedAttachmentPrivateStatusEvent = PersistedIdentityEvent & {
   readonly type: "attachment.private.status-changed";
 };
 
+type PersistedNotificationEvent = PersistedIdentityEvent & {
+  readonly type: "notification.created" | "notification.read" |
+    "notification.handled" | "notification.revoked";
+};
+
 export type OutboxDelivery =
   | (OutboxDeliveryBase & {
       readonly targetKind: "room";
@@ -799,7 +805,8 @@ export type OutboxDelivery =
     })
   | (OutboxDeliveryBase & {
       readonly targetKind: "principal";
-      readonly event: PersistedRoomAccessChangedEvent | PersistedAttachmentPrivateStatusEvent;
+      readonly event: PersistedRoomAccessChangedEvent | PersistedAttachmentPrivateStatusEvent |
+        PersistedNotificationEvent;
     })
   | (OutboxDeliveryBase & {
       readonly targetKind: "session-family";
@@ -1330,6 +1337,9 @@ function validIdentityEventPayload(type: unknown, payload: UnknownRecord): boole
 export function parsePersistedIdentityEvent(
   value: unknown,
 ): ContractParseResult<PersistedIdentityEvent, "invalid_event"> {
+  if (isNotificationStableEvent(value)) {
+    return { ok: true, value };
+  }
   if (isRecord(value) && value.streamKind === "identity" &&
       isAttachmentPrivateEvent({ ...value, streamKind: "principal" })) {
     return { ok: true, value: value as unknown as PersistedIdentityEvent };

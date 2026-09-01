@@ -54,6 +54,7 @@
 .agent-settings-human-path,
 .agent-settings-profile-path,
 .agent-settings-assignment-path,
+.agent-settings-diagnostics,
 .agent-profile-card,
 .agent-assignment-card,
 .agent-settings-error,
@@ -88,6 +89,11 @@
 .agent-settings-provider {
   border-color: #84adff;
   background: #eef4ff;
+}
+
+.agent-settings-diagnostics {
+  border-style: dashed;
+  background: #f8fafc;
 }
 
 .agent-settings-field {

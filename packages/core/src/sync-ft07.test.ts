@@ -48,14 +48,20 @@ const assignment = Object.freeze({
   updatedAt: "2026-08-24T01:00:00.000Z",
 });
 
+const provider = Object.freeze({
+  providerId: "openai",
+  modelId: "gpt-5",
+  credentialReadiness: "ready" as const,
+  retentionDisabled: true as const,
+  selectionPolicy: "server-managed-single" as const,
+  disclosureRevision: 1,
+  disclosedAt: "2026-08-24T00:00:00.000Z",
+});
+
 describe("FT-07 sync projections", () => {
   it("accepts exact Profile, provider, Assignment and deployment event projections", () => {
     expect(isAgentProfileProjection(profile)).toBe(true);
-    expect(isDeploymentProviderDisclosure({
-      providerId: "openai",
-      modelId: "gpt-5",
-      credentialReadiness: "ready",
-    })).toBe(true);
+    expect(isDeploymentProviderDisclosure(provider)).toBe(true);
     expect(isRoomAgentAssignmentProjection(assignment, "room-1")).toBe(true);
     expect(isPersistedDeploymentAgentProfileEvent({
       eventId: "event-1",
@@ -67,6 +73,19 @@ describe("FT-07 sync projections", () => {
       type: "agent-profile.updated",
       payload: { catalogRevision: 9, profile },
     })).toBe(true);
+  });
+
+  it.each([
+    { ...provider, retentionDisabled: false },
+    { ...provider, selectionPolicy: "fallback-enabled" },
+    { ...provider, disclosureRevision: 0 },
+    { ...provider, disclosureRevision: 1.5 },
+    { ...provider, disclosedAt: "2026-08-24T00:00:00Z" },
+    { ...provider, disclosedAt: "not-a-time" },
+    { ...provider, credentialGeneration: 3 },
+    { ...provider, keyVersion: "provider-key-v3" },
+  ])("rejects non-authoritative, non-canonical, or secret-adjacent Provider disclosure %#", (candidate) => {
+    expect(isDeploymentProviderDisclosure(candidate)).toBe(false);
   });
 
   it.each([
@@ -94,9 +113,7 @@ describe("FT-07 sync projections", () => {
       watermark: 0,
       roomRevision: 5,
       assignments: [assignment],
-      provider: {
-        providerId: "openai", modelId: "gpt-5", credentialReadiness: "ready",
-      },
+      provider,
     })).toBe(false);
   });
 
@@ -106,18 +123,14 @@ describe("FT-07 sync projections", () => {
       requestId: "repair-deployment",
       watermark: 9,
       profiles: [profile],
-      provider: {
-        providerId: "openai", modelId: "gpt-5", credentialReadiness: "noauth",
-      },
+      provider: { ...provider, credentialReadiness: "noauth" },
     })).toBe(true);
     expect(isDeploymentAgentProfileRepairSnapshot({
       type: "agent-profile.repair.snapshot",
       requestId: "repair-deployment",
       watermark: 9,
       profiles: [{ ...profile, roomId: "room-secret" }],
-      provider: {
-        providerId: "openai", modelId: "gpt-5", credentialReadiness: "ready",
-      },
+      provider,
     })).toBe(false);
   });
 

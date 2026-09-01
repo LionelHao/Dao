@@ -32,6 +32,10 @@ describe("FT-07 scoped projection sync", () => {
     providerId: "openai",
     modelId: "gpt-5",
     credentialReadiness: "ready",
+    retentionDisabled: true,
+    selectionPolicy: "server-managed-single",
+    disclosureRevision: 1,
+    disclosedAt: "2026-08-24T00:00:00.000Z",
   } as const;
 
   it("passes current session context to the deployment and Room authority projection port", async () => {
@@ -972,7 +976,7 @@ describe("permission-aware retained room sync", () => {
       ).get(),
     }).toEqual(before);
     database.close();
-    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 27 });
+    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 29 });
     const context = fixture.contexts[0];
     if (context === undefined) throw new Error("missing fixture context");
     await expect(fixture.sync.syncRoom(

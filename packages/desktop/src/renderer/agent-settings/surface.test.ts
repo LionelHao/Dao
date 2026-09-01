@@ -75,6 +75,30 @@ describe("FT-07 J-01/J-03/J-05 Agent Settings surface", () => {
     expect(root.textContent).not.toContain("BYOK");
   });
 
+  it("shows the no-content diagnostics action only to the Tenant Administrator projection", () => {
+    const root = document.createElement("main");
+    const save = vi.fn();
+    renderAgentSettingsSurface(root, ready(), {
+      onIntent: vi.fn(), onRecover: vi.fn(), onClose: vi.fn(),
+      diagnostics: { state: { status: "idle", disabled: false, ariaLive: "off",
+        announcement: "" }, save },
+    });
+    const action = root.querySelector<HTMLButtonElement>("[data-action='export-diagnostics']");
+    expect(action?.textContent).toContain("导出无正文诊断包");
+    expect(root.querySelector("[data-settings-section='privacy-diagnostics']")?.textContent)
+      .toContain("不含 Room 正文");
+    action?.click();
+    expect(save).toHaveBeenCalledOnce();
+
+    renderAgentSettingsSurface(root, ready({ viewer: {
+      actorId: "human-owner", tenantAdministrator: false, roomRole: "owner",
+    } }), { onIntent: vi.fn(), onRecover: vi.fn(), onClose: vi.fn(),
+      diagnostics: { state: { status: "idle", disabled: false, ariaLive: "off",
+        announcement: "" }, save },
+    });
+    expect(root.querySelector("[data-action='export-diagnostics']")).toBeNull();
+  });
+
   it("emits closed mutation intent but never changes visible stable facts synchronously", () => {
     const root = document.createElement("main");
     const intents: AgentSettingsMutationIntent[] = [];

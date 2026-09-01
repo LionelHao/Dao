@@ -2,14 +2,25 @@ import type { AgentSettingsBridge } from "../../agent-profile-routing/contracts.
 import { applyAgentSettingsAuthorityMessage, beginAgentSettingsMutation,
   createAgentSettingsInitialState, createAgentSettingsViewModel } from "./view-model.js";
 import { renderAgentSettingsSurface } from "./surface.js";
+import { createDiagnosticsActionModel } from "../../diagnostics/action-model.js";
+import type { DiagnosticsBridge } from "../../diagnostics/contracts.js";
 
 export function mountAgentSettingsBridgeSurface(root: HTMLElement, bridge: AgentSettingsBridge,
-  roomId: string, options: { reducedMotion: boolean; onClose(): void }): () => void {
+  roomId: string, options: { reducedMotion: boolean; onClose(): void;
+    diagnostics?: DiagnosticsBridge }): () => void {
   let state = createAgentSettingsInitialState(options.reducedMotion);
   let disposed = false;
+  const diagnostics = options.diagnostics === undefined
+    ? undefined : createDiagnosticsActionModel(options.diagnostics);
   const render = () => renderAgentSettingsSurface(root, createAgentSettingsViewModel(state), {
     onClose: options.onClose,
     onRecover: () => { void load(); },
+    ...(diagnostics === undefined ? {} : {
+      diagnostics: {
+        state: diagnostics.getState(),
+        save: () => { void diagnostics.save(); },
+      },
+    }),
     onIntent(intent) {
       if (state.operation.status === "submitting" || state.operation.status === "acknowledged") return;
       const requestId = `agent-settings-renderer-${crypto.randomUUID()}`;
@@ -38,6 +49,9 @@ export function mountAgentSettingsBridgeSurface(root: HTMLElement, bridge: Agent
   const unsubscribe = bridge.onAuthorityMessage((message) => {
     if (!disposed) { state = applyAgentSettingsAuthorityMessage(state, message); render(); }
   });
+  const unsubscribeDiagnostics = diagnostics?.subscribe(() => {
+    if (!disposed) render();
+  });
   render(); void load();
-  return () => { disposed = true; unsubscribe(); };
+  return () => { disposed = true; unsubscribe(); unsubscribeDiagnostics?.(); };
 }

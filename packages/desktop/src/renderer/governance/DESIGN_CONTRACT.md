@@ -10,6 +10,7 @@
 | 角色与唯一 owner | `REQ-ROOM-002`、`REQ-PRIM-005`、`REQ-UX-005`；FT-02B/FT-16；Settings drawer / Governance | owner/admin/member 使用文本标签；owner 管理 admin/member/普通 Agent；admin 只能管理 member/普通 Agent，不能管理 owner/peer admin；member 治理区只读。 |
 | 离群责任门 | `REQ-ROOM-003`、`REQ-ID-005`；FT-02B/FT-09 seam；正式设计 J-04 的 Request 接受/转交语义、Settings 的 Departure conflict sheet | preflight 仅用于展示；final `409 departure_blocked` 必须替换陈旧清单。分组覆盖 Request、NextAction、Blocker/OpenQuestion、pending acceptance、pending verification、pending confirmation，只显示安全 summary/source 与 server-supplied closed resolution。 |
 | archive / reopen | `REQ-ROOM-004`、`REQ-NFR-012`、`REQ-NFR-014`、`REQ-PRIM-005`；FT-02C；PRD J-07、状态分支「归档 Room」 | archive 有明确确认；archived banner 持续显示 archive time；history/attachment/project fact/audit 可读；composer/project mutation/Agent 业务控制禁用并解释；owner/admin 可重开。 |
+| owner Room 完整导出 | `REQ-MSG-006`、`REQ-NFR-012`、`REQ-NFR-013`；FT-14；J-07 archived「浏览 / 导出」与 Settings export | active/archived 均只向当前 owner 显示“浏览 / 导出”；renderer 只提交 roomId，服务端 begin 固定 watermark 并逐页重验 exact session、owner、membership、lifecycle/access revision；native main 决定保存路径。与 Tenant Administrator diagnostics 完全分离。设计偏离：无。 |
 | Room list 与启动 | `REQ-UX-003`、`REQ-UX-006`、`REQ-ID-003`、`REQ-ID-005`；FT-11 narrow seam / FT-13；正式设计 J-01 | active/archived catalog 状态来自 projection；启动、撤权、fatal 前不显示未授权 Room。此 feature-local 组件只定义 selected Room 的治理表面，Room list 仍由 FT-11 集成 owner 负责。 |
 | 异步权威收敛 | `REQ-UX-007`、`REQ-NFR-002`、`REQ-NFR-010`；FT-02B/02C/11/13 | local 只可产生 dialog、输入、选择和 `submitting`；匹配 requestId 的 ACK 进入 acknowledged；stable event / projection 才改变 role、revision、membership、active/archived。callback 返回不代表成功。 |
 | offline / repair / revoke | `REQ-NFR-003`、`REQ-NFR-004`、`REQ-NFR-007`、`REQ-NFR-008`、`REQ-NFR-011`；FT-13；正式设计 J-07 | offline 与 repair 只读旧完整 projection、mutation 为零调用；repair failed 保留旧 generation并提供重试；revoked 立即锁 UI、清 cache 后不显示 Room 名称或内容。 |
@@ -24,6 +25,7 @@
 | accepted / closed error | server ACK，必须匹配当前 requestId / command | ACK 不等于所有客户端已收敛，也不允许提前移除 member 或切换 active/archived。 |
 | membership / lifecycle transition | stable event，按 eventId/stream sequence 去重 | 重复或迟到 event 不重复 banner、purge 或重开。 |
 | 最终 owner/role/revision/lifecycle/archive time/repair generation | projection / atomic cache generation | repair 未 complete 前不展示半个新 generation；cache 不是事实源。 |
+| export saving / saved / cancelled / failed | saving 为 local transient；bytes 为固定 watermark server stream；saved 只在本地 checksum/记录数/manifest、fsync 与 atomic rename 后出现 | ACK/open 不等于成功保存；renderer 不持有 token、artifact bytes、任意路径或 generic fs。 |
 
 ## 错误与恢复
 
@@ -38,6 +40,7 @@
 | 503 | 保留旧完整 view 与输入；明确 dependency/service unavailable 后显式重试。 |
 | offline | 只读有效 lease 下的完整 cache；所有 mutation 零调用、无 outbox、无 local ACK。 |
 | repair / repair failed | staging 不可见；成功后一次 atomic flip；失败保留旧 generation并提供明确重试。 |
+| export 401/403/409/410/429/503 | 认证、owner/access drift、stream conflict/gone、capacity/timeout/storage 使用闭合文案并终结 spinner；保留稳定治理 projection，显式重新认证、刷新权限、重新导出或稍后重试。 |
 
 ## 后续 shared bridge / API 需求
 

@@ -12,6 +12,7 @@
 | 权限主体 | `REQ-ID-004`、`REQ-UX-005`；FT-01/02/07 | Tenant Administrator 才可修改 Profile，但不会因此获得 Room role/read；Room owner/admin 才可修改 Assignment；member 只读。 |
 | 工具 / capability | `REQ-AGT-003`、`REQ-AGT-004`；J-05 / Settings | 展示 Profile ceiling、Assignment subset 与 effective subset；guard 拒绝越界、重复、乱序和未知 ID。on-mention 的 direct invocation 不缩减 Assignment 内有效权限。 |
 | Provider 披露 | `REQ-NFR-006`；J-01 invitation disclosure / Settings | 只读显示单 Provider、单模型、credential readiness 与 retention-disabled；无选择器、无客户端 key 字段、无 fallback。 |
+| 无正文诊断导出 | `REQ-NFR-009`、`REQ-NFR-013`；FT-14；J-01 fatal 与 Settings/J-07 状态分支 | 仅 Tenant Administrator projection 显示“导出无正文诊断包”；renderer 只提交无参数意图，main 使用同一认证 WS 生成闭合 NDJSON，并由原生 save dialog 决定路径。Room owner export 保持独立按钮、权限与字节路径。设计偏离：无。 |
 | 稳定收敛 | `REQ-UX-005`、`REQ-NFR-002`、`REQ-NFR-010`；J-01/J-03/J-07 | local submit 只进入 `submitting`；匹配 ACK 只进入 `acknowledged`；匹配 stable event 才更新 Profile/Assignment 并进入 `succeeded`。同步 callback 不产生成功事实。 |
 | 恢复 | `REQ-NFR-003/004/007/008/011`；FT-13；J-07 | offline、repairing、repair-failed 保留上一份完整授权 projection 且写锁定；repair completed 在固定 watermark 原子替换；revoked 立即清 Profile/Assignment。 |
 | 可访问性 | `REQ-UX-009`；FT-16 | native label/input/select/button；唯一克制 `aria-live=polite`；错误摘要/撤权恢复可聚焦；状态不只靠颜色；840×560 重排、桌面 200% zoom、可见 focus ring、reduced motion。 |
@@ -25,6 +26,7 @@
 | Profile/Assignment 改名、职责、participation、pause/remove | stable event，按 `eventId/cursor` 去重 | displayName 不作路由 ID；迟到/重复 event 不倒退 projection。 |
 | loading / empty / room lifecycle / availability / Provider/model | atomic snapshot projection | 不用本地 callback、静态 catalog 或旧 actor readiness 伪造事实。 |
 | offline / repair / revoked | connection/repair/access projection | repair staging 不展示；revoked 后不显示 Room 名称、Profile 或 Assignment。 |
+| diagnostics saving / saved / cancelled / failed | saving 为 local transient；内容与 manifest 来自 server response；saved 只在校验 checksum、fsync 与 atomic rename 后出现 | renderer 不持有 artifact bytes、filename、路径、token；403 以当前 Tenant Administrator 重验结果为准，429/503 不伪成功。 |
 
 ## 错误与恢复闭集
 
@@ -40,6 +42,7 @@
 | offline | 有效 lease 下只读完整 cache；mutation 在 bridge 前零调用，不进入离线队列。 |
 | repair / repair failed | 旧 generation 保持只读；成功后一次原子 flip；失败提供明确重试。 |
 | archived | Room 业务只读；只展示 Assignment pause/remove 等安全缩减，不允许 create/resume/扩大。 |
+| diagnostics 401/403/409/410/429/503 | 按闭合错误显示重新认证、权限撤销、重新生成、稍后重试或依赖不可用；按钮终结 saving，使用 `aria-live` 通告且不回显服务端文本。 |
 
 ## FT-11 production adapter seam
 
@@ -50,3 +53,4 @@
 - 订阅 Authority stable event 与 FT-13 repair/access 消息；renderer reducer 不连接 raw socket；
 - offline/repair/revoked 在 transport 前 fail closed；unsubscribe/shutdown 有界；
 - 关闭 drawer 后由 FT-11 host 将焦点归还「Room 设置」触发器，并在 drawer 内实现 Tab 圈定/Esc 关闭；Esc 不可绕过另行确认的 destructive dialog。
+- FT-14 diagnostics bridge 只能暴露无参数 `save()`；native main 校验 trusted main frame、每块 SHA-256/长度/canonical NDJSON，使用 `0600` 临时文件、fsync 与 atomic rename，取消/失败清理 partial。

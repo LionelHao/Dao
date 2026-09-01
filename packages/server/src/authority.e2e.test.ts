@@ -1431,7 +1431,7 @@ describe("authoritative server real-process harness", () => {
       server = await startAuthoritativeServerForTest({
         databasePath,
         snapshotCachePath: join(directory, "snapshot-cache.sqlite"),
-        sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
+        sharedAuthority: { maxOfflineReadLeaseMs: 300_000 },
         listen: { host: "127.0.0.1", port: 0 },
         actors,
         identities: {
@@ -1533,7 +1533,7 @@ describe("authoritative server real-process harness", () => {
       server = await startAuthoritativeServerForTest({
         databasePath,
         snapshotCachePath,
-        sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
+        sharedAuthority: { maxOfflineReadLeaseMs: 300_000 },
         listen: { host: "127.0.0.1", port: 0 },
         actors,
         identities,
@@ -3427,7 +3427,7 @@ describe("authoritative server real-process harness", () => {
     const serverOptions = {
       databasePath,
       snapshotCachePath,
-      sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
+      sharedAuthority: { maxOfflineReadLeaseMs: 300_000 },
       listen: { host: "127.0.0.1", port: 0 },
       actors,
       identities,

@@ -26,6 +26,7 @@ export class RepairProjectionRegistryError extends Error {
 export interface RepairKeysetPageInput {
   readonly database: DatabaseSync;
   readonly roomId: string;
+  readonly principalActorId?: string;
   readonly watermark: number;
   readonly afterKey: string | undefined;
   readonly limit: number;

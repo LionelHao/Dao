@@ -21,6 +21,8 @@ async function createClient(databasePath: string): Promise<CompleteWorkerDatabas
     databasePath,
     deploymentProviderDisclosure: {
       providerId: "openai-responses", modelId: "gpt-5", credentialReadiness: "noauth",
+      retentionDisabled: true, selectionPolicy: "server-managed-single",
+      disclosureRevision: 1, disclosedAt: "2026-08-24T00:00:00.000Z",
     },
   });
   clients.push(client);

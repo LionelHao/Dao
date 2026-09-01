@@ -72,6 +72,13 @@ import { runtimeResultAsJson } from "../agent-runtime/runtime-authority-protocol
 import { routeResultAsJson } from "../route-runtime/route-authority-protocol.js";
 import { memoryResultAsJson } from "../room-memory/authority-protocol.js";
 import { executeMemoryAuthorityOperation } from "../room-memory/authority-database-handler.js";
+import { executeNotificationAuthorityOperation } from "../notifications/database-authority.js";
+import { executePrivacyRetentionAuthorityOperation } from
+  "../privacy-operations/retention-database-handler.js";
+import {
+  executePrivacyDataAuthorityOperation,
+  PrivacyDataAuthorityError,
+} from "../privacy-operations/data-authority-database-handler.js";
 import {
   ContextSnapshotDatabaseError,
   contextSnapshotResultAsJson,
@@ -137,8 +144,11 @@ import { createSqliteHumanRequestMessageParticipant } from
   "../project-loop/message-human-request-participant.js";
 import { createDefaultHumanRequestProjectPayload } from
   "../project-loop/request-factory.js";
+import { createNotificationAwareHumanRequestParticipant } from
+  "../notifications/source-transaction-adapter.js";
 
-const humanRequestParticipant = createSqliteHumanRequestMessageParticipant({
+const humanRequestParticipant = createNotificationAwareHumanRequestParticipant({
+  delegate: createSqliteHumanRequestMessageParticipant({
   resolveCompanionPayload(binding) {
     return createDefaultHumanRequestProjectPayload({
       roomId: binding.roomId,
@@ -154,6 +164,7 @@ const humanRequestParticipant = createSqliteHumanRequestMessageParticipant({
       occurredAt,
     });
   },
+  }),
 });
 
 interface AuthorityWorkerData {
@@ -222,13 +233,28 @@ function isAuthorityWorkerData(value: unknown): value is AuthorityWorkerData {
   }
   if (record.deploymentProviderDisclosure !== undefined) {
     const disclosure = record.deploymentProviderDisclosure;
+    const disclosureKeys = typeof disclosure === "object" && disclosure !== null
+      ? Reflect.ownKeys(disclosure) : [];
+    const expectedDisclosureKeys = [
+      "credentialReadiness", "disclosedAt", "disclosureRevision", "modelId",
+      "providerId", "retentionDisabled", "selectionPolicy",
+    ];
     if (typeof disclosure !== "object" || disclosure === null || Array.isArray(disclosure) ||
-        Object.keys(disclosure).sort().join("\0") !==
-          ["credentialReadiness", "modelId", "providerId"].sort().join("\0") ||
+        disclosureKeys.length !== expectedDisclosureKeys.length ||
+        disclosureKeys.some((key) =>
+          typeof key !== "string" || !expectedDisclosureKeys.includes(key)) ||
         typeof (disclosure as Record<string, unknown>).providerId !== "string" ||
         typeof (disclosure as Record<string, unknown>).modelId !== "string" ||
         ((disclosure as Record<string, unknown>).credentialReadiness !== "ready" &&
-         (disclosure as Record<string, unknown>).credentialReadiness !== "noauth")) {
+         (disclosure as Record<string, unknown>).credentialReadiness !== "noauth") ||
+        (disclosure as Record<string, unknown>).retentionDisabled !== true ||
+        (disclosure as Record<string, unknown>).selectionPolicy !== "server-managed-single" ||
+        !Number.isSafeInteger((disclosure as Record<string, unknown>).disclosureRevision) ||
+        Number((disclosure as Record<string, unknown>).disclosureRevision) < 1 ||
+        typeof (disclosure as Record<string, unknown>).disclosedAt !== "string" ||
+        !Number.isFinite(Date.parse((disclosure as Record<string, unknown>).disclosedAt as string)) ||
+        new Date(Date.parse((disclosure as Record<string, unknown>).disclosedAt as string))
+          .toISOString() !== (disclosure as Record<string, unknown>).disclosedAt) {
       return false;
     }
   }
@@ -2772,6 +2798,94 @@ function executeProjectLoop(request: AuthorityWorkerRequest): void {
   }
 }
 
+function executeNotification(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.notification") {
+    throw new TypeError("executeNotification received the wrong request type");
+  }
+  try {
+    const result = executeNotificationAuthorityOperation(
+      requireAuthorityTransactionDatabase(),
+      request.operation,
+    );
+    respond({ type: "authority.notification-result", requestId: request.requestId, result });
+    const roomIds = result.kind === "created" || result.kind === "duplicate" ||
+        result.kind === "handled" || result.kind === "acknowledged"
+      ? [result.projection.roomId]
+      : result.kind === "read"
+        ? [result.ack.roomId]
+        : result.kind === "revoked" ? [request.operation.type === "notification.revoke-recipient"
+            ? request.operation.roomId : ""] : [];
+    if (roomIds.length > 0) {
+      const operationNow = request.operation.type === "notification.list" ||
+          request.operation.type === "notification.mark-read" ||
+          request.operation.type === "notification.resolve-source" ||
+          request.operation.type === "notification.acknowledge-tool-result" ||
+          request.operation.type === "notification.acknowledge-execution-result"
+        ? request.operation.now
+        : request.operation.type === "notification.create"
+          ? Date.parse(request.operation.fact.createdAt)
+          : request.operation.type === "notification.source-handled"
+            ? Date.parse(request.operation.occurredAt)
+            : request.operation.type === "notification.revoke-recipient"
+              ? Date.parse(request.operation.revokedAt)
+              : 0;
+      repairs.preemptAfterCommit({ roomIds, catalogPrincipalIds: [], familyIds: [],
+        code: "snapshot_stale", now: operationNow });
+    }
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    respondWithStorageFailure(request.requestId, error, "Authority notification operation failed");
+  }
+}
+
+function executePrivacyRetention(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.privacy-retention") {
+    throw new TypeError("executePrivacyRetention received the wrong request type");
+  }
+  try {
+    const result = runAuthorityImmediateTransaction(
+      requireAuthorityTransactionDatabase(),
+      () => executePrivacyRetentionAuthorityOperation(
+        requireAuthorityTransactionDatabase(),
+        request.operation,
+      ),
+    );
+    respond({
+      type: "authority.privacy-retention-result",
+      requestId: request.requestId,
+      result,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    respondWithStorageFailure(
+      request.requestId,
+      error,
+      "Authority privacy retention operation failed",
+    );
+  }
+}
+
+function executePrivacyData(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.privacy-data") {
+    throw new TypeError("executePrivacyData received the wrong request type");
+  }
+  try {
+    const database = requireAuthorityTransactionDatabase();
+    const result = runAuthorityImmediateTransaction(
+      database,
+      () => executePrivacyDataAuthorityOperation(database, request.operation),
+    );
+    respond({ type: "authority.privacy-data-result", requestId: request.requestId, result });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof PrivacyDataAuthorityError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithStorageFailure(request.requestId, error, "Authority privacy data operation failed");
+  }
+}
+
 function readHistory(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.read-history") {
     throw new TypeError("readHistory received the wrong request type");
@@ -3314,6 +3428,15 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.project-loop":
       executeProjectLoop(value);
+      return;
+    case "authority.notification":
+      executeNotification(value);
+      return;
+    case "authority.privacy-retention":
+      executePrivacyRetention(value);
+      return;
+    case "authority.privacy-data":
+      executePrivacyData(value);
       return;
     case "authority.read-history":
       readHistory(value);

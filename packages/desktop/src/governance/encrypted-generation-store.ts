@@ -98,6 +98,14 @@ export interface EncryptedAuthorityGenerationStore {
     eventId: string,
     streamSeq: number,
   ): "unseen" | "exact" | "conflict";
+  establishIdentityCursor(identityWatermark: number): void;
+  advanceIdentityCursor(event: EncryptedGenerationEvent): "applied" | "replayed";
+  applyIdentityEvent(input: Readonly<{
+    roomId: string;
+    event: EncryptedGenerationEvent;
+    upsert?: EncryptedGenerationRecord;
+    deleteIdentity?: string;
+  }>): "applied" | "replayed";
   writeOfflineLease(roomId: string, lease: unknown): void;
   readOfflineLease(roomId: string): unknown | undefined;
   clearOfflineLease(roomId: string): void;
@@ -184,6 +192,14 @@ const SCHEMA = `
     stream_seq INTEGER NOT NULL CHECK (stream_seq > 0),
     PRIMARY KEY (room_hash, event_hash),
     UNIQUE (room_hash, stream_seq)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS cache_identity_cursor (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    stream_seq INTEGER NOT NULL CHECK (stream_seq >= 0)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS cache_identity_event_ledger (
+    event_hash TEXT PRIMARY KEY,
+    stream_seq INTEGER NOT NULL UNIQUE CHECK (stream_seq > 0)
   ) STRICT;
   CREATE TABLE IF NOT EXISTS cache_offline_leases (
     room_hash TEXT PRIMARY KEY,
@@ -897,6 +913,139 @@ export function createEncryptedAuthorityGenerationStore(
         ? "exact"
         : "conflict";
     },
+    establishIdentityCursor(identityWatermark) {
+      requireOpen();
+      if (!nonnegativeSafeInteger(identityWatermark)) {
+        throw new EncryptedGenerationStoreError("bound_exceeded", "Identity watermark is invalid");
+      }
+      transaction(database, () => {
+        database.prepare(`
+          INSERT INTO cache_identity_cursor(singleton, stream_seq) VALUES (1, ?)
+          ON CONFLICT(singleton) DO UPDATE SET stream_seq = excluded.stream_seq
+        `).run(identityWatermark);
+        database.prepare("DELETE FROM cache_identity_event_ledger").run();
+      });
+    },
+    advanceIdentityCursor(event) {
+      requireOpen();
+      validateText(event.eventId, "eventId");
+      if (!positiveSafeInteger(event.streamSeq)) {
+        throw new EncryptedGenerationStoreError("invalid_generation", "Identity event is invalid");
+      }
+      const cursorRow = database.prepare(
+        "SELECT stream_seq FROM cache_identity_cursor WHERE singleton = 1",
+      ).get() as { stream_seq?: unknown } | undefined;
+      if (cursorRow === undefined) {
+        throw new EncryptedGenerationStoreError("repair_required",
+          "Identity projection has not been bootstrapped");
+      }
+      const cursor = count(cursorRow.stream_seq);
+      const hashedEvent = eventHash(event.eventId);
+      const byEvent = database.prepare(`
+        SELECT stream_seq FROM cache_identity_event_ledger WHERE event_hash = ?
+      `).get(hashedEvent) as { stream_seq?: unknown } | undefined;
+      const bySequence = database.prepare(`
+        SELECT event_hash FROM cache_identity_event_ledger WHERE stream_seq = ?
+      `).get(event.streamSeq) as { event_hash?: unknown } | undefined;
+      if (byEvent !== undefined && byEvent.stream_seq !== event.streamSeq ||
+          bySequence !== undefined && bySequence.event_hash !== hashedEvent) {
+        throw new EncryptedGenerationStoreError("repair_required", "Identity event ledger conflicted");
+      }
+      if (event.streamSeq <= cursor) return "replayed";
+      if (event.streamSeq !== cursor + 1) {
+        throw new EncryptedGenerationStoreError("repair_required", "Identity event stream has a gap");
+      }
+      transaction(database, () => {
+        database.prepare(`
+          INSERT INTO cache_identity_event_ledger(event_hash, stream_seq) VALUES (?, ?)
+        `).run(hashedEvent, event.streamSeq);
+        database.prepare("UPDATE cache_identity_cursor SET stream_seq = ? WHERE singleton = 1")
+          .run(event.streamSeq);
+        database.prepare(`
+          DELETE FROM cache_identity_event_ledger WHERE stream_seq <= ?
+        `).run(Math.max(0, event.streamSeq - 10_000));
+      });
+      return "applied";
+    },
+    applyIdentityEvent(input) {
+      requireOpen();
+      validateText(input.event.eventId, "eventId");
+      validateText(input.roomId, "roomId");
+      if (!positiveSafeInteger(input.event.streamSeq) ||
+          (input.upsert === undefined) === (input.deleteIdentity === undefined) ||
+          input.upsert !== undefined && !input.upsert.identity.startsWith("notification\0") ||
+          input.deleteIdentity !== undefined && !input.deleteIdentity.startsWith("notification\0")) {
+        throw new EncryptedGenerationStoreError("invalid_generation", "Identity event is invalid");
+      }
+      const cursorRow = database.prepare(
+        "SELECT stream_seq FROM cache_identity_cursor WHERE singleton = 1",
+      ).get() as { stream_seq?: unknown } | undefined;
+      if (cursorRow === undefined) {
+        throw new EncryptedGenerationStoreError("repair_required",
+          "Identity projection has not been bootstrapped");
+      }
+      const cursor = count(cursorRow.stream_seq);
+      const hashedEvent = eventHash(input.event.eventId);
+      const byEvent = database.prepare(`
+        SELECT stream_seq FROM cache_identity_event_ledger WHERE event_hash = ?
+      `).get(hashedEvent) as { stream_seq?: unknown } | undefined;
+      const bySequence = database.prepare(`
+        SELECT event_hash FROM cache_identity_event_ledger WHERE stream_seq = ?
+      `).get(input.event.streamSeq) as { event_hash?: unknown } | undefined;
+      if (byEvent !== undefined && byEvent.stream_seq !== input.event.streamSeq ||
+          bySequence !== undefined && bySequence.event_hash !== hashedEvent) {
+        throw new EncryptedGenerationStoreError("repair_required", "Identity event ledger conflicted");
+      }
+      if (input.event.streamSeq <= cursor) return "replayed";
+      if (input.event.streamSeq !== cursor + 1) {
+        throw new EncryptedGenerationStoreError("repair_required", "Identity event stream has a gap");
+      }
+      const head = active(input.roomId);
+      const room = roomHash(input.roomId);
+      transaction(database, () => {
+        if (head !== undefined && typeof head.generation_id === "string") {
+          const generationId = head.generation_id;
+          const identity = input.upsert?.identity ?? input.deleteIdentity!;
+          const hashedIdentity = identityHash(identity);
+          if (input.deleteIdentity !== undefined) {
+            database.prepare("DELETE FROM cache_records WHERE generation_id = ? AND identity_hash = ?")
+              .run(generationId, hashedIdentity);
+          } else {
+            const existing = database.prepare(`
+              SELECT ordinal FROM cache_records WHERE generation_id = ? AND identity_hash = ?
+            `).get(generationId, hashedIdentity) as { ordinal?: unknown } | undefined;
+            const ordinal = existing === undefined
+              ? count((database.prepare(`
+                  SELECT COALESCE(MAX(ordinal), -1) + 1 AS ordinal FROM cache_records
+                  WHERE generation_id = ?
+                `).get(generationId) as { ordinal?: unknown }).ordinal)
+              : count(existing.ordinal);
+            const sealed = sealRecord(dataKey,
+              recordAad(tenantHash, accountHash, room, generationId, hashedIdentity),
+              input.upsert!, limits.maxRecordBytes);
+            database.prepare(`
+              INSERT INTO cache_records(generation_id, identity_hash, ordinal, sealed_record)
+              VALUES (?, ?, ?, ?)
+              ON CONFLICT(generation_id, identity_hash) DO UPDATE SET sealed_record = excluded.sealed_record
+            `).run(generationId, hashedIdentity, ordinal, sealed);
+          }
+          const records = readGenerationRecords(room, generationId);
+          database.prepare(`
+            UPDATE cache_generations SET expected_count = ?, checksum = ? WHERE generation_id = ?
+          `).run(records.length,
+            authorityGenerationChecksum("room", records.map((record) => record.value)), generationId);
+        }
+        database.prepare(`
+          INSERT INTO cache_identity_event_ledger(event_hash, stream_seq) VALUES (?, ?)
+        `).run(hashedEvent, input.event.streamSeq);
+        database.prepare("UPDATE cache_identity_cursor SET stream_seq = ? WHERE singleton = 1")
+          .run(input.event.streamSeq);
+        database.prepare(`
+          DELETE FROM cache_identity_event_ledger WHERE stream_seq <= ?
+        `).run(Math.max(0, input.event.streamSeq - 10_000));
+      });
+      return "applied";
+    },
     writeOfflineLease(roomId, lease) {
       requireOpen();
       const room = roomHash(roomId);
@@ -1010,6 +1159,8 @@ export function createEncryptedAuthorityGenerationStore(
           DELETE FROM cache_room_catalog;
           DELETE FROM cache_offline_leases;
           DELETE FROM cache_event_ledger;
+          DELETE FROM cache_identity_event_ledger;
+          DELETE FROM cache_identity_cursor;
           DELETE FROM cache_records;
           DELETE FROM cache_generations;
           DELETE FROM cache_metadata;

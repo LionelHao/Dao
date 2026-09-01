@@ -407,6 +407,17 @@ describe("FT-10 SQLite tool-safety authority", () => {
         "SELECT COUNT(*) AS count FROM outbox_deliveries WHERE target_kind = 'room'",
       ).get()).toEqual({ count: 7 });
       expect(database.prepare(
+        `SELECT notification_kind AS notificationKind,
+                handled_at IS NOT NULL AS handled, read_at AS readAt
+         FROM notifications ORDER BY notification_kind`,
+      ).all()).toEqual([
+        { notificationKind: "tool_confirmation", handled: 1, readAt: null },
+        { notificationKind: "tool_result", handled: 0, readAt: null },
+      ]);
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type LIKE 'notification.%'",
+      ).get()).toEqual({ count: 3 });
+      expect(database.prepare(
         "SELECT MAX(instr(projection_json, 'hello')) AS leaked FROM tool_safety_repair_records_v2",
       ).get()).toEqual({ leaked: 0 });
     } finally {
@@ -467,6 +478,49 @@ describe("FT-10 SQLite tool-safety authority", () => {
       fixture.close();
     }
   });
+
+  it.each(["known_succeeded", "known_failed"] as const)(
+    "suppresses notifications for a late %s settlement after the Room is archived",
+    (state) => {
+      const fixture = testDatabase();
+      const { database } = fixture;
+      try {
+        seedAuthority(database);
+        const claim = prepareAndClaim(database);
+        database.prepare(
+          `UPDATE rooms SET status = 'archived', archive_generation = archive_generation + 1,
+             archived_at = ? WHERE id = 'room-ft10' AND status = 'active'`,
+        ).run(new Date(NOW + 4_000).toISOString());
+        const before = {
+          notifications: database.prepare("SELECT COUNT(*) AS count FROM notifications").get(),
+          notificationEvents: database.prepare(
+            "SELECT COUNT(*) AS count FROM events WHERE event_type LIKE 'notification.%'",
+          ).get(),
+          notificationOutbox: database.prepare(
+            `SELECT COUNT(*) AS count FROM outbox_deliveries AS delivery
+             JOIN events AS event ON event.event_id = delivery.event_id
+             WHERE event.event_type LIKE 'notification.%'`,
+          ).get(),
+        };
+        expect(transact(database, {
+          type: "tool-safety.settle", dispatchId: claim.dispatchId, expectedVersion: 2,
+          state, summary: { outcome: state }, now: NOW + 5_000,
+        })).toMatchObject({ kind: "settled", state, version: 3 });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM notifications").get())
+          .toEqual(before.notifications);
+        expect(database.prepare(
+          "SELECT COUNT(*) AS count FROM events WHERE event_type LIKE 'notification.%'",
+        ).get()).toEqual(before.notificationEvents);
+        expect(database.prepare(
+          `SELECT COUNT(*) AS count FROM outbox_deliveries AS delivery
+           JOIN events AS event ON event.event_id = delivery.event_id
+           WHERE event.event_type LIKE 'notification.%'`,
+        ).get()).toEqual(before.notificationOutbox);
+      } finally {
+        fixture.close();
+      }
+    },
+  );
 
   it("keeps a scoped cancellation from overwriting a claimed unknown parent", () => {
     const fixture = testDatabase();

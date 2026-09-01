@@ -770,12 +770,16 @@ const serverOptions: StartAuthoritativeServerOptions = {
   databasePath: command.databasePath,
   snapshotCachePath: command.snapshotCachePath,
   sharedAuthority: {
-    maxOfflineReadLeaseMs: 60_000,
+    // FT-14 release policy has an explicit five-minute hard minimum. The
+    // real-process fixture must opt into that production-valid value instead
+    // of relying on the pre-FT-14 one-minute test policy.
+    maxOfflineReadLeaseMs: 300_000,
     offlineReadLeaseSigning: {
       tenantId: "dao-authority-fixture",
       serverSubject: "dao-authority-child",
       keyId: "fixture-key-1",
       privateKey: offlineReadLeaseKeys.privateKey,
+      activatedAtMs: 0,
     },
   },
   listen: { host: "127.0.0.1", port: 0 },

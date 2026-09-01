@@ -85,6 +85,8 @@ function fixture(options: Readonly<{
     providerDisclosure: () => ({
       providerId: "openai-responses", modelId: "gpt-5",
       credentialReadiness: options.credentialReadiness ?? "noauth",
+      retentionDisabled: true, selectionPolicy: "server-managed-single",
+      disclosureRevision: 1, disclosedAt: NOW,
     }),
     capabilities: ["room.project.read", "room.respond"],
     tools: ["repository.git-status"],
@@ -298,7 +300,8 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
     ).get(created.profile.actorId)).toEqual({ displayName: "Evidence Researcher" });
     const query = await authority.queryProfiles("owner-token");
     expect(query.provider).toEqual({ providerId: "openai-responses", modelId: "gpt-5",
-      credentialReadiness: "noauth" });
+      credentialReadiness: "noauth", retentionDisabled: true,
+      selectionPolicy: "server-managed-single", disclosureRevision: 1, disclosedAt: NOW });
     expect(Object.keys(query)).toEqual(["profiles", "provider"]);
     expect(Object.keys(query.profiles[0]!).sort()).toEqual([
       "actorId", "capabilityCeiling", "createdAt", "displayName", "globalResponsibility",

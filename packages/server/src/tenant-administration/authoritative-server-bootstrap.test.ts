@@ -25,7 +25,7 @@ function options(directory: string, bootstrapHumanActorIds: readonly string[]) {
     ] as const,
     identities: { async verify() { return undefined; } },
     invitationSecretKey: new Uint8Array(32).fill(27),
-    sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
+    sharedAuthority: { maxOfflineReadLeaseMs: 300_000 },
     tenantAdministration: { bootstrapHumanActorIds },
   } as const;
 }

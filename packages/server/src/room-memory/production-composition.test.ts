@@ -73,7 +73,7 @@ describe("FT-05 production composition sentinel", () => {
       actors: [{ id: "human-owner", kind: "human", displayName: "Owner", reachability: "online" }],
       identities: { async verify() { return undefined; } },
       invitationSecretKey: new Uint8Array(32).fill(23),
-      sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
+      sharedAuthority: { maxOfflineReadLeaseMs: 300_000 },
       agentRuntime: { sandboxRoot: join(directory, "agent-sandbox") },
     }, { toolAdapterPathFallbackForTest: true });
 

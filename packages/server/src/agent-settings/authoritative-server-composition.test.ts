@@ -64,7 +64,7 @@ describe("authoritative server FT-07 production composition", () => {
           ? { accountId: "owner-account", actorId: "human-owner" } : undefined;
       } },
       invitationSecretKey: new Uint8Array(32).fill(19),
-      sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
+      sharedAuthority: { maxOfflineReadLeaseMs: 300_000 },
       tenantAdministration: { bootstrapHumanActorIds: ["human-owner"] },
     }, { toolAdapterPathFallbackForTest: true });
     servers.push(server);

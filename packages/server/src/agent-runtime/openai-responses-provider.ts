@@ -13,6 +13,10 @@ import {
   type AgentFinalProviderEventV1,
 } from "./provider-final.js";
 import { parseOpenAIResponseSse } from "./sse-parser.js";
+import {
+  encodeNoRetentionOpenAIRequest,
+  ProviderSecurityPolicyError,
+} from "../privacy-operations/provider-security-policy.js";
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -214,31 +218,41 @@ export function createOpenAIResponsesProvider(
           "Agent model authentication is not configured",
         );
       }
-      const requestBody = JSON.stringify({
-        model,
-        stream: true,
-        store: false,
-        max_output_tokens: input.limits.maxOutputTokens,
-        parallel_tool_calls: false,
-        input: buildProviderInput(input),
-        tools: input.availableTools.map((tool) => ({
-          type: "function",
-          name: functionName(tool.id),
-          description: tool.displayName,
-          strict: true,
-          parameters: functionParameters(tool),
-        })),
-        text: {
-          format: {
-            type: "json_schema",
-            name: "AgentFinalDraftV1",
-            strict: true,
-            schema: AGENT_FINAL_DRAFT_SCHEMA,
+      let requestBody: string;
+      try {
+        requestBody = encodeNoRetentionOpenAIRequest({
+          adapterId: "openai-responses",
+          modelId: model,
+          maxBytes: input.limits.maxInputBytes,
+          body: {
+            model,
+            stream: true,
+            store: false,
+            max_output_tokens: input.limits.maxOutputTokens,
+            parallel_tool_calls: false,
+            input: buildProviderInput(input),
+            tools: input.availableTools.map((tool) => ({
+              type: "function",
+              name: functionName(tool.id),
+              description: tool.displayName,
+              strict: true,
+              parameters: functionParameters(tool),
+            })),
+            text: {
+              format: {
+                type: "json_schema",
+                name: "AgentFinalDraftV1",
+                strict: true,
+                schema: AGENT_FINAL_DRAFT_SCHEMA,
+              },
+            },
           },
-        },
-      });
-      if (Buffer.byteLength(requestBody, "utf8") > input.limits.maxInputBytes) {
-        throw new AgentRuntimeError("invalid_parameters", "Provider input exceeded its byte limit");
+        });
+      } catch (error: unknown) {
+        if (error instanceof ProviderSecurityPolicyError && error.reason === "request_too_large") {
+          throw new AgentRuntimeError("invalid_parameters", "Provider input exceeded its byte limit");
+        }
+        throw new AgentRuntimeError("provider_failure", "Provider request security policy was rejected");
       }
 
       let response: Response;

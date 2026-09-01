@@ -24,6 +24,8 @@ async function open(databasePath: string) {
     databasePath,
     deploymentProviderDisclosure: {
       providerId: "openai-responses", modelId: "gpt-5", credentialReadiness: "ready",
+      retentionDisabled: true, selectionPolicy: "server-managed-single",
+      disclosureRevision: 1, disclosedAt: "2026-08-24T12:00:00.000Z",
     },
   });
   clients.push(worker);

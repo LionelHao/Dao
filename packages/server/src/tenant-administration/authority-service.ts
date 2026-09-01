@@ -34,6 +34,10 @@ export interface DeploymentProviderDisclosure {
   readonly providerId: string;
   readonly modelId: string;
   readonly credentialReadiness: CredentialReadiness;
+  readonly retentionDisabled: true;
+  readonly selectionPolicy: "server-managed-single";
+  readonly disclosureRevision: number;
+  readonly disclosedAt: string;
 }
 
 export type DeploymentAuditAction =
@@ -226,6 +230,10 @@ function validTime(value: unknown): value is string {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
 }
 
+function canonicalTime(value: unknown): value is string {
+  return validTime(value) && new Date(Date.parse(value)).toISOString() === value;
+}
+
 function exactCanonicalSet(
   values: readonly string[],
   allowed: ReadonlySet<string>,
@@ -263,14 +271,27 @@ function freezeProfile(profile: GlobalAgentProfile): GlobalAgentProfile {
 }
 
 function freezeProvider(value: DeploymentProviderDisclosure): DeploymentProviderDisclosure {
-  if (!validText(value.providerId, MAX_ID_BYTES) || !validText(value.modelId, MAX_ID_BYTES) ||
-      (value.credentialReadiness !== "ready" && value.credentialReadiness !== "noauth")) {
+  const expectedKeys = [
+    "providerId", "modelId", "credentialReadiness", "retentionDisabled",
+    "selectionPolicy", "disclosureRevision", "disclosedAt",
+  ];
+  if (Reflect.ownKeys(value).length !== expectedKeys.length ||
+      Reflect.ownKeys(value).some((key) =>
+        typeof key !== "string" || !expectedKeys.includes(key)) ||
+      !validText(value.providerId, MAX_ID_BYTES) || !validText(value.modelId, MAX_ID_BYTES) ||
+      (value.credentialReadiness !== "ready" && value.credentialReadiness !== "noauth") ||
+      value.retentionDisabled !== true || value.selectionPolicy !== "server-managed-single" ||
+      !validPositiveRevision(value.disclosureRevision) || !canonicalTime(value.disclosedAt)) {
     throw new TypeError("Provider disclosure is invalid");
   }
   return Object.freeze({
     providerId: value.providerId,
     modelId: value.modelId,
     credentialReadiness: value.credentialReadiness,
+    retentionDisabled: true,
+    selectionPolicy: "server-managed-single",
+    disclosureRevision: value.disclosureRevision,
+    disclosedAt: value.disclosedAt,
   });
 }
 

@@ -111,10 +111,18 @@ describe("FT-07 Agent Settings protocol", () => {
         providerId: "openai",
         modelId: "gpt-5",
         credentialReadiness: "ready",
+        retentionDisabled: true,
+        selectionPolicy: "server-managed-single",
+        disclosureRevision: 1,
+        disclosedAt: "2026-08-24T00:00:00.000Z",
       },
     };
     expect(isFt07AgentSettingsServerFrame(base)).toBe(true);
     expect(isFt07AgentSettingsServerFrame({ ...base, credential: "secret-canary" })).toBe(false);
     expect(isFt07AgentSettingsServerFrame({ ...base, roomId: "room-secret" })).toBe(false);
+    expect(isFt07AgentSettingsServerFrame({ ...base,
+      provider: { ...base.provider, credentialGeneration: 2 } })).toBe(false);
+    expect(isFt07AgentSettingsServerFrame({ ...base,
+      provider: { ...base.provider, keyVersion: "provider-key-v2" } })).toBe(false);
   });
 });

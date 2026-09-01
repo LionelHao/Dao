@@ -173,9 +173,16 @@ export function isTenantAdministrationOperation(value: unknown): value is Tenant
 }
 
 function provider(value: unknown): value is DeploymentProviderDisclosure {
-  return record(value) && exact(value, ["providerId", "modelId", "credentialReadiness"]) &&
+  return record(value) && exact(value, [
+    "providerId", "modelId", "credentialReadiness", "retentionDisabled",
+    "selectionPolicy", "disclosureRevision", "disclosedAt",
+  ]) &&
     text(value.providerId) && text(value.modelId) &&
-    (value.credentialReadiness === "ready" || value.credentialReadiness === "noauth");
+    (value.credentialReadiness === "ready" || value.credentialReadiness === "noauth") &&
+    value.retentionDisabled === true && value.selectionPolicy === "server-managed-single" &&
+    revision(value.disclosureRevision) && typeof value.disclosedAt === "string" &&
+    Number.isFinite(Date.parse(value.disclosedAt)) &&
+    new Date(Date.parse(value.disclosedAt)).toISOString() === value.disclosedAt;
 }
 
 function registry(value: unknown): value is TenantAdministratorRegistry {

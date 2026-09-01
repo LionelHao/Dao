@@ -7,6 +7,13 @@ import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js"
 import type { InvocationBridge } from "../invocation-runtime/contracts.js";
 import type { ProjectLoopBridge } from "../project-loop/contracts.js";
 import type { ToolSafetyBridge } from "../tool-safety/contracts.js";
+import type { NotificationCenterBridge } from "../notification-center/contracts.js";
+import type { NotificationToolResultActionBridge } from
+  "../notification-center/tool-result-action-contracts.js";
+import type { NotificationExecutionResultActionBridge } from
+  "../notification-center/execution-result-action-contracts.js";
+import type { RoomExportBridge } from "../room-export/contracts.js";
+import type { DiagnosticsBridge } from "../diagnostics/contracts.js";
 
 declare global {
   interface Window {
@@ -20,6 +27,11 @@ declare global {
       readonly invocation: InvocationBridge;
       readonly projectLoop: ProjectLoopBridge;
       readonly toolSafety: ToolSafetyBridge;
+      readonly notificationCenter: NotificationCenterBridge;
+      readonly notificationToolResult: NotificationToolResultActionBridge;
+      readonly notificationExecutionResult: NotificationExecutionResultActionBridge;
+      readonly roomExport: RoomExportBridge;
+      readonly diagnostics: DiagnosticsBridge;
     }>;
   }
 }

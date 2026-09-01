@@ -1,4 +1,4 @@
-import type { ActiveHumanMessage, MessageAuthorityEvent } from "@native-im/core";
+import type { ActiveHumanMessage, MessageAuthorityEvent, NotificationProjection } from "@native-im/core";
 import { WebSocket, WebSocketServer } from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -41,6 +41,15 @@ const acceptedEvent: MessageAuthorityEvent = {
   actorId: "human-1",
   occurredAt: createdAt,
   payload: message,
+};
+const notification: NotificationProjection = {
+  recordVersion: "notification.v1", notificationId: "notification-1", roomId: "room-1",
+  recipientActorId: "human-1", notificationKind: "human_request",
+  source: { sourceKind: "project_request", sourceId: "request-1", sourceRevision: 1,
+    sourceBoundaryId: "request-1:1", ordinal: 0 }, dedupeKey: "a".repeat(64), createdAt,
+  readAt: null, readRevision: 0, handled: false, handledAt: null, sourceAccessible: true,
+  deepLink: { kind: "request", targetId: "request-1" },
+  safeProjection: { titleKey: "human_request", actorId: "human-2" },
 };
 const servers: WebSocketServer[] = [];
 
@@ -93,6 +102,202 @@ async function listen(
 }
 
 describe("Message Authority WebSocket transport", () => {
+  it("reuses the authenticated Message Authority socket for diagnostics RPCs", async () => {
+    const bytes = Buffer.from("safe\n", "utf8");
+    const authority = await listen((frame, send) => {
+      const requestId = frame.requestId as string;
+      if (frame.type === "auth.resume") return send({ type: "auth.authenticated", requestId,
+        accountId: "account-1", actorId: "human-1", sessionId: "session-1" });
+      if (frame.type === "diagnostics.generate") return send({ type: "diagnostics.generated",
+        requestId, streamId: "diagnostics-stream-1", artifactId: "artifact-1",
+        filename: "dao-diagnostics-2026-09-01T00-00-00.000Z.ndjson",
+        mediaType: "application/x-ndjson", byteLength: bytes.byteLength,
+        sha256: "a".repeat(64), expiresAt: "2026-09-01T00:10:00.000Z", chunkSize: 49_152 });
+      if (frame.type === "diagnostics.read") return send({ type: "diagnostics.chunk", requestId,
+        streamId: "diagnostics-stream-1", offset: 0, byteLength: bytes.byteLength,
+        base64: bytes.toString("base64"), eof: true });
+      if (frame.type === "diagnostics.abort") return send({ type: "diagnostics.aborted", requestId,
+        streamId: "diagnostics-stream-1" });
+    });
+    const transport = createMessageAuthorityWebSocketTransport({ endpoint: authority.endpoint,
+      session: authoritySession, webSocketFactory: (endpoint) =>
+        new WebSocket(endpoint) as unknown as MessageAuthorityWebSocketLike });
+    await expect(transport.diagnosticsGenerate({ type: "diagnostics.generate",
+      requestId: "diagnostics-generate-1" })).resolves.toMatchObject({
+        type: "diagnostics.generated", streamId: "diagnostics-stream-1" });
+    await expect(transport.diagnosticsRead({ type: "diagnostics.read",
+      requestId: "diagnostics-read-1", streamId: "diagnostics-stream-1", offset: 0 }))
+      .resolves.toMatchObject({ type: "diagnostics.chunk", eof: true });
+    await expect(transport.diagnosticsAbort({ type: "diagnostics.abort",
+      requestId: "diagnostics-abort-1", streamId: "diagnostics-stream-1" }))
+      .resolves.toMatchObject({ type: "diagnostics.aborted" });
+    expect(authority.received.filter(({ type }) => type === "auth.resume")).toHaveLength(1);
+    transport.close();
+  });
+
+  it("maps only the closed diagnostics error family into renderer-safe failures", () => {
+    for (const [status, wireCode, code] of [
+      [401, "unauthenticated", "authentication_required"],
+      [403, "administrator_required", "administrator_required"],
+      [409, "diagnostics_stream_conflict", "diagnostics_stream_conflict"],
+      [410, "diagnostics_artifact_gone", "diagnostics_artifact_gone"],
+      [429, "diagnostics_capacity_limited", "diagnostics_capacity_limited"],
+      [503, "diagnostics_invalid_artifact", "diagnostics_invalid_artifact"],
+      [503, "diagnostics_unavailable", "diagnostics_unavailable"],
+    ] as const) {
+      const parsed = parseMessageAuthorityServerFrame(JSON.stringify({ type: "error", status,
+        code: wireCode, message: "secret /private/db.sqlite", requestId: `diagnostics-${status}`,
+        ...(status === 429 ? { retryAfterSeconds: 2 } : {}) }));
+      expect(parsed).toMatchObject({ type: "error", error: { diagnosticsError: {
+        status, code, ...(status === 429 ? { retryAfterMs: 2_000 } : {}),
+      } } });
+      expect(JSON.stringify(parsed)).not.toContain("/private/db.sqlite");
+    }
+  });
+
+  it("reuses one authenticated socket for correlated Room export offset RPCs", async () => {
+    const bytes = Buffer.from("hello");
+    const authority = await listen((frame, send) => {
+      const requestId = frame.requestId as string;
+      if (frame.type === "auth.resume") return send({ type: "auth.authenticated", requestId,
+        accountId: "account-1", actorId: "human-1", sessionId: "session-1" });
+      if (frame.type === "room-export.open") return send({ type: "room-export.opened", requestId,
+        streamId: "stream-1", roomId: "room-1", chunkSize: 65_536 });
+      if (frame.type === "room-export.read") return send({ type: "room-export.chunk", requestId,
+        streamId: "stream-1", offset: frame.offset, byteLength: bytes.byteLength,
+        base64: bytes.toString("base64"), eof: false });
+      if (frame.type === "room-export.abort") return send({ type: "room-export.aborted", requestId,
+        streamId: "stream-1" });
+    });
+    const transport = createMessageAuthorityWebSocketTransport({ endpoint: authority.endpoint,
+      session: authoritySession, webSocketFactory: (endpoint) =>
+        new WebSocket(endpoint) as unknown as MessageAuthorityWebSocketLike });
+    await expect(transport.roomExportOpen({ type: "room-export.open", requestId: "export-open-1",
+      roomId: "room-1" })).resolves.toMatchObject({ streamId: "stream-1", chunkSize: 65_536 });
+    await expect(transport.roomExportRead({ type: "room-export.read", requestId: "export-read-1",
+      streamId: "stream-1", offset: 0 })).resolves.toMatchObject({ offset: 0,
+        byteLength: 5, base64: bytes.toString("base64") });
+    await expect(transport.roomExportAbort({ type: "room-export.abort", requestId: "export-abort-1",
+      streamId: "stream-1" })).resolves.toMatchObject({ type: "room-export.aborted" });
+    expect(authority.received.filter(({ type }) => type === "auth.resume")).toHaveLength(1);
+    expect(authority.received.filter(({ type }) => String(type).startsWith("room-export.")))
+      .toEqual([
+        { type: "room-export.open", requestId: "export-open-1", roomId: "room-1" },
+        { type: "room-export.read", requestId: "export-read-1", streamId: "stream-1", offset: 0 },
+        { type: "room-export.abort", requestId: "export-abort-1", streamId: "stream-1" },
+      ]);
+    transport.close();
+  });
+
+  it("rejects malformed Room export payloads and maps the closed error family", () => {
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({ type: "room-export.chunk",
+      requestId: "read-1", streamId: "stream-1", offset: 0, byteLength: 2,
+      base64: "not-base64", eof: false }))).toBeUndefined();
+    for (const [status, wireCode, code, retryAfterMs] of [
+      [401, "unauthenticated", "authentication_required", undefined],
+      [403, "room_export_forbidden", "room_export_forbidden", undefined],
+      [409, "room_export_stream_conflict", "room_export_conflict", undefined],
+      [410, "room_export_stream_gone", "room_export_access_revoked", undefined],
+      [429, "room_export_capacity_limited", "room_export_capacity_exceeded", 1_000],
+      [503, "storage_unavailable", "storage_unavailable", undefined],
+    ] as const) {
+      const parsed = parseMessageAuthorityServerFrame(JSON.stringify({ type: "error", status,
+        code: wireCode, message: "private path", requestId: `error-${status}`,
+        ...(retryAfterMs === undefined ? {} : { retryAfterSeconds: retryAfterMs / 1_000 }) }));
+      expect(parsed).toMatchObject({ type: "error", error: { roomExportError: {
+        status, code, ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+      } } });
+      expect(JSON.stringify(parsed)).not.toContain("private path");
+    }
+  });
+
+  it("rejects a mis-correlated Room export response without accepting another request", async () => {
+    const authority = await listen((frame, send) => {
+      if (frame.type === "auth.resume") return send({ type: "auth.authenticated",
+        requestId: frame.requestId, accountId: "account-1", actorId: "human-1",
+        sessionId: "session-1" });
+      send({ type: "room-export.opened", requestId: "another-request", streamId: "stream-1",
+        roomId: "room-1", chunkSize: 65_536 });
+    });
+    const transport = createMessageAuthorityWebSocketTransport({ endpoint: authority.endpoint,
+      session: authoritySession, timeoutMs: 50, webSocketFactory: (endpoint) =>
+        new WebSocket(endpoint) as unknown as MessageAuthorityWebSocketLike });
+    await expect(transport.roomExportOpen({ type: "room-export.open", requestId: "export-open-1",
+      roomId: "room-1" })).rejects.toMatchObject({ code: "protocol_error" });
+    transport.close();
+  });
+
+  it("reuses the authenticated socket for closed notification RPCs and recipient stable events", async () => {
+    const authority = await listen((frame, send) => {
+      const requestId = frame.requestId as string;
+      if (frame.type === "auth.resume") return send({ type: "auth.authenticated", requestId,
+        accountId: "account-1", actorId: "human-1", sessionId: "session-1" });
+      if (frame.type === "notification.list") return send({ type: "notification.list.result", requestId,
+        notifications: [notification], roomBadges: [{ roomId: "room-1", unreadCount: 1,
+          unhandledCount: 1 }], hasMore: false, identityWatermark: 4 });
+      if (frame.type === "notification.mark-read") return send({ type: "notification.read.ack", requestId,
+        notificationId: "notification-1", roomId: "room-1", recipientActorId: "human-1",
+        outcome: "read", readAt: createdAt, readRevision: 1, eventId: "notification-event-5" });
+      if (frame.type === "notification.source.resolve") return send({
+        type: "notification.source.result", requestId, projection: notification,
+      });
+      if (frame.type === "notification.tool-result.acknowledge") return send({
+        type: "notification.tool-result.ack", requestId, outcome: "acknowledged",
+        projection: { ...notification, notificationKind: "tool_result",
+          source: { sourceKind: "tool_call", sourceId: "tool-call-1", sourceRevision: 1,
+            sourceBoundaryId: "dispatch-1", ordinal: 0 }, handled: true, handledAt: createdAt,
+          deepLink: { kind: "tool_call", targetId: "tool-call-1" },
+          safeProjection: { titleKey: "tool_result", actorId: "human-2" } },
+      });
+      if (frame.type === "notification.execution-result.acknowledge") return send({
+        type: "notification.execution-result.ack", requestId, outcome: "acknowledged",
+        projection: { ...notification, notificationKind: "agent_execution_completed",
+          source: { sourceKind: "agent_execution", sourceId: "execution-1", sourceRevision: 2,
+            sourceBoundaryId: "execution-1", ordinal: 0 }, handled: true, handledAt: createdAt,
+          deepLink: { kind: "agent_execution", targetId: "execution-1" },
+          safeProjection: { titleKey: "agent_execution_completed", actorId: "agent-1" } },
+      });
+    });
+    const transport = createMessageAuthorityWebSocketTransport({ endpoint: authority.endpoint,
+      session: authoritySession, webSocketFactory: (endpoint) =>
+        new WebSocket(endpoint) as unknown as MessageAuthorityWebSocketLike });
+    await expect(transport.notificationList({ type: "notification.list", requestId: "list-1",
+      roomId: null, before: null, limit: 50 })).resolves.toMatchObject({ identityWatermark: 4,
+        roomBadges: [{ roomId: "room-1", unreadCount: 1, unhandledCount: 1 }] });
+    await expect(transport.notificationMarkRead({ type: "notification.mark-read", requestId: "read-1",
+      notificationId: "notification-1", expectedReadRevision: 0 })).resolves.toMatchObject({
+        type: "notification.read.ack", readRevision: 1 });
+    await expect(transport.notificationResolveSource({ type: "notification.source.resolve",
+      requestId: "source-1", notificationId: "notification-1" })).resolves.toMatchObject({
+        type: "notification.source.result", projection: notification });
+    await expect(transport.notificationAcknowledgeToolResult({
+      type: "notification.tool-result.acknowledge", requestId: "tool-result-1",
+      notificationId: "notification-1",
+    })).resolves.toMatchObject({ type: "notification.tool-result.ack", outcome: "acknowledged" });
+    await expect(transport.notificationAcknowledgeExecutionResult({
+      type: "notification.execution-result.acknowledge", requestId: "execution-result-1",
+      notificationId: "notification-1",
+    })).resolves.toMatchObject({ type: "notification.execution-result.ack",
+      outcome: "acknowledged" });
+    const events: string[] = [];
+    const identityAdvances: number[] = [];
+    transport.onPrincipalIdentityAdvance((event) => identityAdvances.push(event.streamSeq));
+    transport.onNotificationEvent((event) => events.push(event.eventId));
+    authority.send({ eventId: "identity-room-5", streamKind: "identity", streamId: "human-1",
+      streamSeq: 5, actorId: "human-1", type: "identity.room-access.changed", occurredAt: createdAt,
+      payload: { roomId: "room-1", change: "updated" } });
+    authority.send({ eventId: "notification-event-6", streamKind: "identity", streamId: "human-1",
+      streamSeq: 6, type: "notification.read", occurredAt: createdAt,
+      payload: { ...notification, readAt: createdAt, readRevision: 1 } });
+    await vi.waitFor(() => {
+      expect(identityAdvances).toEqual([5]);
+      expect(events).toEqual(["notification-event-6"]);
+    });
+    expect(authority.received.filter(({ type }) => String(type).startsWith("notification.")))
+      .toHaveLength(5);
+    transport.close();
+  });
+
   it("sends all closed FT-10 commands and accepts only the matching authority ACK", async () => {
     const authority = await listen((frame, send) => {
       if (frame.type === "auth.resume") return send({ type: "auth.authenticated",
@@ -217,6 +422,39 @@ describe("Message Authority WebSocket transport", () => {
       retryable: false,
     }))).toMatchObject({ type: "error", requestId: "memory-1",
       error: { memoryError: { code: "memory_version_conflict" } } });
+  });
+
+  it.each([
+    [401, "invalid_token", "authentication_required", undefined],
+    [403, "notification_forbidden", "notification_forbidden", undefined],
+    [409, "notification_revision_conflict", "notification_revision_conflict", undefined],
+    [410, "notification_source_gone", "notification_source_gone", undefined],
+    [429, "rate_limited", "rate_limited", 2_500],
+    [503, "storage_unavailable", "storage_unavailable", undefined],
+  ] as const)("maps notification closed error %i/%s without exposing server text",
+    (status, wireCode, expectedCode, retryAfterMs) => {
+      const frame = parseMessageAuthorityServerFrame(JSON.stringify({
+        type: "error", requestId: `notification-error-${status}`, status, code: wireCode,
+        message: "private server diagnostic", ...(retryAfterMs === undefined ? {} : {
+          details: { retryAfterMs },
+        }),
+      }));
+      expect(frame).toMatchObject({ type: "error", requestId: `notification-error-${status}`,
+        error: { notificationError: { status, code: expectedCode,
+          ...(retryAfterMs === undefined ? {} : { retryAfterMs }) } } });
+      expect(JSON.stringify(frame)).not.toContain("private server diagnostic");
+    });
+
+  it("maps the production top-level retryAfterSeconds into bounded notification retry milliseconds", () => {
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({
+      type: "error", requestId: "notification-rate-limit", status: 429,
+      code: "rate_limited", message: "private server diagnostic", retryAfterSeconds: 3,
+    }))).toMatchObject({
+      type: "error", requestId: "notification-rate-limit",
+      error: { notificationError: {
+        status: 429, code: "rate_limited", retryAfterMs: 3_000,
+      } },
+    });
   });
 
   it("dispatches every closed runtime reset without dropping the socket or Room subscription", async () => {

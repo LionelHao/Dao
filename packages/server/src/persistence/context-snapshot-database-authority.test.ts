@@ -38,6 +38,10 @@ function readyWorkerOptions(databasePath: string) {
       providerId: "openai-responses",
       modelId: "configured-model",
       credentialReadiness: "ready" as const,
+      retentionDisabled: true as const,
+      selectionPolicy: "server-managed-single" as const,
+      disclosureRevision: 1,
+      disclosedAt: NOW,
     },
   };
 }

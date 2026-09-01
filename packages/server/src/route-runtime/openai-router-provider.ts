@@ -1,8 +1,17 @@
 import { isRouterPlan, type RouterProviderInput } from "@native-im/core";
 import type { SecretProvider } from "../agent-runtime/contracts.js";
+import { encodeNoRetentionOpenAIRequest } from "../privacy-operations/provider-security-policy.js";
 import { RouteRuntimeError, type RouterProvider } from "./contracts.js";
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+async function cancelRejectedResponse(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Rejection remains closed even when the provider body cannot be cancelled.
+  }
+}
 
 interface OpenAIRouterProviderOptions {
   readonly endpoint: string;
@@ -75,49 +84,56 @@ export function createOpenAIRouterProvider(options: OpenAIRouterProviderOptions)
       if (secret === undefined || secret.length === 0) {
         throw new RouteRuntimeError("provider_failure", "Router model authentication is not configured");
       }
-      const requestBody = JSON.stringify({
-        model: options.model,
-        store: false,
-        input: [{
-          role: "user",
-          content: [{
-            type: "input_text",
-            text: `Return only the closed route plan for this summary input:\n${JSON.stringify(input)}`,
-          }],
-        }],
-        text: {
-          format: {
-            type: "json_schema",
-            name: "route_plan",
-            strict: true,
-            schema: {
-              type: "object",
-              additionalProperties: false,
-              required: ["candidates"],
-              properties: {
-                candidates: {
-                  type: "array",
-                  maxItems: input.limits.maxCandidates,
-                  items: {
-                    type: "object",
-                    additionalProperties: false,
-                    required: ["agentId", "trigger", "order", "reasonCode", "reasonText"],
-                    properties: {
-                      agentId: { type: "string" },
-                      trigger: { type: "string", enum: ["domain", "risk", "structured_mention", "ball"] },
-                      order: { type: "integer", minimum: 1 },
-                      reasonCode: { type: "string", enum: ["domain_match", "risk_detected", "structured_help", "ball_due"] },
-                      reasonText: { type: "string", minLength: 1, maxLength: 512 },
+      let requestBody: string;
+      try {
+        requestBody = encodeNoRetentionOpenAIRequest({
+          adapterId: "openai-router",
+          modelId: options.model,
+          maxBytes: 128 * 1_024,
+          body: {
+            model: options.model,
+            store: false,
+            input: [{
+              role: "user",
+              content: [{
+                type: "input_text",
+                text: `Return only the closed route plan for this summary input:\n${JSON.stringify(input)}`,
+              }],
+            }],
+            text: {
+              format: {
+                type: "json_schema",
+                name: "route_plan",
+                strict: true,
+                schema: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["candidates"],
+                  properties: {
+                    candidates: {
+                      type: "array",
+                      maxItems: input.limits.maxCandidates,
+                      items: {
+                        type: "object",
+                        additionalProperties: false,
+                        required: ["agentId", "trigger", "order", "reasonCode", "reasonText"],
+                        properties: {
+                          agentId: { type: "string" },
+                          trigger: { type: "string", enum: ["domain", "risk", "structured_mention", "ball"] },
+                          order: { type: "integer", minimum: 1 },
+                          reasonCode: { type: "string", enum: ["domain_match", "risk_detected", "structured_help", "ball_due"] },
+                          reasonText: { type: "string", minLength: 1, maxLength: 512 },
+                        },
+                      },
                     },
                   },
                 },
               },
             },
           },
-        },
-      });
-      if (Buffer.byteLength(requestBody, "utf8") > 128 * 1_024) {
-        throw new RouteRuntimeError("provider_malformed", "Router input exceeded its byte limit");
+        });
+      } catch {
+        throw new RouteRuntimeError("provider_malformed", "Router input was rejected by security policy");
       }
       let response: Response;
       try {
@@ -136,6 +152,7 @@ export function createOpenAIRouterProvider(options: OpenAIRouterProviderOptions)
         throw new RouteRuntimeError(signal.aborted ? "provider_timeout" : "provider_failure", "Router request failed");
       }
       if (!response.ok) {
+        await cancelRejectedResponse(response);
         throw new RouteRuntimeError(
           response.status === 408 || response.status === 504 ? "provider_timeout" : "provider_failure",
           "Router provider rejected the request",
@@ -143,6 +160,7 @@ export function createOpenAIRouterProvider(options: OpenAIRouterProviderOptions)
       }
       const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
       if (contentType !== "application/json") {
+        await cancelRejectedResponse(response);
         throw new RouteRuntimeError("provider_malformed", "Router response content type was rejected");
       }
       let envelope: unknown;

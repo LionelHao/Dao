@@ -38,6 +38,23 @@ import { createDesktopProjectLoopRuntime } from "./project-loop/production-runti
 import { registerProjectLoopIpc } from "./project-loop/ipc.js";
 import { createDesktopToolSafetyRuntime } from "./tool-safety/production-runtime.js";
 import { registerToolSafetyIpc } from "./tool-safety/ipc.js";
+import { createDesktopNotificationCenterRuntime } from "./notification-center/production-runtime.js";
+import { registerNotificationCenterIpc } from "./notification-center/ipc.js";
+import { createNotificationToolResultActionRuntime } from
+  "./notification-center/tool-result-action-runtime.js";
+import { registerNotificationToolResultActionIpc } from
+  "./notification-center/tool-result-action-ipc.js";
+import { createNotificationExecutionResultActionRuntime } from
+  "./notification-center/execution-result-action-runtime.js";
+import { registerNotificationExecutionResultActionIpc } from
+  "./notification-center/execution-result-action-ipc.js";
+import { createDesktopRoomExportRuntime } from "./room-export/runtime.js";
+import { createElectronRoomExportSaveDialog } from "./room-export/electron-ports.js";
+import { createRoomExportWebSocketTransport } from "./room-export/websocket-transport.js";
+import { registerRoomExportIpc } from "./room-export/ipc.js";
+import { createDesktopDiagnosticsRuntime } from "./diagnostics/runtime.js";
+import { createDiagnosticsWebSocketTransport } from "./diagnostics/websocket-transport.js";
+import { registerDiagnosticsIpc } from "./diagnostics/ipc.js";
 import { createEncryptedAuthorityCachePersistence } from "./governance/encrypted-authority-cache.js";
 import {
   createRecoverableEncryptedAuthorityGenerationStore,
@@ -73,9 +90,48 @@ function offlineReadLeaseVerificationFromEnvironment() {
   if (publicKey.asymmetricKeyType !== "ed25519") {
     throw new Error("Offline read lease verification key must be Ed25519");
   }
+  const previousKeyId = process.env.NATIVE_IM_OFFLINE_LEASE_PREVIOUS_KEY_ID;
+  const previousPublicKeySpki =
+    process.env.NATIVE_IM_OFFLINE_LEASE_PREVIOUS_PUBLIC_KEY_SPKI_BASE64;
+  const previousIssuanceCutoff =
+    process.env.NATIVE_IM_OFFLINE_LEASE_PREVIOUS_ISSUANCE_CUTOFF_MS;
+  const previousVerificationCutoff =
+    process.env.NATIVE_IM_OFFLINE_LEASE_PREVIOUS_VERIFICATION_CUTOFF_MS;
+  const previousValues = [previousKeyId, previousPublicKeySpki, previousIssuanceCutoff,
+    previousVerificationCutoff];
+  const previousConfigured = previousValues.some((value) => value !== undefined);
+  if (previousConfigured && previousValues.some(
+    (value) => value === undefined || value.length === 0,
+  )) throw new Error("Offline read lease previous-key configuration is incomplete");
+  const verificationKeys = new Map([[keyId!, publicKey]]);
+  const previousKeyWindows = new Map<string, {
+    issuanceCutoffMs: number;
+    verificationCutoffMs: number;
+  }>();
+  if (previousConfigured) {
+    if (previousKeyId === keyId || !/^(0|[1-9][0-9]*)$/u.test(previousIssuanceCutoff!) ||
+        !/^(0|[1-9][0-9]*)$/u.test(previousVerificationCutoff!)) {
+      throw new Error("Offline read lease previous-key configuration is invalid");
+    }
+    const issuanceCutoffMs = Number(previousIssuanceCutoff);
+    const verificationCutoffMs = Number(previousVerificationCutoff);
+    if (!Number.isSafeInteger(issuanceCutoffMs) || !Number.isSafeInteger(verificationCutoffMs) ||
+        verificationCutoffMs - issuanceCutoffMs !== 24 * 60 * 60 * 1_000) {
+      throw new Error("Offline read lease previous-key overlap must be exactly 24 hours");
+    }
+    const previousPublicKey = createPublicKey({
+      key: Buffer.from(previousPublicKeySpki!, "base64"), format: "der", type: "spki",
+    });
+    if (previousPublicKey.asymmetricKeyType !== "ed25519") {
+      throw new Error("Offline read lease previous verification key must be Ed25519");
+    }
+    verificationKeys.set(previousKeyId!, previousPublicKey);
+    previousKeyWindows.set(previousKeyId!, { issuanceCutoffMs, verificationCutoffMs });
+  }
   return Object.freeze({
     verifier: createDesktopOfflineReadLeaseVerifier({
-      verificationKeys: new Map([[keyId!, publicKey]]),
+      verificationKeys,
+      ...(previousConfigured ? { previousKeyWindows } : {}),
     }),
     authority: Object.freeze({ tenantId: tenantId!, serverSubject: serverSubject! }),
   });
@@ -105,6 +161,14 @@ async function createWindow(): Promise<void> {
   let disposeAttachmentGovernanceState: (() => void) | undefined;
   let agentSettings: ReturnType<typeof createDesktopAgentSettingsRuntime> | undefined;
   let disposeAgentSettingsIpc: (() => void) | undefined;
+  let notificationCenter: ReturnType<typeof createDesktopNotificationCenterRuntime> | undefined;
+  let disposeNotificationCenterIpc: (() => void) | undefined;
+  let disposeNotificationToolResultIpc: (() => void) | undefined;
+  let disposeNotificationExecutionResultIpc: (() => void) | undefined;
+  let roomExport: ReturnType<typeof createDesktopRoomExportRuntime> | undefined;
+  let disposeRoomExportIpc: (() => void) | undefined;
+  let diagnostics: ReturnType<typeof createDesktopDiagnosticsRuntime> | undefined;
+  let disposeDiagnosticsIpc: (() => void) | undefined;
   const attachmentRuntimeHost = createElectronAttachmentRuntimeHost({
     createRuntime: () => {
       const ports = createElectronAttachmentPorts({
@@ -167,6 +231,9 @@ async function createWindow(): Promise<void> {
           messageAuthorityRuntime?.invalidateAuthorizedState();
           memoryAuthorityRuntime?.invalidateAuthorizedState();
           projectLoop?.invalidateAuthorizedState();
+          notificationCenter?.invalidateAuthorizedState();
+          void roomExport?.invalidateAuthorizedState();
+          void diagnostics?.invalidateAuthorizedState();
           attachmentRuntimeHost.invalidateIdentity();
         },
       },
@@ -237,6 +304,39 @@ async function createWindow(): Promise<void> {
       session: () => identity?.getCurrentAuthoritySession(),
       webSocketFactory: (endpoint) => new WebSocket(endpoint),
     });
+    roomExport = createDesktopRoomExportRuntime({
+      transport: createRoomExportWebSocketTransport(messageAuthorityRuntime.transport),
+      saveDialog: createElectronRoomExportSaveDialog({
+        parentWindow: window,
+        dialog: { showSaveDialog: (_parent, options) => dialog.showSaveDialog(
+          window,
+          options as unknown as SaveDialogOptions,
+        ) },
+      }),
+      createRequestId: (operation) => `room-export-${operation}-${randomUUID()}`,
+      randomId: randomUUID,
+    });
+    disposeRoomExportIpc = registerRoomExportIpc({
+      ipcMain, webContents: window.webContents, runtime: roomExport,
+    });
+    diagnostics = createDesktopDiagnosticsRuntime({
+      transport: createDiagnosticsWebSocketTransport(messageAuthorityRuntime.transport),
+      saveDialog: {
+        async chooseDestination(suggestedName) {
+          const result = await dialog.showSaveDialog(window, {
+            title: "导出无正文诊断包",
+            defaultPath: suggestedName,
+            filters: [{ name: "NDJSON", extensions: ["ndjson"] }],
+          });
+          return result.canceled || result.filePath === undefined ? undefined : result.filePath;
+        },
+      },
+      createRequestId: (operation) => `diagnostics-${operation}-${randomUUID()}`,
+      randomId: randomUUID,
+    });
+    disposeDiagnosticsIpc = registerDiagnosticsIpc({
+      ipcMain, webContents: window.webContents, runtime: diagnostics,
+    });
     messageAuthority = createMessageAuthorityController({
       client: messageAuthorityRuntime.client,
       createRequestId: (operation) => `message-${operation}-${randomUUID()}`,
@@ -245,6 +345,32 @@ async function createWindow(): Promise<void> {
       ipcMain,
       webContents: window.webContents,
       controller: messageAuthority,
+    });
+    notificationCenter = createDesktopNotificationCenterRuntime({
+      session: () => identity?.getCurrentAuthoritySession(),
+      transport: messageAuthorityRuntime.transport,
+      cache: governance.cache,
+      restoreWorkspace: () => governance!.restoreWorkspace(),
+      createRequestId: (operation) => `notification-${operation}-${randomUUID()}`,
+    });
+    disposeNotificationCenterIpc = registerNotificationCenterIpc({
+      ipcMain, webContents: window.webContents, runtime: notificationCenter,
+    });
+    const notificationToolResult = createNotificationToolResultActionRuntime({
+      session: () => identity?.getCurrentAuthoritySession(),
+      transport: messageAuthorityRuntime.transport,
+      createRequestId: () => `notification-tool-result-${randomUUID()}`,
+    });
+    disposeNotificationToolResultIpc = registerNotificationToolResultActionIpc({
+      ipcMain, webContents: window.webContents, runtime: notificationToolResult,
+    });
+    const notificationExecutionResult = createNotificationExecutionResultActionRuntime({
+      session: () => identity?.getCurrentAuthoritySession(),
+      transport: messageAuthorityRuntime.transport,
+      createRequestId: () => `notification-execution-result-${randomUUID()}`,
+    });
+    disposeNotificationExecutionResultIpc = registerNotificationExecutionResultActionIpc({
+      ipcMain, webContents: window.webContents, runtime: notificationExecutionResult,
     });
     memoryAuthorityRuntime = createDesktopMemoryAuthorityRuntime({
       endpoint: process.env.NATIVE_IM_IDENTITY_WS_URL ?? "ws://127.0.0.1:8787",
@@ -291,6 +417,11 @@ async function createWindow(): Promise<void> {
       disposeProjectLoopIpc?.();
       disposeToolSafetyIpc?.();
       disposeAgentSettingsIpc?.();
+      disposeNotificationCenterIpc?.();
+      disposeNotificationToolResultIpc?.();
+      disposeNotificationExecutionResultIpc?.();
+      disposeRoomExportIpc?.();
+      disposeDiagnosticsIpc?.();
       disposeAttachmentGovernanceState?.();
       attachmentRuntimeHost.close();
       identity?.close();
@@ -301,6 +432,9 @@ async function createWindow(): Promise<void> {
       projectLoop?.close();
       toolSafety?.close();
       agentSettings?.close();
+      notificationCenter?.close();
+      void roomExport?.close();
+      void diagnostics?.close();
     });
 
     await Promise.all([window.loadFile(rendererPath), identity.initialize()]);
@@ -315,6 +449,11 @@ async function createWindow(): Promise<void> {
         invocationMethods: Object.keys(globalThis.dao?.invocation ?? {}).sort(),
         projectLoopMethods: Object.keys(globalThis.dao?.projectLoop ?? {}).sort(),
         toolSafetyMethods: Object.keys(globalThis.dao?.toolSafety ?? {}).sort(),
+        notificationCenterMethods: Object.keys(globalThis.dao?.notificationCenter ?? {}).sort(),
+        notificationToolResultMethods: Object.keys(globalThis.dao?.notificationToolResult ?? {}).sort(),
+        notificationExecutionResultMethods: Object.keys(globalThis.dao?.notificationExecutionResult ?? {}).sort(),
+        roomExportMethods: Object.keys(globalThis.dao?.roomExport ?? {}).sort(),
+        diagnosticsMethods: Object.keys(globalThis.dao?.diagnostics ?? {}).sort(),
         namespaces: Object.keys(globalThis.dao ?? {}).sort(),
         bridgeMissing: document.querySelector("[data-identity-bridge-missing]") !== null,
         governanceRouteContract: document.querySelector("#app")?.dataset.governanceRouteContract ?? "",
@@ -361,6 +500,12 @@ async function createWindow(): Promise<void> {
     const expectedInvocationMethods = ["cancel", "getSurface", "onStateChanged", "retry"];
     const expectedProjectLoopMethods = ["getSurface", "onStateChanged", "submit"];
     const expectedToolSafetyMethods = ["getSurface", "onStateChanged", "repair", "submit"];
+    const expectedNotificationCenterMethods = [
+      "getState", "list", "markRead", "onStateChanged", "resolveSource", "retryRepair",
+    ];
+    const expectedNotificationSourceActionMethods = ["acknowledge"];
+    const expectedRoomExportMethods = ["save"];
+    const expectedDiagnosticsMethods = ["save"];
     let startupProbe: unknown;
     try {
       startupProbe = typeof startupProbeJson === "string"
@@ -401,9 +546,24 @@ async function createWindow(): Promise<void> {
         startupProbe.projectLoopMethods.join(",") !== expectedProjectLoopMethods.join(",") ||
         !("toolSafetyMethods" in startupProbe) || !Array.isArray(startupProbe.toolSafetyMethods) ||
         startupProbe.toolSafetyMethods.join(",") !== expectedToolSafetyMethods.join(",") ||
+        !("notificationCenterMethods" in startupProbe) ||
+        !Array.isArray(startupProbe.notificationCenterMethods) ||
+        startupProbe.notificationCenterMethods.join(",") !== expectedNotificationCenterMethods.join(",") ||
+        !("notificationToolResultMethods" in startupProbe) ||
+        !Array.isArray(startupProbe.notificationToolResultMethods) ||
+        startupProbe.notificationToolResultMethods.join(",") !==
+          expectedNotificationSourceActionMethods.join(",") ||
+        !("notificationExecutionResultMethods" in startupProbe) ||
+        !Array.isArray(startupProbe.notificationExecutionResultMethods) ||
+        startupProbe.notificationExecutionResultMethods.join(",") !==
+          expectedNotificationSourceActionMethods.join(",") ||
+        !("roomExportMethods" in startupProbe) || !Array.isArray(startupProbe.roomExportMethods) ||
+        startupProbe.roomExportMethods.join(",") !== expectedRoomExportMethods.join(",") ||
+        !("diagnosticsMethods" in startupProbe) || !Array.isArray(startupProbe.diagnosticsMethods) ||
+        startupProbe.diagnosticsMethods.join(",") !== expectedDiagnosticsMethods.join(",") ||
         !("namespaces" in startupProbe) || !Array.isArray(startupProbe.namespaces) ||
         startupProbe.namespaces.join(",") !==
-          "agentSettings,attachmentAuthority,governance,identity,invocation,memoryAuthority,messageAuthority,projectLoop,toolSafety" ||
+          "agentSettings,attachmentAuthority,diagnostics,governance,identity,invocation,memoryAuthority,messageAuthority,notificationCenter,notificationExecutionResult,notificationToolResult,projectLoop,roomExport,toolSafety" ||
         !("governanceRouteContract" in startupProbe) ||
         startupProbe.governanceRouteContract !== "closed-v1" ||
         !("bridgeMissing" in startupProbe) || startupProbe.bridgeMissing !== false ||
@@ -430,6 +590,11 @@ async function createWindow(): Promise<void> {
     disposeProjectLoopIpc?.();
     disposeToolSafetyIpc?.();
     disposeAgentSettingsIpc?.();
+    disposeNotificationCenterIpc?.();
+    disposeNotificationToolResultIpc?.();
+    disposeNotificationExecutionResultIpc?.();
+    disposeRoomExportIpc?.();
+    disposeDiagnosticsIpc?.();
     disposeAttachmentGovernanceState?.();
     attachmentRuntimeHost.close();
     identity?.close();
@@ -440,6 +605,9 @@ async function createWindow(): Promise<void> {
     projectLoop?.close();
     toolSafety?.close();
     agentSettings?.close();
+    notificationCenter?.close();
+    void roomExport?.close();
+    void diagnostics?.close();
     if (!window.isDestroyed()) window.destroy();
     throw error;
   }

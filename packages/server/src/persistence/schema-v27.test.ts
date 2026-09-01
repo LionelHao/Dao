@@ -32,13 +32,13 @@ describe("v27 sync reliability lifecycle schema", () => {
     { range: "v1-v13", firstVersion: 1, lastVersion: 13 },
     { range: "v14-v26", firstVersion: 14, lastVersion: 26 },
   ])("migrates historical $range to immutable v27", ({ firstVersion, lastVersion }) => {
-    expect(AUTHORITY_SCHEMA_VERSION).toBe(27);
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(29);
     expect(AUTHORITY_V27_MIGRATION_CHECKSUM_FOR_TEST).toMatch(/^[0-9a-f]{64}$/);
     for (let version = firstVersion; version <= lastVersion; version += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(27);
+        expect(readSchemaVersion(database)).toBe(29);
         const migration = database.prepare(
           "SELECT name, checksum FROM schema_migrations WHERE version = 27",
         ).get();

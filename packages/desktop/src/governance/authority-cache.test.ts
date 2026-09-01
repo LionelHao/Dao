@@ -68,6 +68,36 @@ DesktopOfflineReadLeaseClaims {
 }
 
 describe("production Desktop authority cache", () => {
+  it("derives notification projection from the single Room repair and applies stable updates", async () => {
+    const notification = { recordVersion: "notification.v1" as const, notificationId: "notification-1",
+      roomId: "room-1", recipientActorId: "human-1", notificationKind: "human_request" as const,
+      source: { sourceKind: "project_request" as const, sourceId: "request-1", sourceRevision: 1,
+        sourceBoundaryId: "request-1:1", ordinal: 0 }, dedupeKey: "a".repeat(64),
+      createdAt: "2026-08-31T08:00:00.000Z", readAt: null, readRevision: 0,
+      handled: false, handledAt: null, sourceAccessible: true as const,
+      deepLink: { kind: "request" as const, targetId: "request-1" },
+      safeProjection: { titleKey: "human_request" as const, actorId: "human-2" } };
+    const notificationRecords: readonly RoomRepairRecord[] = [
+      ...records, { kind: "notification", value: notification },
+    ];
+    const checksum = authoritySnapshotChecksum("room", notificationRecords);
+    const cache = createDesktopAuthorityCache();
+    cache.beginRoom("room-1", "notification-repair");
+    cache.stageRoomPage({ ...page(), snapshotId: "notification-repair", records: notificationRecords,
+      snapshotChecksum: checksum });
+    expect(await cache.finalizeRoom("notification-repair", checksum)).toBe(true);
+    cache.commitRoom("room-1", 9, checksum);
+    expect(cache.notificationProjections("human-1")).toEqual([notification]);
+    cache.establishNotificationIdentityCursor(4);
+    expect(cache.advanceNotificationIdentityCursor({ eventId: "room-access-event-5", streamSeq: 5 }))
+      .toBe("applied");
+    expect(cache.applyNotificationEvent({ eventId: "notification-event-6", streamKind: "identity",
+      streamId: "human-1", streamSeq: 6, type: "notification.read",
+      occurredAt: "2026-08-31T08:01:00.000Z", payload: { ...notification,
+        readAt: "2026-08-31T08:01:00.000Z", readRevision: 1 } })).toBe("applied");
+    expect(cache.notificationProjections("human-1")[0]).toMatchObject({ readRevision: 1 });
+  });
+
   it("classifies the complete persisted Room event union before cursor advancement", () => {
     expect(Object.keys(DESKTOP_ROOM_EVENT_PROJECTION_ACTIONS_FOR_TEST)).toHaveLength(62);
     expect(new Set(Object.values(DESKTOP_ROOM_EVENT_PROJECTION_ACTIONS_FOR_TEST))).toEqual(new Set([

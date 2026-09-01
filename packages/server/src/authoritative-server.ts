@@ -59,6 +59,21 @@ import { createBallRuntimeService, type BallRuntimeService } from "./ball-runtim
 import { RoomCacheInvalidationPostCommitDispatcher } from "./access/room-cache-invalidation-port.js";
 import { createProductionSharedAuthorityParticipantComposition } from "./room-governance/production-participant-composition.js";
 import {
+  validatePrivacyOperationsSharedAuthority,
+} from "./privacy-operations/deployment-configuration.js";
+import { createProviderSecurityDisclosure } from
+  "./privacy-operations/provider-security-policy.js";
+import { createHostedRetentionOperationsAdapter } from
+  "./privacy-operations/operations-runtime.js";
+import {
+  createOfflineLeaseKeyringPolicy,
+  requireActiveOfflineLeaseSigningKey,
+} from "./privacy-operations/offline-lease-keyring-policy.js";
+import {
+  createAuthenticatedPrivacyOperationsTransport,
+  type AuthenticatedPrivacyOperationsTransport,
+} from "./privacy-operations/authoritative-host.js";
+import {
   createSourceScopedRuntimeBoundary,
   type SourceScopedRuntimeBoundary,
 } from "./message-authority/runtime/source-scoped-runtime-coordinator.js";
@@ -110,6 +125,7 @@ export const AUTHORITATIVE_SERVER_DEFAULT_PORT = 8_787;
 
 export interface AuthoritativeServer {
   readonly url: string;
+  readonly privacyOperations: AuthenticatedPrivacyOperationsTransport;
   close(): Promise<void>;
 }
 
@@ -235,6 +251,12 @@ export interface StartAuthoritativeServerOptions {
       readonly serverSubject: string;
       readonly keyId: string;
       readonly privateKey: KeyObject;
+      readonly activatedAtMs: number;
+      readonly previous?: Readonly<{
+        keyId: string;
+        issuanceCutoffMs: number;
+        verificationCutoffMs: number;
+      }>;
     };
   };
   /**
@@ -245,6 +267,10 @@ export interface StartAuthoritativeServerOptions {
   readonly tenantAdministration?: {
     readonly bootstrapHumanActorIds: readonly string[];
   };
+  readonly privacyOperations?: Readonly<{
+    readonly artifactRoot?: string;
+    readonly auditPath?: string;
+  }>;
   readonly agentRuntime?: {
     readonly model?: string;
     /** Deployment-owned, conservative context window for models outside the built-in registry. */
@@ -298,6 +324,8 @@ interface AuthoritativeServerTestOptions {
     | "route"
     | "project-boundary"
     | "runtime"
+    | "privacy-retention"
+    | "privacy-operations"
     | "ball"
     | "snapshots"
     | "worker",
@@ -366,6 +394,9 @@ async function start(
   testOptions: AuthoritativeServerTestOptions,
   testOnlyAllowEphemeralOfflineLeaseSigning: boolean,
 ): Promise<AuthoritativeServer> {
+  const releaseLeasePolicy = validatePrivacyOperationsSharedAuthority({
+    maxOfflineReadLeaseMs: options.sharedAuthority.maxOfflineReadLeaseMs,
+  });
   const ephemeralLeaseKey = options.sharedAuthority.offlineReadLeaseSigning === undefined &&
       testOnlyAllowEphemeralOfflineLeaseSigning
     ? generateKeyPairSync("ed25519").privateKey
@@ -376,10 +407,30 @@ async function start(
       serverSubject: "dao-test-authority",
       keyId: "dao-test-ephemeral-key",
       privateKey: ephemeralLeaseKey,
+      activatedAtMs: 0,
     });
   if (offlineReadLeaseSigning === undefined) {
     throw new TypeError("offlineReadLeaseSigning is required for production composition");
   }
+  const offlineLeaseKeyring = createOfflineLeaseKeyringPolicy({
+    active: {
+      keyId: offlineReadLeaseSigning.keyId,
+      activatedAtMs: offlineReadLeaseSigning.activatedAtMs,
+    },
+    ...(offlineReadLeaseSigning.previous === undefined
+      ? {} : { previous: offlineReadLeaseSigning.previous }),
+  });
+  requireActiveOfflineLeaseSigningKey(
+    offlineLeaseKeyring,
+    Date.now(),
+    offlineReadLeaseSigning.keyId,
+  );
+  const offlineReadLeaseWorkerSigning = Object.freeze({
+    tenantId: offlineReadLeaseSigning.tenantId,
+    serverSubject: offlineReadLeaseSigning.serverSubject,
+    keyId: offlineReadLeaseSigning.keyId,
+    privateKey: offlineReadLeaseSigning.privateKey,
+  });
   const runtimeModel = options.agentRuntime?.model ?? "gpt-5-mini";
   assertAgentRuntimeModelContextCapability({
     model: runtimeModel,
@@ -393,7 +444,7 @@ async function start(
     lightTaskDeadlineMs: ballConfiguration.lightTaskDeadlineMs ?? 24 * 60 * 60 * 1_000,
   });
   createProductionSharedAuthorityParticipantComposition({
-    maxOfflineReadLeaseMs: options.sharedAuthority.maxOfflineReadLeaseMs,
+    maxOfflineReadLeaseMs: releaseLeasePolicy.maxOfflineReadLeaseMs,
     ballPolicy,
   });
   const actorIds = new Set<string>();
@@ -408,14 +459,24 @@ async function start(
       ? testOptions.faultPoint
       : undefined;
   const secretProvider = createEnvironmentSecretProvider();
-  const deploymentProviderDisclosure = Object.freeze({
-    providerId: "openai-responses",
+  const providerSecurityDisclosure = createProviderSecurityDisclosure({
     modelId: runtimeModel,
-    credentialReadiness:
+    readiness:
       testOptions.agentRuntimeProviderForTest !== undefined ||
         secretProvider.getSecret("OPENAI_API_KEY") !== undefined
         ? "ready" as const
         : "noauth" as const,
+    disclosureRevision: 1,
+    disclosedAt: new Date().toISOString(),
+  });
+  const deploymentProviderDisclosure = Object.freeze({
+    providerId: providerSecurityDisclosure.providerId,
+    modelId: providerSecurityDisclosure.modelId,
+    credentialReadiness: providerSecurityDisclosure.readiness,
+    retentionDisabled: providerSecurityDisclosure.retentionDisabled,
+    selectionPolicy: providerSecurityDisclosure.selectionPolicy,
+    disclosureRevision: providerSecurityDisclosure.disclosureRevision,
+    disclosedAt: providerSecurityDisclosure.disclosedAt,
   });
   let worker: WorkerDatabaseClient | undefined;
   let snapshots: Awaited<ReturnType<typeof createSnapshotWorkerClient>> | undefined;
@@ -423,6 +484,8 @@ async function start(
   let runtime: AgentRuntimeService | undefined;
   let kickDirectIntentConsumer: () => void = () => undefined;
   let stopRuntimeRecovery: (() => void) | undefined;
+  let retentionOperations: ReturnType<typeof createHostedRetentionOperationsAdapter> | undefined;
+  let privacyOperations: AuthenticatedPrivacyOperationsTransport | undefined;
   let projectBoundaryRuntime: ProjectBoundaryRuntime | undefined;
   let sourceScopedRuntimeBoundary: SourceScopedRuntimeBoundary | undefined;
   let routeRuntime: RouteRuntimeService | undefined;
@@ -452,23 +515,32 @@ async function start(
           databasePath: options.databasePath,
           sharedAuthorityRecovery: {
             ballPolicy,
-            maxOfflineReadLeaseMs: options.sharedAuthority.maxOfflineReadLeaseMs,
+            maxOfflineReadLeaseMs: releaseLeasePolicy.maxOfflineReadLeaseMs,
           },
           deploymentProviderDisclosure,
-          offlineReadLeaseSigning,
+          offlineReadLeaseSigning: offlineReadLeaseWorkerSigning,
         })
       : await createWorkerDatabaseClientWithTransactionFaultForTest(
           {
             databasePath: options.databasePath,
             sharedAuthorityRecovery: {
               ballPolicy,
-              maxOfflineReadLeaseMs: options.sharedAuthority.maxOfflineReadLeaseMs,
+              maxOfflineReadLeaseMs: releaseLeasePolicy.maxOfflineReadLeaseMs,
             },
             deploymentProviderDisclosure,
-            offlineReadLeaseSigning,
+            offlineReadLeaseSigning: offlineReadLeaseWorkerSigning,
           },
           transactionFault,
         );
+    retentionOperations = createHostedRetentionOperationsAdapter({
+      batchPort: worker as CompleteWorkerDatabaseClient,
+      alertSink: {
+        emit(alert) {
+          process.stderr.write(`${JSON.stringify({ source: "privacy-retention", ...alert })}\n`);
+        },
+      },
+    });
+    await retentionOperations.run("startup_recovery", Date.now());
     const authority = createSqliteAuthoritativeStore(worker, {
       invitationSecretProtector: createAesGcmInvitationSecretProtector(
         options.invitationSecretKey,
@@ -653,6 +725,16 @@ async function start(
       },
       identities: options.identities,
       authority,
+    });
+    const privacyRoot = resolve(
+      dirname(options.snapshotCachePath),
+      "privacy-operations",
+    );
+    privacyOperations = await createAuthenticatedPrivacyOperationsTransport({
+      auth,
+      worker: worker as CompleteWorkerDatabaseClient,
+      artifactRoot: options.privacyOperations?.artifactRoot ?? resolve(privacyRoot, "artifacts"),
+      auditPath: options.privacyOperations?.auditPath ?? resolve(privacyRoot, "audit.jsonl"),
     });
     const commandStore = {
         async executeHuman(context, command) {
@@ -1183,6 +1265,8 @@ async function start(
     await scanProjectBoundaries();
     const runtimeRecoveryTimer = setInterval(() => {
       void runtime?.recover().catch(() => undefined);
+      void retentionOperations?.run("periodic", Date.now()).catch(() => undefined);
+      void privacyOperations?.runMaintenance(Date.now()).catch(() => undefined);
       void afterCommittedProducerCommand();
       kickDirectIntentConsumer();
       void scanProjectBoundaries().catch(() => undefined);
@@ -1304,12 +1388,20 @@ async function start(
         },
       },
       offlineReadLeaseAuthority: {
-        issue: (context, roomId) => authorityWorker.issueOfflineReadLease(
-          context,
-          roomId,
-          options.sharedAuthority.maxOfflineReadLeaseMs,
-          Date.now(),
-        ),
+        issue: (context, roomId) => {
+          const nowMs = Date.now();
+          requireActiveOfflineLeaseSigningKey(
+            offlineLeaseKeyring,
+            nowMs,
+            offlineReadLeaseSigning.keyId,
+          );
+          return authorityWorker.issueOfflineReadLease(
+            context,
+            roomId,
+            releaseLeasePolicy.defaultLeaseMs,
+            nowMs,
+          );
+        },
       },
       agentRuntime: runtime,
       toolSafetyAuthority: publicToolSafetyAuthority,
@@ -1355,6 +1447,11 @@ async function start(
       messageAuthority,
       memoryAuthority: publicMemoryAuthority,
       projectLoopAuthority,
+      notificationAuthority: {
+        execute: (operation) => authorityWorker.executeNotification(operation),
+      },
+      roomExportAuthority: privacyOperations,
+      diagnosticsAuthority: privacyOperations,
       agentSettingsAuthority: agentSettings,
       ...(attachmentAuthority === undefined ? {} : { attachmentAuthority }),
       governance: governanceStore,
@@ -1374,6 +1471,8 @@ async function start(
     await projectBoundaryRuntime?.close().catch(() => undefined);
     let runtimeSafetySettled = true;
     await runtime?.close().catch(() => { runtimeSafetySettled = false; });
+    await retentionOperations?.shutdown().catch(() => undefined);
+    await privacyOperations?.close().catch(() => undefined);
     await snapshots?.close().catch(() => undefined);
     if (runtimeSafetySettled) await worker?.close().catch(() => undefined);
     throw error;
@@ -1382,6 +1481,7 @@ async function start(
   let closePromise: Promise<void> | undefined;
   return {
     url: transport.url,
+    privacyOperations: privacyOperations!,
     close() {
       if (closePromise !== undefined) return closePromise;
       const attempt = (async () => {
@@ -1399,6 +1499,13 @@ async function start(
           ["route", () => routeRuntime!.close()],
           ["project-boundary", () => projectBoundaryRuntime!.close()],
           ["runtime", () => runtime!.close()],
+          ["privacy-retention", async () => {
+            const result = await retentionOperations?.shutdown();
+            if (result?.status === "shutdown_timeout") {
+              throw new Error("Privacy retention shutdown timed out");
+            }
+          }],
+          ["privacy-operations", () => privacyOperations!.close()],
           ["ball", () => ballRuntime!.close()],
           ["snapshots", () => snapshots.close()],
           ["worker", () => worker.close()],

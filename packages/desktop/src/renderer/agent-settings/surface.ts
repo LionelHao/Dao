@@ -5,11 +5,16 @@ import type {
   AgentSettingsErrorView,
   AgentSettingsViewModel,
 } from "./view-model.js";
+import type { DiagnosticsActionState } from "../../diagnostics/action-model.js";
 
 export interface AgentSettingsSurfaceActions {
   readonly onIntent: (intent: AgentSettingsMutationIntent) => void;
   readonly onRecover: (error: AgentSettingsErrorView) => void;
   readonly onClose: () => void;
+  readonly diagnostics?: Readonly<{
+    state: DiagnosticsActionState;
+    save(): void;
+  }>;
 }
 
 function element<Tag extends keyof HTMLElementTagNameMap>(tag: Tag, className?: string): HTMLElementTagNameMap[Tag] {
@@ -370,6 +375,31 @@ export function renderAgentSettingsSurface(
   if (model.permissions.canManageProfiles) profiles.append(renderCreateProfile(model, actions));
   if (model.profiles.length === 0) profiles.append(text("p", "EMPTY · 没有可显示的 Global Profile。"));
   else for (const profile of model.profiles) profiles.append(renderProfileCard(profile, model, actions));
+  if (model.permissions.canManageProfiles && actions.diagnostics !== undefined) {
+    const diagnostics = element("section", "agent-settings-diagnostics");
+    diagnostics.dataset.settingsSection = "privacy-diagnostics";
+    diagnostics.setAttribute("aria-label", "部署隐私诊断导出");
+    const diagnosticsButton = button(
+      actions.diagnostics.state.status === "saving" ? "正在导出诊断包…" : "导出无正文诊断包",
+      "export-diagnostics",
+      actions.diagnostics.state.disabled || model.writeLocked,
+    );
+    diagnosticsButton.removeAttribute("data-agent-mutation");
+    diagnosticsButton.addEventListener("click", actions.diagnostics.save);
+    const diagnosticsLive = text("p", actions.diagnostics.state.announcement,
+      "agent-settings-live");
+    diagnosticsLive.dataset.diagnosticsStatus = actions.diagnostics.state.status;
+    diagnosticsLive.setAttribute("role", "status");
+    diagnosticsLive.setAttribute("aria-live", actions.diagnostics.state.ariaLive);
+    diagnosticsLive.setAttribute("aria-atomic", "true");
+    diagnostics.append(
+      text("h3", "Privacy Operations · 诊断"),
+      text("p", "仅导出闭合运行状态与错误分类；不含 Room 正文、Provider 请求或凭据。"),
+      diagnosticsButton,
+      diagnosticsLive,
+    );
+    profiles.append(diagnostics);
+  }
   shell.append(profiles);
 
   const assignments = element("section", "agent-settings-assignment-path");

@@ -1,4 +1,5 @@
 import { createServer, type Server as HttpServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
@@ -13,6 +14,9 @@ import {
   isTimelineMessage,
   isWorkspaceBootstrapPage,
   MESSAGE_AUTHORITY_LIMITS,
+  ROOM_EXPORT_TRANSPORT_MAX_CHUNK_BYTES,
+  ROOM_EXPORT_TRANSPORT_MAX_STREAMS_PER_CONNECTION,
+  type DiagnosticsTransportClientFrame,
   type HumanMessageSubmit,
   type MessageRevision,
   type MessageTargetOutcome,
@@ -23,6 +27,7 @@ import {
   type RoomCursor,
   type SnapshotVersion,
   type TimelineMessage,
+  type RoomExportTransportClientFrame,
 } from "@native-im/core";
 import {
   AuthenticationError,
@@ -80,6 +85,22 @@ import {
   executeProjectLoopFrame,
   type ProjectLoopAuthorityTransport,
 } from "./project-loop-websocket.js";
+import type {
+  NotificationAuthorityOperation,
+  NotificationAuthorityResult,
+} from "./notifications/authority-protocol.js";
+import { createNotificationRecallOutboxPreparation } from
+  "./notifications/outbox-recall-preparation.js";
+import {
+  consumeNotificationRateLimit,
+  createNotificationRateLimitState,
+  type NotificationRateLimitState,
+} from "./notifications/rate-limit.js";
+import {
+  createDiagnosticsWebSocketConnection,
+  DiagnosticsTransportError,
+  type DiagnosticsAuthenticatedArtifactTransport,
+} from "./privacy-operations/diagnostics-websocket-transport.js";
 import {
   createSubscriptionRegistry,
   type RegisteredConnection,
@@ -211,6 +232,14 @@ export interface ToolSafetyAuthorityTransport {
   }>>;
 }
 
+export interface NotificationAuthorityTransport {
+  execute(operation: NotificationAuthorityOperation): Promise<NotificationAuthorityResult>;
+}
+
+export interface RoomExportAuthorityTransport {
+  streamRoomExport(accessToken: string, roomId: string, signal?: AbortSignal): AsyncIterable<Uint8Array>;
+}
+
 export interface StartMessageWebSocketServerOptions {
   readonly auth: AuthenticationService;
   readonly service: MessageService;
@@ -251,6 +280,9 @@ export interface StartMessageWebSocketServerOptions {
   readonly agentSettingsAuthority?: Ft07AgentSettingsAuthorityTransport;
   readonly previewAuthority?: AgentPreviewDeliveryAuthority;
   readonly projectLoopAuthority?: ProjectLoopAuthorityTransport;
+  readonly notificationAuthority?: NotificationAuthorityTransport;
+  readonly roomExportAuthority?: RoomExportAuthorityTransport;
+  readonly diagnosticsAuthority?: DiagnosticsAuthenticatedArtifactTransport;
   readonly governance?: Pick<CommandStore, "executeHuman"> &
     Pick<SyncQueryStore, "readRoomGovernance"> &
     Partial<ClosedRoomGovernanceTransportStore>;
@@ -314,11 +346,34 @@ interface ConnectionContext {
   readonly ownedStreamingSnapshots: Map<string, AuthenticatedSessionContext>;
   readonly connectionId: string;
   readonly v2GatesByRoom: Map<string, V2SubscriptionGate>;
+  readonly notificationRateLimit: NotificationRateLimitState;
+  readonly roomExportStreams: Map<string, RoomExportStreamState>;
+  readonly releaseRoomExportStreams: () => void;
+  diagnosticsConnection: ReturnType<typeof createDiagnosticsWebSocketConnection> | undefined;
+  readonly releaseDiagnosticsConnection: () => void;
   readonly clearLiveSubscriptions: () => void;
   readonly clearRoomSubscriptions: () => void;
   readonly releaseSnapshotOwners: () => void;
   readonly unsubscribeAll: () => void;
   registeredConnection: RegisteredConnection | undefined;
+}
+
+interface RoomExportStreamState {
+  readonly streamId: string;
+  /** Open request identity accepted as an abort alias while the client awaits opened. */
+  readonly provisionalStreamId: string;
+  readonly roomId: string;
+  readonly actorId: string;
+  readonly sessionFamilyId: string;
+  readonly sessionId: string;
+  readonly credentialGeneration: number;
+  readonly controller: AbortController;
+  readonly iterator: AsyncIterator<Uint8Array>;
+  source: Uint8Array | undefined;
+  sourceOffset: number;
+  offset: number;
+  eof: boolean;
+  active: boolean;
 }
 
 interface V2SubscriptionGate {
@@ -1189,6 +1244,8 @@ function installAuthentication(
   if (context.closed) {
     return false;
   }
+  context.releaseRoomExportStreams();
+  context.releaseDiagnosticsConnection();
   context.credentialGeneration += 1;
   context.refreshPreviewSubscriptionEpochs();
   for (const gate of [...context.v2GatesByRoom.values()]) {
@@ -1239,6 +1296,8 @@ function clearAuthentication(
     return false;
   }
   context.credentialGeneration += 1;
+  context.releaseRoomExportStreams();
+  context.releaseDiagnosticsConnection();
   if (!preserveRefreshState) {
     context.principal = undefined;
     context.session = undefined;
@@ -1553,7 +1612,18 @@ function isCorrelatedRecoveryResponse(
       | "tool.confirmation.handoff.offer"
       | "tool.confirmation.handoff.accept"
       | "tool.outcome.review"
-      | "tool.compensation.propose";
+      | "tool.compensation.propose"
+      | "notification.list"
+      | "notification.mark-read"
+      | "notification.source.resolve"
+      | "notification.tool-result.acknowledge"
+      | "notification.execution-result.acknowledge"
+      | "room-export.open"
+      | "room-export.read"
+      | "room-export.abort"
+      | "diagnostics.generate"
+      | "diagnostics.read"
+      | "diagnostics.abort";
   }>,
   response: unknown,
 ): response is ServerFrame {
@@ -1704,7 +1774,18 @@ async function handleRecoveryFrame(
       | "tool.confirmation.handoff.offer"
       | "tool.confirmation.handoff.accept"
       | "tool.outcome.review"
-      | "tool.compensation.propose";
+      | "tool.compensation.propose"
+      | "notification.list"
+      | "notification.mark-read"
+      | "notification.source.resolve"
+      | "notification.tool-result.acknowledge"
+      | "notification.execution-result.acknowledge"
+      | "room-export.open"
+      | "room-export.read"
+      | "room-export.abort"
+      | "diagnostics.generate"
+      | "diagnostics.read"
+      | "diagnostics.abort";
   }>,
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
@@ -2552,6 +2633,295 @@ async function handleFt07AgentSettingsFrame(
   }
 }
 
+const ROOM_EXPORT_MAX_SOURCE_CHUNK_BYTES = 1_048_576;
+
+function releaseRoomExportStream(
+  context: ConnectionContext,
+  state: RoomExportStreamState,
+): void {
+  if (!state.active) return;
+  state.active = false;
+  state.source = undefined;
+  if (context.roomExportStreams.get(state.streamId) === state) {
+    context.roomExportStreams.delete(state.streamId);
+  }
+  state.controller.abort(Object.assign(new Error("Room export client aborted"), {
+    code: "client_aborted",
+  }));
+  try {
+    const returned = state.iterator.return?.();
+    if (returned !== undefined) void returned.catch(() => undefined);
+  } catch {
+    // The stream is already locally unavailable; cleanup remains fail closed.
+  }
+}
+
+function findRoomExportStream(
+  context: ConnectionContext,
+  streamId: string,
+): RoomExportStreamState | undefined {
+  const exact = context.roomExportStreams.get(streamId);
+  if (exact !== undefined) return exact;
+  return [...context.roomExportStreams.values()].find((candidate) =>
+    candidate.active && candidate.provisionalStreamId === streamId);
+}
+
+function roomExportBindingMatches(
+  state: RoomExportStreamState,
+  session: AuthenticatedSessionContext,
+  context: ConnectionContext,
+): boolean {
+  return state.active && state.credentialGeneration === context.credentialGeneration &&
+    state.actorId === session.principal.actorId && state.sessionId === session.sessionId &&
+    state.sessionFamilyId === session.sessionFamilyId;
+}
+
+async function loadRoomExportSource(state: RoomExportStreamState): Promise<void> {
+  let emptyChunks = 0;
+  while (state.active && !state.eof &&
+      (state.source === undefined || state.sourceOffset >= state.source.byteLength)) {
+    const signal = state.controller.signal;
+    if (signal.aborted) throw signal.reason;
+    let rejectAborted!: (error: unknown) => void;
+    const aborted = new Promise<never>((_resolve, reject) => { rejectAborted = reject; });
+    const onAbort = () => rejectAborted(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    let pending: Promise<IteratorResult<Uint8Array>>;
+    try { pending = Promise.resolve(state.iterator.next()); }
+    catch (error) { pending = Promise.reject(error); }
+    // Promise.race observes a late rejection. releaseRoomExportStream has already
+    // issued iterator.return(), so a late result also drains into that cleanup.
+    void pending.catch(() => undefined);
+    let next: IteratorResult<Uint8Array>;
+    try { next = await Promise.race([pending, aborted]); }
+    finally { signal.removeEventListener("abort", onAbort); }
+    if (!state.active) return;
+    if (next.done === true) {
+      state.source = undefined;
+      state.sourceOffset = 0;
+      state.eof = true;
+      return;
+    }
+    const candidate: unknown = next.value;
+    if (!ArrayBuffer.isView(candidate) || !("BYTES_PER_ELEMENT" in candidate) ||
+        candidate.BYTES_PER_ELEMENT !== 1 ||
+        !Number.isSafeInteger(candidate.byteLength) || candidate.byteLength < 0 ||
+        candidate.byteLength > ROOM_EXPORT_MAX_SOURCE_CHUNK_BYTES) {
+      throw new TypeError("Room export authority returned an invalid source chunk");
+    }
+    const bytes = new Uint8Array(candidate.byteLength);
+    bytes.set(new Uint8Array(candidate.buffer, candidate.byteOffset, candidate.byteLength));
+    if (bytes.byteLength === 0) {
+      emptyChunks += 1;
+      if (emptyChunks >= 16) {
+        throw new TypeError("Room export authority returned too many empty chunks");
+      }
+      continue;
+    }
+    state.source = bytes;
+    state.sourceOffset = 0;
+  }
+}
+
+function roomExportFailure(error: unknown, requestId: string): ProtocolErrorFrame {
+  if (typeof error === "object" && error !== null) {
+    if ("code" in error && error.code === "client_aborted") {
+      return errorFrame(410, "room_export_stream_gone", "room_export_stream_gone", requestId);
+    }
+    if ("status" in error && error.status === 429) {
+      return errorFrame(429, "room_export_capacity_limited",
+        "room_export_capacity_limited", requestId);
+    }
+    if ("code" in error && error.code === "operations_timeout") {
+      return errorFrame(503, "room_export_timeout", "room_export_timeout", requestId);
+    }
+    if (("code" in error && error.code === "storage_unavailable") ||
+        ("status" in error && error.status === 503) ||
+        error instanceof TypeError || error instanceof RangeError) {
+      return errorFrame(503, "storage_unavailable", "storage_unavailable", requestId);
+    }
+    if (("code" in error && error.code === "room_export_forbidden") ||
+        ("status" in error && error.status === 403)) {
+      return errorFrame(403, "room_export_forbidden", "room_export_forbidden", requestId);
+    }
+  }
+  return errorFrame(403, "room_export_forbidden", "room_export_forbidden", requestId);
+}
+
+async function handleRoomExportFrame(
+  socket: WebSocket,
+  frame: RoomExportTransportClientFrame,
+  options: RuntimeMessageWebSocketServerOptions,
+  context: ConnectionContext,
+): Promise<void> {
+  const session = await requireSession(socket, frame.requestId, options, context);
+  if (session === undefined) return;
+  const generation = context.credentialGeneration;
+  const authority = options.roomExportAuthority;
+  if (authority === undefined) {
+    sendCurrentGeneration(socket, errorFrame(
+      503, "storage_unavailable", "storage_unavailable", frame.requestId,
+    ), generation, context);
+    return;
+  }
+
+  if (frame.type === "room-export.open") {
+    if (context.roomExportStreams.size >= ROOM_EXPORT_TRANSPORT_MAX_STREAMS_PER_CONNECTION) {
+      sendCurrentGeneration(socket, {
+        type: "error", status: 429, code: "room_export_capacity_limited",
+        message: "room_export_capacity_limited", requestId: frame.requestId,
+        retryAfterSeconds: 1,
+      }, generation, context);
+      return;
+    }
+    const accessToken = context.accessToken;
+    if (accessToken === undefined) {
+      sendCurrentGeneration(socket, errorFrame(
+        401, "unauthenticated", "Authentication is required", frame.requestId,
+      ), generation, context);
+      return;
+    }
+    const streamId = `room-export-${randomUUID()}`;
+    const controller = new AbortController();
+    const iterator = authority.streamRoomExport(
+      accessToken, frame.roomId, controller.signal,
+    )[Symbol.asyncIterator]();
+    const state: RoomExportStreamState = {
+      streamId,
+      provisionalStreamId: frame.requestId,
+      roomId: frame.roomId,
+      actorId: session.principal.actorId,
+      sessionFamilyId: session.sessionFamilyId,
+      sessionId: session.sessionId,
+      credentialGeneration: generation,
+      controller,
+      iterator,
+      source: undefined,
+      sourceOffset: 0,
+      offset: 0,
+      eof: false,
+      active: true,
+    };
+    context.roomExportStreams.set(streamId, state);
+    try {
+      // Prime authorization so a successful open never precedes a 403/503 authority result.
+      await loadRoomExportSource(state);
+      if (!roomExportBindingMatches(state, session, context)) {
+        releaseRoomExportStream(context, state);
+        return;
+      }
+      const sent = await sendFrameWithResult(socket, {
+        type: "room-export.opened", requestId: frame.requestId, streamId,
+        roomId: frame.roomId, chunkSize: ROOM_EXPORT_TRANSPORT_MAX_CHUNK_BYTES,
+      });
+      if (!sent.accepted) releaseRoomExportStream(context, state);
+    } catch (error: unknown) {
+      releaseRoomExportStream(context, state);
+      sendCurrentGeneration(socket, roomExportFailure(error, frame.requestId), generation, context);
+    }
+    return;
+  }
+
+  const state = findRoomExportStream(context, frame.streamId);
+  if (state === undefined) {
+    sendCurrentGeneration(socket, errorFrame(
+      410, "room_export_stream_gone", "room_export_stream_gone", frame.requestId,
+    ), generation, context);
+    return;
+  }
+  if (!roomExportBindingMatches(state, session, context)) {
+    releaseRoomExportStream(context, state);
+    sendCurrentGeneration(socket, errorFrame(
+      403, "room_export_forbidden", "room_export_forbidden", frame.requestId,
+    ), generation, context);
+    return;
+  }
+  if (frame.type === "room-export.abort") {
+    releaseRoomExportStream(context, state);
+    await sendFrameWithResult(socket, {
+      type: "room-export.aborted", requestId: frame.requestId, streamId: frame.streamId,
+    });
+    return;
+  }
+  if (frame.offset !== state.offset) {
+    sendCurrentGeneration(socket, errorFrame(
+      409, "room_export_stream_conflict", "room_export_stream_conflict", frame.requestId,
+    ), generation, context);
+    return;
+  }
+
+  try {
+    await loadRoomExportSource(state);
+    if (!roomExportBindingMatches(state, session, context)) {
+      releaseRoomExportStream(context, state);
+      return;
+    }
+    const source = state.source;
+    const bytes = source === undefined
+      ? new Uint8Array()
+      : source.subarray(state.sourceOffset,
+        Math.min(source.byteLength, state.sourceOffset + ROOM_EXPORT_TRANSPORT_MAX_CHUNK_BYTES));
+    const eof = state.eof && bytes.byteLength === 0;
+    const sent = await sendFrameWithResult(socket, {
+      type: "room-export.chunk", requestId: frame.requestId, streamId: state.streamId,
+      offset: state.offset, byteLength: bytes.byteLength,
+      base64: Buffer.from(bytes).toString("base64"), eof,
+    });
+    if (!sent.accepted) {
+      releaseRoomExportStream(context, state);
+      return;
+    }
+    state.offset += bytes.byteLength;
+    state.sourceOffset += bytes.byteLength;
+    if (eof) releaseRoomExportStream(context, state);
+  } catch (error: unknown) {
+    releaseRoomExportStream(context, state);
+    sendCurrentGeneration(socket, roomExportFailure(error, frame.requestId), generation, context);
+  }
+}
+
+function diagnosticsFailure(error: unknown, requestId: string): ProtocolErrorFrame {
+  if (error instanceof DiagnosticsTransportError) {
+    const failure = error.diagnosticsError;
+    const retryAfterSeconds = failure.retryAfterMs === undefined
+      ? undefined : Math.max(1, Math.ceil(failure.retryAfterMs / 1_000));
+    return {
+      type: "error",
+      status: failure.status,
+      code: failure.code === "authentication_required" ? "unauthenticated" : failure.code,
+      message: failure.code,
+      requestId,
+      ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
+    };
+  }
+  return errorFrame(503, "diagnostics_unavailable", "diagnostics_unavailable", requestId);
+}
+
+async function handleDiagnosticsFrame(
+  socket: WebSocket,
+  frame: DiagnosticsTransportClientFrame,
+  options: RuntimeMessageWebSocketServerOptions,
+  context: ConnectionContext,
+): Promise<void> {
+  const session = await requireSession(socket, frame.requestId, options, context);
+  if (session === undefined) return;
+  const generation = context.credentialGeneration;
+  const accessToken = context.accessToken;
+  const connection = context.diagnosticsConnection;
+  if (accessToken === undefined || connection === undefined) {
+    sendCurrentGeneration(socket, errorFrame(
+      503, "diagnostics_unavailable", "diagnostics_unavailable", frame.requestId,
+    ), generation, context);
+    return;
+  }
+  try {
+    const response = await connection.handle(accessToken, frame);
+    sendCurrentGeneration(socket, response, generation, context);
+  } catch (error) {
+    sendCurrentGeneration(socket, diagnosticsFailure(error, frame.requestId), generation, context);
+  }
+}
+
 async function handleFrame(
   socket: WebSocket,
   frame: ClientFrame,
@@ -2562,6 +2932,106 @@ async function handleFrame(
     return;
   }
   switch (frame.type) {
+    case "diagnostics.generate":
+    case "diagnostics.read":
+    case "diagnostics.abort":
+      await handleDiagnosticsFrame(socket, frame, options, context);
+      return;
+    case "room-export.open":
+    case "room-export.read":
+    case "room-export.abort":
+      await handleRoomExportFrame(socket, frame, options, context);
+      return;
+    case "notification.list":
+    case "notification.mark-read":
+    case "notification.source.resolve":
+    case "notification.tool-result.acknowledge":
+    case "notification.execution-result.acknowledge": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      const generation = context.credentialGeneration;
+      if (options.notificationAuthority === undefined) {
+        sendCurrentGeneration(socket, { type: "error", status: 503,
+          code: "storage_unavailable", message: "Notification authority is unavailable",
+          requestId: frame.requestId }, generation, context);
+        return;
+      }
+      const now = Date.now();
+      const rateLimit = consumeNotificationRateLimit(context.notificationRateLimit, now);
+      if (!rateLimit.allowed) {
+        sendCurrentGeneration(socket, {
+          type: "error",
+          status: 429,
+          code: "rate_limited",
+          message: "rate_limited",
+          requestId: frame.requestId,
+          retryAfterSeconds: Math.max(1, Math.ceil(rateLimit.retryAfterMs / 1_000)),
+        }, generation, context);
+        return;
+      }
+      const operation: NotificationAuthorityOperation = frame.type === "notification.list"
+        ? { type: "notification.list", context: session, roomId: frame.roomId,
+            before: frame.before, limit: frame.limit, now }
+        : frame.type === "notification.mark-read"
+          ? { type: "notification.mark-read", context: session,
+              commandRequestId: frame.requestId, notificationId: frame.notificationId,
+              expectedReadRevision: frame.expectedReadRevision,
+              occurredAt: new Date(now).toISOString(), now }
+          : frame.type === "notification.source.resolve"
+            ? { type: "notification.resolve-source", context: session,
+                notificationId: frame.notificationId, now }
+            : frame.type === "notification.tool-result.acknowledge"
+              ? { type: "notification.acknowledge-tool-result", context: session,
+                  commandRequestId: frame.requestId, notificationId: frame.notificationId,
+                  occurredAt: new Date(now).toISOString(), now }
+              : { type: "notification.acknowledge-execution-result", context: session,
+                  commandRequestId: frame.requestId, notificationId: frame.notificationId,
+                  occurredAt: new Date(now).toISOString(), now };
+      try {
+        const result = await options.notificationAuthority.execute(operation);
+        if (result.kind === "failure") {
+          const code = result.code === "forbidden" ? "notification_forbidden"
+            : result.code === "not_found" ? "notification_not_found"
+              : result.code === "source_inaccessible" ? "notification_source_gone"
+                : result.code === "revision_conflict" ? "notification_revision_conflict"
+                  : result.code === "unauthenticated" ? "invalid_token"
+                    : result.code === "room_archived" ? "room_archived" : "invalid_parameters";
+          sendCurrentGeneration(socket, { type: "error", status: result.status, code,
+            message: "Notification operation was rejected", requestId: frame.requestId },
+          generation, context);
+          return;
+        }
+        if (result.kind === "list") {
+          sendCurrentGeneration(socket, { type: "notification.list.result",
+            requestId: frame.requestId, notifications: result.notifications,
+            hasMore: result.hasMore, roomBadges: result.roomBadges,
+            identityWatermark: result.identityWatermark }, generation, context);
+          return;
+        }
+        if (result.kind === "read") {
+          sendCurrentGeneration(socket, result.ack, generation, context);
+          return;
+        }
+        if (result.kind === "source") {
+          sendCurrentGeneration(socket, { type: "notification.source.result",
+            requestId: frame.requestId, projection: result.projection }, generation, context);
+          return;
+        }
+        if (result.kind === "acknowledged") {
+          sendCurrentGeneration(socket, { type: frame.type === "notification.tool-result.acknowledge"
+            ? "notification.tool-result.ack" : "notification.execution-result.ack",
+            requestId: frame.requestId, outcome: result.outcome,
+            projection: result.projection }, generation, context);
+          return;
+        }
+        sendCurrentGeneration(socket, { type: "error", status: 503,
+          code: "storage_unavailable", message: "Notification authority returned an internal result",
+          requestId: frame.requestId }, generation, context);
+      } catch (error: unknown) {
+        sendCurrentGeneration(socket, mappedError(error, frame.requestId), generation, context);
+      }
+      return;
+    }
     case "project.snapshot.read":
     case "project.proposal.create":
     case "project.proposal.resolve":
@@ -3396,6 +3866,11 @@ export async function startMessageWebSocketServer(
           ? {}
           : { failureLifecycle: options.outboxFailureLifecycle }),
         ...(options.outboxAlertSink === undefined ? {} : { alertSink: options.outboxAlertSink }),
+        ...(options.notificationAuthority === undefined ? {} : {
+          prepareDelivery: createNotificationRecallOutboxPreparation(
+            options.notificationAuthority,
+          ),
+        }),
         async send(candidate, frame: OutboxDispatchFrame, delivery: OutboxDelivery) {
           const live = liveConnections.get(candidate.connectionId);
           const session = live?.context.session;
@@ -3504,6 +3979,10 @@ export async function startMessageWebSocketServer(
       authorityEpoch: string;
     }>>();
     const ownedStreamingSnapshots = new Map<string, AuthenticatedSessionContext>();
+    const roomExportStreams = new Map<string, RoomExportStreamState>();
+    const createDiagnosticsConnection = () => options.diagnosticsAuthority === undefined
+      ? undefined
+      : createDiagnosticsWebSocketConnection({ authority: options.diagnosticsAuthority });
     const v2GatesByRoom = new Map<string, V2SubscriptionGate>();
     const clearRoomSubscriptions = () => {
       const previewRooms = new Set([
@@ -3527,6 +4006,15 @@ export async function startMessageWebSocketServer(
             candidate.v2GatesByRoom.has(roomId)));
         if (!roomStillSubscribed) visiblePreviewAttemptsByRoom.delete(roomId);
       }
+    };
+    const releaseRoomExportStreams = () => {
+      for (const state of [...roomExportStreams.values()]) {
+        releaseRoomExportStream(context, state);
+      }
+    };
+    const releaseDiagnosticsConnection = () => {
+      context.diagnosticsConnection?.close();
+      context.diagnosticsConnection = context.closed ? undefined : createDiagnosticsConnection();
     };
     const clearLiveSubscriptions = () => {
       clearRoomSubscriptions();
@@ -3587,6 +4075,11 @@ export async function startMessageWebSocketServer(
       ownedStreamingSnapshots,
       connectionId,
       v2GatesByRoom,
+      notificationRateLimit: createNotificationRateLimitState(),
+      roomExportStreams,
+      releaseRoomExportStreams,
+      diagnosticsConnection: createDiagnosticsConnection(),
+      releaseDiagnosticsConnection,
       clearRoomSubscriptions,
       clearLiveSubscriptions,
       releaseSnapshotOwners,
@@ -3628,6 +4121,8 @@ export async function startMessageWebSocketServer(
     let frameQueue = Promise.resolve();
     let queuedFrameCount = 0;
     let queuedFrameBytes = 0;
+    let diagnosticsAbortInFlight = false;
+    let roomExportAbortInFlight = false;
     const abort = () => abortConnection(context);
 
     abortConnectionBySocket.set(socket, abort);
@@ -3649,6 +4144,55 @@ export async function startMessageWebSocketServer(
       ) {
         abortAndTerminate(socket);
         return;
+      }
+      if (!isBinary && !diagnosticsAbortInFlight) {
+        const immediate = parseClientFrame(rawDataToString(raw));
+        if (immediate.ok && immediate.frame.type === "diagnostics.abort" &&
+            context.diagnosticsConnection?.matchesAbort(immediate.frame.streamId) === true) {
+          diagnosticsAbortInFlight = true;
+          queuedFrameCount += 1;
+          queuedFrameBytes += rawBytes;
+          void handleFrame(socket, immediate.frame, runtimeOptions, context)
+            .catch(() => {
+              if (!context.closed) {
+                sendFrame(socket, errorFrame(
+                  500, "internal_error", "Unable to process request", immediate.frame.requestId,
+                ));
+              }
+            })
+            .finally(() => {
+              diagnosticsAbortInFlight = false;
+              queuedFrameCount -= 1;
+              queuedFrameBytes -= rawBytes;
+            });
+          return;
+        }
+      }
+      if (!isBinary && !roomExportAbortInFlight) {
+        const immediate = parseClientFrame(rawDataToString(raw));
+        const stream = immediate.ok && immediate.frame.type === "room-export.abort"
+          ? findRoomExportStream(context, immediate.frame.streamId)
+          : undefined;
+        if (immediate.ok && immediate.frame.type === "room-export.abort" &&
+            stream?.active === true) {
+          roomExportAbortInFlight = true;
+          queuedFrameCount += 1;
+          queuedFrameBytes += rawBytes;
+          void handleFrame(socket, immediate.frame, runtimeOptions, context)
+            .catch(() => {
+              if (!context.closed) {
+                sendFrame(socket, errorFrame(
+                  500, "internal_error", "Unable to process request", immediate.frame.requestId,
+                ));
+              }
+            })
+            .finally(() => {
+              roomExportAbortInFlight = false;
+              queuedFrameCount -= 1;
+              queuedFrameBytes -= rawBytes;
+            });
+          return;
+        }
       }
       queuedFrameCount += 1;
       queuedFrameBytes += rawBytes;

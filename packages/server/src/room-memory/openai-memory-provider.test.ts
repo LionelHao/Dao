@@ -416,6 +416,15 @@ describe("production OpenAI MemoryStewardProvider", () => {
     )).rejects.toMatchObject({ code, retryable });
   });
 
+  it("cancels a rejected provider response body without consuming it", async () => {
+    const cancel = vi.fn();
+    const response = new Response(new ReadableStream<Uint8Array>({ cancel }), { status: 503 });
+    await expect(provider(async () => response).generate(
+      input(), validators(), new AbortController().signal,
+    )).rejects.toMatchObject({ code: "provider_unavailable" });
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
   it("maps network and abort failures without exposing the adapter error", async () => {
     const sentinel = "raw-provider-secret-error";
     await expect(provider(async () => { throw new Error(sentinel); }).generate(

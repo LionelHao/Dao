@@ -46,7 +46,7 @@ describe("FT-05 real AuthorityWorker restart", () => {
 
     let client = await createWorkerDatabaseClient({ databasePath });
     try {
-      await expect(client.inspectSchema()).resolves.toEqual({ version: 27 });
+      await expect(client.inspectSchema()).resolves.toEqual({ version: 29 });
       const claim = await client.executeMemory({ type: "memory.claim", roomId: "room-1",
         jobId: "memory-job:restart", attemptId: "memory-attempt:restart",
         inputSha256: "a".repeat(64), batchSize: 32,

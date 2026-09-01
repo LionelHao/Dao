@@ -7,6 +7,17 @@ import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js"
 import type { InvocationBridge } from "../invocation-runtime/contracts.js";
 import type { ProjectLoopBridge } from "../project-loop/contracts.js";
 import type { ToolSafetyBridge } from "../tool-safety/contracts.js";
+import type { NotificationCenterBridge } from "../notification-center/contracts.js";
+import type { RoomExportBridge } from "../room-export/contracts.js";
+import type { DiagnosticsBridge } from "../diagnostics/contracts.js";
+import type { NotificationToolResultActionBridge } from
+  "../notification-center/tool-result-action-contracts.js";
+import type { NotificationExecutionResultActionBridge } from
+  "../notification-center/execution-result-action-contracts.js";
+import {
+  mountNotificationCenterShell,
+  type NotificationDeepLinkTarget,
+} from "./notification-center/host-adapter.js";
 import { mountAgentSettingsBridgeSurface } from "./agent-settings/bridge-adapter.js";
 import {
   mountGovernanceSurface,
@@ -34,6 +45,7 @@ export interface DesktopRendererEntryPorts {
     root: HTMLElement,
     bridge: GovernanceBridge,
     roomId: string,
+    roomExport?: RoomExportBridge,
   ) => () => void;
   readonly mountMessageAuthoritySurface: (
     root: HTMLElement,
@@ -48,7 +60,7 @@ export interface DesktopRendererEntryPorts {
     roomId: string,
   ) => () => void;
   readonly mountAgentSettingsSurface?: (root: HTMLElement, bridge: AgentSettingsBridge,
-    roomId: string) => () => void;
+    roomId: string, diagnostics?: DiagnosticsBridge) => () => void;
   readonly mountInvocationSurface?: (root: HTMLElement, bridge: InvocationBridge,
     roomId: string, actions: InvocationSurfaceActions) => () => void;
   readonly mountProjectLoopSurface?: (
@@ -63,6 +75,15 @@ export interface DesktopRendererEntryPorts {
     roomId: string,
     actions: { openSource(sourceRef: string): void; newInvocation(): void; reauthenticate(): void },
   ) => () => void;
+  readonly mountNotificationCenterShell?: (options: Readonly<{
+    workspace: HTMLElement;
+    bridge: NotificationCenterBridge;
+    toolResultAction: NotificationToolResultActionBridge;
+    executionResultAction: NotificationExecutionResultActionBridge;
+    roomId: string;
+    onDeepLink(target: NotificationDeepLinkTarget): void;
+    onReauthenticate(): void;
+  }>) => () => void;
 }
 
 const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
@@ -70,9 +91,11 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
   renderRoomJoinReview,
   renderVisualSeparationPreview,
   mountIdentityApp,
-  mountGovernanceSurface: (root: HTMLElement, bridge: GovernanceBridge, roomId: string) =>
+  mountGovernanceSurface: (root: HTMLElement, bridge: GovernanceBridge, roomId: string,
+    roomExport?: RoomExportBridge) =>
     mountGovernanceSurface(root, bridge, {
       roomId,
+      ...(roomExport === undefined ? {} : { roomExport }),
       reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
       onNavigateConflictResolution: (conflict, resolution) => {
         const notice = document.createElement("p");
@@ -107,9 +130,11 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
       reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
     },
   ),
-  mountAgentSettingsSurface: (root: HTMLElement, bridge: AgentSettingsBridge, roomId: string) => mountAgentSettingsBridgeSurface(
+  mountAgentSettingsSurface: (root: HTMLElement, bridge: AgentSettingsBridge, roomId: string,
+    diagnostics?: DiagnosticsBridge) => mountAgentSettingsBridgeSurface(
     root, bridge, roomId, { reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
-      onClose: () => history.back() }),
+      onClose: () => history.back(),
+      ...(diagnostics === undefined ? {} : { diagnostics }) }),
   mountInvocationSurface,
   mountProjectLoopSurface: (root: HTMLElement, bridge: ProjectLoopBridge, roomId: string,
     messageBridge?: MessageAuthorityBridge) => mountProjectLoopBridgeSurface(
@@ -130,6 +155,7 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
     },
     ),
   mountToolSafetySurface: mountToolSafetyBridgeSurface,
+  mountNotificationCenterShell,
 });
 
 const encoder = new TextEncoder();
@@ -175,10 +201,10 @@ function focusRouteEntry(
   };
 }
 
-function navigateRenderer(search: string): void {
+function navigateRenderer(search: string, hash = ""): void {
   const url = new URL(window.location.href);
   url.search = search;
-  url.hash = "";
+  url.hash = hash;
   window.history.pushState(null, "", url);
   window.dispatchEvent(new PopStateEvent("popstate", { state: window.history.state }));
 }
@@ -285,6 +311,11 @@ export function mountDesktopRendererEntry(
   invocation?: InvocationBridge,
   projectLoop?: ProjectLoopBridge,
   toolSafety?: ToolSafetyBridge,
+  notificationCenter?: NotificationCenterBridge,
+  notificationToolResult?: NotificationToolResultActionBridge,
+  notificationExecutionResult?: NotificationExecutionResultActionBridge,
+  roomExport?: RoomExportBridge,
+  diagnostics?: DiagnosticsBridge,
 ): (() => void) | undefined {
   const route = new URLSearchParams(search);
   root.dataset.governanceRouteContract = "closed-v1";
@@ -299,7 +330,9 @@ export function mountDesktopRendererEntry(
       renderGovernanceRouteFailure(root, "Agent Settings bridge 或 Room 标识无效；设置保持锁定。");
       return undefined;
     }
-    return ports.mountAgentSettingsSurface(root, agentSettings, roomId);
+    return diagnostics === undefined
+      ? ports.mountAgentSettingsSurface(root, agentSettings, roomId)
+      : ports.mountAgentSettingsSurface(root, agentSettings, roomId, diagnostics);
   }
 
   if (route.has("message-room")) {
@@ -437,6 +470,37 @@ export function mountDesktopRendererEntry(
         notice.tabIndex = -1; notice.focus();
       }
     };
+    const openNotificationSource = (target: NotificationDeepLinkTarget): void => {
+      if (target.roomId !== roomId) {
+        const hash = `notification-source=${encodeURIComponent(`${target.kind}:${target.targetId}`)}`;
+        navigateRenderer(`?message-room=${encodeURIComponent(target.roomId)}`, hash);
+        return;
+      }
+      const selectors: Readonly<Record<NotificationDeepLinkTarget["kind"], string>> = {
+        message: "[data-message-id]", request: "[data-request-transfer-target]",
+        confirmation: "[data-confirmation-id]", project_boundary: "[data-project-source-ref]",
+        tool_call: "[data-tool-call-id]", agent_execution: "[data-execution-id]",
+        project_obstacle: "[data-obstacle-reason]",
+      };
+      const attribute = selectors[target.kind];
+      const source = [...workspace.querySelectorAll<HTMLElement>(attribute)].find((candidate) =>
+        Object.values(candidate.dataset).includes(target.targetId));
+      if (source !== undefined) {
+        source.tabIndex = -1; source.dataset.sourceHighlighted = "true";
+        source.scrollIntoView({ block: "center", behavior: "auto" }); source.focus();
+        return;
+      }
+      const notice = document.createElement("p"); notice.setAttribute("role", "status");
+      notice.textContent = "来源仍可访问，但当前 Room projection 尚未载入该位置。请刷新对应权威面板。";
+      timeline.prepend(notice); notice.tabIndex = -1; notice.focus();
+    };
+    const disposeNotifications = notificationCenter === undefined || notificationToolResult === undefined ||
+      notificationExecutionResult === undefined ||
+      ports.mountNotificationCenterShell === undefined ? undefined
+      : ports.mountNotificationCenterShell({ workspace, bridge: notificationCenter, roomId,
+          toolResultAction: notificationToolResult,
+          executionResultAction: notificationExecutionResult,
+          onDeepLink: openNotificationSource, onReauthenticate: () => navigateRenderer("") });
     const disposeTools = tools === undefined || toolSafety === undefined ||
       ports.mountToolSafetySurface === undefined ? undefined
       : ports.mountToolSafetySurface(tools, toolSafety, roomId, {
@@ -468,7 +532,20 @@ export function mountDesktopRendererEntry(
           showInvocationHostHandoff(workspace, executions, action, context.executionId);
         },
       });
+    const notificationHash = window.location.hash.startsWith("#notification-source=")
+      ? decodeURIComponent(window.location.hash.slice("#notification-source=".length)) : undefined;
+    if (notificationHash !== undefined) {
+      const separator = notificationHash.indexOf(":");
+      const kind = notificationHash.slice(0, separator) as NotificationDeepLinkTarget["kind"];
+      const targetId = notificationHash.slice(separator + 1);
+      if (separator > 0 && ["message", "request", "confirmation", "project_boundary", "tool_call",
+        "agent_execution", "project_obstacle"].includes(kind) && targetId.length > 0 &&
+        new TextEncoder().encode(targetId).byteLength <= 256) {
+        queueMicrotask(() => openNotificationSource({ roomId, kind, targetId }));
+      }
+    }
     return () => {
+      disposeNotifications?.();
       disposeInvocations?.();
       disposeTools?.();
       disposeProject?.();
@@ -487,7 +564,7 @@ export function mountDesktopRendererEntry(
       renderGovernanceRouteFailure(root, "Desktop 治理桥未加载，Room 内容保持锁定。");
       return undefined;
     }
-    const dispose = ports.mountGovernanceSurface(root, governance, roomId);
+    const dispose = ports.mountGovernanceSurface(root, governance, roomId, roomExport);
     const stopFocus = focusRouteEntry(root, ROUTE_FOCUS_SELECTORS.governance);
     return () => {
       stopFocus();

@@ -180,8 +180,47 @@ export {
 export type {
   MessageWebSocketServer,
   StartMessageWebSocketServerOptions,
+  NotificationAuthorityTransport,
+  RoomExportAuthorityTransport,
   ToolSafetyAuthorityTransport,
 } from "./websocket.js";
+export {
+  isNotificationFrameType,
+  isNotificationServerFrame,
+  parseNotificationClientFrame,
+} from "./notifications/protocol.js";
+export type {
+  NotificationClientFrame,
+  NotificationServerFrame,
+} from "./notifications/protocol.js";
+export type {
+  NotificationAuthorityOperation,
+  NotificationAuthorityResult,
+} from "./notifications/authority-protocol.js";
+export {
+  parsePrivacyOperationsDeploymentConfiguration,
+  validatePrivacyOperationsSharedAuthority,
+  PROVIDER_SECURITY_DISCLOSURE_REVISION,
+} from "./privacy-operations/deployment-configuration.js";
+export type {
+  PrivacyOperationsDeploymentConfiguration,
+} from "./privacy-operations/deployment-configuration.js";
+export {
+  createPrivacyOperationsProductionIntegration,
+  PrivacyOperationsRuntimeError,
+} from "./privacy-operations/production-integration.js";
+export type {
+  PrivacyOperationsProductionIntegration,
+} from "./privacy-operations/production-integration.js";
+export {
+  createAuthenticatedPrivacyOperationsTransport,
+  createPrivacyOperationsMetadataAuditFileSink,
+  createServerPrivateDiagnosticsArtifactStore,
+} from "./privacy-operations/authoritative-host.js";
+export type {
+  AuthenticatedPrivacyOperationsTransport,
+  ServerPrivateDiagnosticsArtifactStore,
+} from "./privacy-operations/authoritative-host.js";
 export {
   CollaborationPrimitiveError,
   createAuthoritativeCollaborationPrimitives,
@@ -224,6 +263,7 @@ export type WorkerDatabaseClient = Omit<
   | "executeBall"
   | "executeMemory"
   | "executeProjectLoop"
+  | "executeNotification"
   | "executeAttachment"
   | "executeTenantAdministration"
   | "executeRoomAssignment"

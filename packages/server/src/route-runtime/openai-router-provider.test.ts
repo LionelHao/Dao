@@ -108,4 +108,27 @@ describe("production OpenAI RouterProvider", () => {
       });
     }
   });
+
+  it("cancels rejected HTTP and content-type response bodies", async () => {
+    const cancelHttp = vi.fn();
+    const cancelContentType = vi.fn();
+    for (const response of [
+      new Response(new ReadableStream<Uint8Array>({ cancel: cancelHttp }), { status: 503 }),
+      new Response(new ReadableStream<Uint8Array>({ cancel: cancelContentType }), {
+        status: 200, headers: { "content-type": "text/plain" },
+      }),
+    ]) {
+      const provider = createOpenAIRouterProvider({
+        endpoint: "https://api.openai.com/v1/responses",
+        model: "router-model",
+        secretProvider: { getSecret: () => "secret" },
+        fetch: async () => response,
+      });
+      await expect(provider.decide(input, new AbortController().signal)).rejects.toMatchObject({
+        code: expect.stringMatching(/^provider_/u),
+      });
+    }
+    expect(cancelHttp).toHaveBeenCalledTimes(1);
+    expect(cancelContentType).toHaveBeenCalledTimes(1);
+  });
 });

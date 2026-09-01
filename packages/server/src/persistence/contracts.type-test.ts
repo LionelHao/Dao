@@ -163,7 +163,9 @@ export type SessionFamilyDeliveryCarriesOnlyRevocation = Assert<
 export type PrincipalDeliveryCarriesOnlyPrivateAuthority = Assert<
   Exclude<
     PrincipalEventType,
-    "identity.room-access.changed" | "attachment.private.status-changed"
+    "identity.room-access.changed" | "attachment.private.status-changed" |
+      "notification.created" | "notification.read" | "notification.handled" |
+      "notification.revoked"
   > extends never ? true : false
 >;
 export type MintedContextIsInternal = Assert<

@@ -25,6 +25,8 @@ async function fixture() {
     databasePath,
     deploymentProviderDisclosure: {
       providerId: "openai-responses", modelId: "gpt-5", credentialReadiness: "noauth" as const,
+      retentionDisabled: true, selectionPolicy: "server-managed-single",
+      disclosureRevision: 1, disclosedAt: "2026-08-24T08:00:00.000Z",
     },
   });
   clients.push(client);
@@ -63,6 +65,8 @@ describe("Tenant administration AuthorityWorker integration", () => {
       version: 1, type: "provider-configuration.disclose", context: session, now: NOW,
     })).resolves.toEqual({ kind: "provider-configuration", provider: {
       providerId: "openai-responses", modelId: "gpt-5", credentialReadiness: "noauth",
+      retentionDisabled: true, selectionPolicy: "server-managed-single",
+      disclosureRevision: 1, disclosedAt: "2026-08-24T08:00:00.000Z",
     } });
     const context = { ...session, kind: "human" as const, requestId: "profile-create-request",
       idempotencyKey: "profile-create-key" };
@@ -112,7 +116,9 @@ describe("Tenant administration AuthorityWorker integration", () => {
     });
     expect(listed).toMatchObject({ kind: "agent-profiles", profiles: [enabled.profile],
       provider: { providerId: "openai-responses", modelId: "gpt-5",
-        credentialReadiness: "noauth" } });
+        credentialReadiness: "noauth", retentionDisabled: true,
+        selectionPolicy: "server-managed-single", disclosureRevision: 1,
+        disclosedAt: "2026-08-24T08:00:00.000Z" } });
     await expect(client.executeTenantAdministration({
       version: 1, type: "agent-profile.get", context: session,
       profileId: created.profile.profileId, now: NOW,

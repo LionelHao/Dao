@@ -33,6 +33,10 @@ import {
   type ManagedRoom,
 } from "@native-im/core";
 import type { GovernanceBridge, GovernanceRemoteState } from "../governance/contracts.js";
+import type {
+  RoomExportBridge,
+  RoomExportClosedError,
+} from "../room-export/contracts.js";
 import {
   renderGovernanceSurface as renderGovernanceFeatureSurface,
 } from "./governance/governance-surface.js";
@@ -100,6 +104,7 @@ export function mountGovernanceSurface(
   options: {
     readonly roomId: string;
     readonly reducedMotion: boolean;
+    readonly roomExport?: RoomExportBridge;
     readonly onNavigateConflictResolution: (
       conflict: DepartureConflict,
       resolution: DepartureResolution,
@@ -110,6 +115,74 @@ export function mountGovernanceSurface(
   let remote: Extract<GovernanceRemoteState, { status: "ready" }> | undefined;
   let dialog: GovernanceDialog | null = null;
   let authoritySequence = 0;
+  let exportOperation:
+    | Readonly<{ status: "idle" | "saving" | "saved" | "cancelled" }>
+    | Readonly<{ status: "failed"; error: RoomExportClosedError }> = { status: "idle" };
+
+  const exportFailure = (error: unknown): RoomExportClosedError => {
+    if (typeof error === "object" && error !== null && "roomExportError" in error) {
+      const value = error.roomExportError;
+      if (typeof value === "object" && value !== null && "status" in value && "code" in value &&
+          [401, 403, 409, 410, 429, 503].includes(Number(value.status))) {
+        return value as RoomExportClosedError;
+      }
+    }
+    return { status: 503, code: "storage_unavailable" };
+  };
+
+  const appendRoomExportControl = (): void => {
+    if (remote === undefined || remote.viewerActorId !== remote.projection.ownerActorId) return;
+    const shell = root.querySelector<HTMLElement>(".dao-governance");
+    if (shell === null) return;
+    const section = document.createElement("section");
+    section.className = "governance-room-export";
+    section.dataset.roomExportControl = "true";
+    section.setAttribute("aria-label", "Room owner 数据导出");
+    const heading = document.createElement("h2");
+    heading.textContent = "Room 数据导出";
+    const explanation = document.createElement("p");
+    explanation.id = `room-export-${options.roomId}-explanation`;
+    explanation.textContent =
+      "导出当前固定 authority watermark 的完整 Room 数据；保存位置只由系统原生对话框选择。";
+    const status = document.createElement("p");
+    status.dataset.roomExportStatus = exportOperation.status;
+    status.setAttribute("role", exportOperation.status === "failed" ? "alert" : "status");
+    status.setAttribute("aria-live", "polite");
+    status.setAttribute("aria-atomic", "true");
+    status.tabIndex = -1;
+    status.textContent = exportOperation.status === "saving"
+      ? "正在生成并保存 Room 导出…"
+      : exportOperation.status === "saved" ? "Room 导出已保存。"
+        : exportOperation.status === "cancelled" ? "已取消保存；服务端导出未写入所选位置。"
+          : exportOperation.status === "failed"
+            ? `导出失败 · ${exportOperation.error.status} ${exportOperation.error.code}` : "";
+    const control = document.createElement("button");
+    control.type = "button";
+    control.dataset.action = "save-room-export";
+    control.textContent = exportOperation.status === "failed" ? "重试导出" : "浏览 / 导出";
+    const online = remote.connection.status === "online";
+    control.disabled = options.roomExport === undefined || !online || exportOperation.status === "saving";
+    control.setAttribute("aria-describedby", explanation.id);
+    if (!online) control.setAttribute("aria-label", "浏览 / 导出（需在线重新授权）");
+    control.addEventListener("click", () => {
+      if (options.roomExport === undefined || !online || exportOperation.status === "saving") return;
+      exportOperation = { status: "saving" };
+      render();
+      void options.roomExport.save({ roomId: options.roomId }).then((result) => {
+        if (!active || result.roomId !== options.roomId) return;
+        exportOperation = { status: result.status === "saved" ? "saved" : "cancelled" };
+        render();
+        root.querySelector<HTMLElement>("[data-room-export-status]")?.focus();
+      }).catch((error: unknown) => {
+        if (!active) return;
+        exportOperation = { status: "failed", error: exportFailure(error) };
+        render();
+        root.querySelector<HTMLElement>("[data-room-export-status]")?.focus();
+      });
+    });
+    section.append(heading, explanation, control, status);
+    shell.append(section);
+  };
 
   const render = (): void => {
     if (remote === undefined) return;
@@ -163,6 +236,7 @@ export function mountGovernanceSurface(
         render();
       },
     });
+    appendRoomExportControl();
   };
 
   const applyRemote = (state: GovernanceRemoteState): void => {

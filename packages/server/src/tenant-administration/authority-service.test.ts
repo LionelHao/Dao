@@ -28,7 +28,13 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
-function fixture() {
+function fixture(providerDisclosure: () => ReturnType<
+  Parameters<typeof createTenantAdministrationAuthority>[0]["providerDisclosure"]
+> = () => ({
+  providerId: "openai-responses", modelId: "gpt-5", credentialReadiness: "ready",
+  retentionDisabled: true, selectionPolicy: "server-managed-single",
+  disclosureRevision: 1, disclosedAt: NOW,
+})) {
   const state: TestState = {
     principalKinds: new Map([
       ["human-owner", "human"],
@@ -104,9 +110,7 @@ function fixture() {
         }
       },
     },
-    providerDisclosure: () => ({
-      providerId: "openai-responses", modelId: "gpt-5", credentialReadiness: "ready",
-    }),
+    providerDisclosure,
     capabilities: ["project.read", "route.participate"],
     tools: ["repository.git-status"],
     clock: () => NOW,
@@ -268,6 +272,8 @@ describe("Global Agent Profile authority", () => {
     const view = await f.authority.queryProfiles("owner-token");
     expect(view).toEqual({ profiles: [], provider: {
       providerId: "openai-responses", modelId: "gpt-5", credentialReadiness: "ready",
+      retentionDisabled: true, selectionPolicy: "server-managed-single",
+      disclosureRevision: 1, disclosedAt: NOW,
     } });
     expect(JSON.stringify(view)).not.toMatch(/room|secret|credentialValue|apiKey/i);
     const sentinel = "sk-secret-sentinel-never-store";
@@ -275,6 +281,25 @@ describe("Global Agent Profile authority", () => {
       providerId: "openai-responses", credential: sentinel,
     })).rejects.toMatchObject({ status: 503, code: "configuration_unsupported" });
     expect(JSON.stringify({ audits: f.state.audits, replay: [...f.state.replay] })).not.toContain(sentinel);
+  });
+
+  it.each([
+    { retentionDisabled: false },
+    { selectionPolicy: "fallback-enabled" },
+    { disclosureRevision: 0 },
+    { disclosedAt: "2026-08-24T06:00:00Z" },
+    { credentialGeneration: 2 },
+    { keyVersion: "provider-key-v2" },
+  ])("rejects non-canonical or secret-adjacent Provider disclosure before returning it %#", async (unsafe) => {
+    const f = fixture(() => ({
+      providerId: "openai-responses", modelId: "gpt-5", credentialReadiness: "ready",
+      retentionDisabled: true, selectionPolicy: "server-managed-single",
+      disclosureRevision: 1, disclosedAt: NOW, ...unsafe,
+    } as never));
+    await bootstrap(f);
+    await expect(f.authority.queryProfiles("owner-token")).rejects.toThrow(
+      "Provider disclosure is invalid",
+    );
   });
 
   it("writes immutable deployment-only audit shapes and rolls conflicts back without audit", async () => {

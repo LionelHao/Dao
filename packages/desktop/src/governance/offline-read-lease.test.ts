@@ -70,6 +70,29 @@ describe("Desktop OfflineReadLease verifier", () => {
     })).toThrowError(expect.objectContaining({ reason: "generation_mismatch" }));
   });
 
+  it("enforces previous-key issuance and verification cutoffs at exact boundaries", () => {
+    const previousKeyWindows = new Map([["key-1", {
+      issuanceCutoffMs: now,
+      verificationCutoffMs: now + 500,
+    }]]);
+    const duringOverlap = createDesktopOfflineReadLeaseVerifier({
+      verificationKeys: new Map([["key-1", keys.publicKey]]), previousKeyWindows,
+      now: () => now + 499,
+    });
+    expect(duringOverlap.verify(token(), binding)).toEqual(claims);
+
+    const issuedAtCutoff = { ...claims, issuedAtMs: now, notBeforeMs: now };
+    expect(() => duringOverlap.verify(token(issuedAtCutoff), binding))
+      .toThrowError(expect.objectContaining({ reason: "key_issuance_cutoff" }));
+
+    const atVerificationCutoff = createDesktopOfflineReadLeaseVerifier({
+      verificationKeys: new Map([["key-1", keys.publicKey]]), previousKeyWindows,
+      now: () => now + 500,
+    });
+    expect(() => atVerificationCutoff.verify(token(), binding))
+      .toThrowError(expect.objectContaining({ reason: "key_verification_cutoff" }));
+  });
+
   it.each([
     ["accountId", { accountId: "other-account" }],
     ["deviceId", { deviceId: "other-device" }],

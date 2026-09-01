@@ -51,12 +51,13 @@ describe("production shared-authority participant composition", () => {
         databasePath: join(directory, "authority.sqlite"),
         snapshotCachePath: join(directory, "snapshot-cache.sqlite"),
         sharedAuthority: {
-          maxOfflineReadLeaseMs: 60_000,
+          maxOfflineReadLeaseMs: 300_000,
           offlineReadLeaseSigning: {
             tenantId: "test-tenant",
             serverSubject: "test-server",
             keyId: "test-key-1",
             privateKey: leaseKeys.privateKey,
+            activatedAtMs: 0,
           },
         },
         listen: { host: "127.0.0.1", port: 0 },
@@ -95,6 +96,39 @@ describe("production shared-authority participant composition", () => {
       maxOfflineReadLeaseMs: 0,
       ballPolicy: { openItemDeadlineMs: 41_000, lightTaskDeadlineMs: 43_000 },
     })).toThrow(/invalid_policy/i);
+  });
+
+  it("fails closed on every startup while the active offline signing key is future-dated", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-future-lease-key-"));
+    const leaseKeys = generateKeyPairSync("ed25519");
+    const options = {
+      databasePath: join(directory, "authority.sqlite"),
+      snapshotCachePath: join(directory, "snapshot-cache.sqlite"),
+      sharedAuthority: {
+        maxOfflineReadLeaseMs: 300_000,
+        offlineReadLeaseSigning: {
+          tenantId: "test-tenant", serverSubject: "test-server", keyId: "future-key",
+          privateKey: leaseKeys.privateKey, activatedAtMs: Date.now() + 60_000,
+        },
+      },
+      listen: { host: "127.0.0.1", port: 0 },
+      actors: [
+        { id: "human-a", kind: "human" as const, displayName: "Human A",
+          reachability: "online" as const },
+      ],
+      identities: { verify: async () => undefined },
+      invitationSecretKey: new Uint8Array(32).fill(17),
+    };
+    try {
+      await expect(startAuthoritativeServerForTest(options, {
+        toolAdapterPathFallbackForTest: true,
+      })).rejects.toMatchObject({ reason: "inactive_signing_key" });
+      await expect(startAuthoritativeServerForTest(options, {
+        toolAdapterPathFallbackForTest: true,
+      })).rejects.toMatchObject({ reason: "inactive_signing_key" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("fails startup capability validation for unknown or undersized model windows", () => {

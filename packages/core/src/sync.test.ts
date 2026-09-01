@@ -836,4 +836,25 @@ describe("pure synchronization contracts", () => {
       ...(records[1] as { value: Record<string, unknown> }).value, targetActorId: undefined,
     } }))).toBe(false);
   });
+
+  it("accepts a recipient notification repair record only for the requested Room", () => {
+    const record = { kind: "notification", value: {
+      recordVersion: "notification.v1", notificationId: "notification-1", roomId: "room-1",
+      recipientActorId: "human-1", notificationKind: "human_request",
+      source: { sourceKind: "project_request", sourceId: "request-1", sourceRevision: 1,
+        sourceBoundaryId: "request-1", ordinal: 0 }, dedupeKey: "a".repeat(64),
+      createdAt: "2026-08-31T08:00:00.000Z", readAt: null, readRevision: 0,
+      handled: false, handledAt: null, sourceAccessible: true,
+      deepLink: { kind: "request", targetId: "request-1" },
+      safeProjection: { titleKey: "human_request", actorId: "human-author" },
+    } };
+    const page = (roomId: string) => ({
+      type: "room.repair.page", requestId: "request-notification",
+      snapshotId: "snapshot-notification", roomId, page: 0, records: [record], watermark: 8,
+      snapshotChecksum: "sha256:notification", hasMore: false, mode: "streaming",
+      idleExpiresAt: "2026-08-31T08:01:00.000Z",
+    });
+    expect(isRoomRepairPage(page("room-1"))).toBe(true);
+    expect(isRoomRepairPage(page("room-2"))).toBe(false);
+  });
 });

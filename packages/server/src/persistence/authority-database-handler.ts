@@ -147,6 +147,16 @@ import {
   type HumanRequestMessageTransactionParticipant,
 } from "../project-loop/message-human-request-participant.js";
 import {
+  persistNotificationProducerEvidenceInTransaction,
+  projectNotificationSourceTerminalInTransaction,
+  revokeNotificationSourceInTransaction,
+} from
+  "../notifications/source-transaction-adapter.js";
+import {
+  appendNotificationIdentityEventInTransaction,
+  revokeAllNotificationsForMembershipInTransaction,
+} from "../notifications/sqlite-authority.js";
+import {
   beginProjectBoundaryExecutionInTransaction,
   claimProjectBoundaryInvocationInTransaction,
   finishProjectBoundaryExecutionInTransaction,
@@ -302,7 +312,12 @@ export async function executeTenantAdministrationAuthorityOperation(
   function deploymentProvider(): DeploymentProviderDisclosure {
     if (provider === undefined || !isProviderIdentifier(provider.providerId) ||
         !isProviderIdentifier(provider.modelId) ||
-        (provider.credentialReadiness !== "ready" && provider.credentialReadiness !== "noauth")) {
+        (provider.credentialReadiness !== "ready" && provider.credentialReadiness !== "noauth") ||
+        provider.retentionDisabled !== true ||
+        provider.selectionPolicy !== "server-managed-single" ||
+        !Number.isSafeInteger(provider.disclosureRevision) || provider.disclosureRevision < 1 ||
+        !Number.isFinite(Date.parse(provider.disclosedAt)) ||
+        new Date(Date.parse(provider.disclosedAt)).toISOString() !== provider.disclosedAt) {
       throw new AuthorityDatabaseError(
         "provider_configuration_unavailable",
         "Deployment Provider configuration is unavailable",
@@ -2128,6 +2143,20 @@ function parseOutboxEvent(
     type: row.eventType,
     payload,
   };
+  if (row.streamKind === "identity" && typeof row.eventType === "string" &&
+      row.eventType.startsWith("notification.")) {
+    const parsed = parsePersistedIdentityEvent({
+      eventId: row.eventId,
+      streamKind: row.streamKind,
+      streamId: row.streamId,
+      streamSeq: row.streamSeq,
+      occurredAt: row.occurredAt,
+      type: row.eventType,
+      payload,
+    });
+    if (parsed.ok) return parsed.value;
+    return fail("storage_unavailable", "Stored notification outbox event is corrupt");
+  }
   if (row.streamKind === "room") {
     const parsed = parsePersistedRoomEvent({ ...envelope, roomId: row.roomId,
       ...(typeof row.eventType === "string" && row.eventType.startsWith("project.")
@@ -2156,6 +2185,14 @@ function isAttachmentPrivateStatusEvent(
   event: PersistedIdentityEvent,
 ): event is PersistedIdentityEvent & { readonly type: "attachment.private.status-changed" } {
   return event.type === "attachment.private.status-changed";
+}
+
+function isNotificationEvent(
+  event: PersistedIdentityEvent,
+): event is PersistedIdentityEvent & { readonly type: "notification.created" |
+  "notification.read" | "notification.handled" | "notification.revoked" } {
+  return event.type === "notification.created" || event.type === "notification.read" ||
+    event.type === "notification.handled" || event.type === "notification.revoked";
 }
 
 export function listPendingOutboxDatabaseQuery(
@@ -2233,7 +2270,8 @@ export function listPendingOutboxDatabaseQuery(
     if (
       row.targetKind === "principal" &&
       event.streamKind === "identity" &&
-      (isRoomAccessChangedEvent(event) || isAttachmentPrivateStatusEvent(event)) &&
+      (isRoomAccessChangedEvent(event) || isAttachmentPrivateStatusEvent(event) ||
+        isNotificationEvent(event)) &&
       event.streamId === row.targetId
     ) {
       return {
@@ -2312,7 +2350,7 @@ export function authorizeOutboxCandidateDatabaseQuery(
   ] as const;
   if (delivery.targetKind === "principal") {
     if (candidate.principal.actorId !== delivery.targetId) return false;
-    return database
+    const sessionIsCurrent = database
       .prepare(
         `SELECT 1 AS allowed
          FROM sessions AS session
@@ -2326,6 +2364,48 @@ export function authorizeOutboxCandidateDatabaseQuery(
            AND actor.kind = 'human'`,
       )
       .get(...sessionParameters)?.allowed === 1;
+    if (!sessionIsCurrent) return false;
+    if (delivery.eventType === "notification.revoked") return true;
+    if (
+      delivery.eventType === "notification.created" ||
+      delivery.eventType === "notification.read" ||
+      delivery.eventType === "notification.handled"
+    ) {
+      let payload: unknown;
+      try {
+        payload = typeof delivery.payloadJson === "string"
+          ? JSON.parse(delivery.payloadJson)
+          : undefined;
+      } catch {
+        return false;
+      }
+      if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+        return false;
+      }
+      const notificationId = Reflect.get(payload, "notificationId");
+      const roomId = Reflect.get(payload, "roomId");
+      const recipientActorId = Reflect.get(payload, "recipientActorId");
+      if (
+        typeof notificationId !== "string" || typeof roomId !== "string" ||
+        recipientActorId !== delivery.targetId
+      ) {
+        return false;
+      }
+      return database.prepare(
+        `SELECT 1 AS allowed
+         FROM notifications AS notification
+         JOIN room_memberships AS membership
+           ON membership.room_id = notification.room_id
+          AND membership.actor_id = notification.recipient_actor_id
+         JOIN rooms AS room ON room.id = notification.room_id
+         WHERE notification.notification_id = ?
+           AND notification.room_id = ?
+           AND notification.recipient_actor_id = ?
+           AND notification.revoked_at IS NULL
+           AND (room.status = 'active' OR room.status = 'archived')`,
+      ).get(notificationId, roomId, delivery.targetId)?.allowed === 1;
+    }
+    return true;
   }
   if (delivery.targetKind !== "room") return false;
   return database
@@ -2592,6 +2672,12 @@ export function cleanupExpiredIdempotencyDatabaseCommand(
       },
       {
         table: "invocation_human_retry_receipts",
+        expiry: "expires_at",
+        value: nowIso,
+        predicate: "expires_at <= ?",
+      },
+      {
+        table: "notification_command_receipts",
         expiry: "expires_at",
         value: nowIso,
         predicate: "expires_at <= ?",
@@ -3965,6 +4051,16 @@ function commitClosedDeparture(
     acceptedAt,
     authorization.roomId,
   );
+  // Membership removal is the privacy boundary: one set-based update makes the
+  // complete old Room slice permanently inaccessible before membership can be
+  // deleted or later re-created. Per-item events are capped; the access-changed
+  // event below is the complete cache-clear signal.
+  revokeAllNotificationsForMembershipInTransaction(database, {
+    roomId: authorization.roomId,
+    recipientActorId: targetActorId,
+    revokedAt: acceptedAt,
+    eventLimit: 256,
+  }, appendNotificationIdentityEventInTransaction);
   const removed = database.prepare(
         `DELETE FROM room_memberships
          WHERE room_id = ? AND actor_id = ? AND kind = 'human'`,
@@ -5574,6 +5670,16 @@ function executeAgentExecutionTransition(
     payload: execution,
   });
   appendRoomOutbox(database, eventId, command.roomId, streamSeq, acceptedAt, scope, key);
+  if (command.payload.status === "completed" || command.payload.status === "failed") {
+    persistDirectExecutionTerminalNotification(database, {
+      id: command.payload.executionId,
+      roomId: command.roomId,
+      requesterId: String(execution.requesterId),
+      agentId,
+      currentAttemptSeq: 1,
+      status: command.payload.status,
+    }, acceptedAt);
+  }
   return {
     aggregateId: command.payload.executionId,
     eventIds: [eventId],
@@ -5663,6 +5769,49 @@ function runtimeExecutionById(database: DatabaseSync, executionId: string): Agen
     ...(supersedesExecutionIds === undefined ? {} : { supersedesExecutionIds }),
   };
   return execution;
+}
+
+function persistDirectExecutionTerminalNotification(
+  database: DatabaseSync,
+  execution: Readonly<{
+    id: string;
+    roomId: string;
+    requesterId: string;
+    agentId: string;
+    currentAttemptSeq: number;
+    status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  }>,
+  occurredAt: string,
+): void {
+  if (execution.status !== "completed" && execution.status !== "failed") return;
+  const recipient = database.prepare(
+    `SELECT actor.kind AS actorKind, room.status AS roomStatus
+     FROM actors AS actor
+     JOIN room_memberships AS membership ON membership.actor_id = actor.id
+     JOIN rooms AS room ON room.id = membership.room_id
+     WHERE actor.id = ? AND membership.room_id = ? AND membership.kind = 'human'`,
+  ).get(execution.requesterId, execution.roomId);
+  if (recipient?.actorKind !== "human" || recipient.roomStatus !== "active") return;
+  const base = {
+    roomId: execution.roomId,
+    roomLifecycle: "active" as const,
+    createdAt: occurredAt,
+    actorId: execution.agentId,
+    executionId: execution.id,
+    executionVersion: execution.currentAttemptSeq,
+    sourceHumanRecipientActorId: execution.requesterId,
+    recipientRelation: "invocation_source" as const,
+  };
+  const result = execution.status === "completed"
+    ? persistNotificationProducerEvidenceInTransaction(database, {
+        ...base, kind: "agent_execution_completed", executionStatus: "completed",
+      })
+    : persistNotificationProducerEvidenceInTransaction(database, {
+        ...base, kind: "agent_execution_failed", executionStatus: "failed",
+      });
+  if (result === null) {
+    return fail("storage_unavailable", "Terminal direct execution did not produce a notification");
+  }
 }
 
 function runtimeInvocationIntentByExecution(
@@ -8630,6 +8779,7 @@ export function executeRuntimeAuthorityOperation(
       appendRoomOutbox(database, messageEventId, current.roomId, messageSeq, occurredAt, "runtime", "message");
       const execution = runtimeExecutionById(database, operation.executionId);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "completed");
+      persistDirectExecutionTerminalNotification(database, execution, occurredAt);
       return { kind: "execution", execution };
     }
 
@@ -8705,6 +8855,7 @@ export function executeRuntimeAuthorityOperation(
       ).run(occurredAt, occurredAt, operation.errorCode, occurredAt, current.id, current.currentAttemptSeq);
       const execution = runtimeExecutionById(database, current.id);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "dead-lettered", operation.errorCode);
+      persistDirectExecutionTerminalNotification(database, execution, occurredAt);
       const ownedItems = database.prepare(
         `SELECT id
          FROM open_items
@@ -9391,6 +9542,12 @@ export function executeRuntimeAuthorityOperation(
           stableId("runtime-manual-retry-replay-gate", existing.id),
         );
         const execution = runtimeExecutionById(database, existing.id);
+        projectNotificationSourceTerminalInTransaction(database, {
+          sourceKind: "agent_execution",
+          sourceBoundaryId: old.id,
+          sourceTerminal: "execution_result_acknowledged_or_recovered",
+          occurredAt,
+        });
         return {
           kind: "invocation", execution,
           intent: runtimeInvocationIntentByExecution(database, execution.id), replayed: true,
@@ -9449,6 +9606,12 @@ export function executeRuntimeAuthorityOperation(
       const execution = runtimeExecutionById(database, operation.newExecutionId);
       requireRuntimeFrozenHandoff(database, execution.id);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "manual-retry-queued");
+      projectNotificationSourceTerminalInTransaction(database, {
+        sourceKind: "agent_execution",
+        sourceBoundaryId: old.id,
+        sourceTerminal: "execution_result_acknowledged_or_recovered",
+        occurredAt,
+      });
       let response: Extract<RuntimeAuthorityOperationResult, { readonly kind: "invocation" }> = {
         kind: "invocation" as const, execution,
         intent: runtimeInvocationIntentByExecution(database, execution.id), replayed: false,
@@ -11710,6 +11873,12 @@ export function recallHumanMessageDatabaseCommand(
         if (updated.changes !== 1) {
           return fail("message_version_conflict", "Message recall compare-and-set failed");
         }
+        revokeNotificationSourceInTransaction(database, {
+          roomId: input.command.roomId,
+          sourceKind: "message_mention",
+          sourceId: input.command.messageId,
+          revokedAt: recalledAt,
+        });
         database.prepare(
           `UPDATE message_attachment_links SET operational_state = 'excluded_recalled'
            WHERE message_id = ? AND operational_state = 'active'`,

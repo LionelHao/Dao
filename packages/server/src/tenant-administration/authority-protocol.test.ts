@@ -41,7 +41,9 @@ describe("Tenant administration worker protocol", () => {
 
   it("accepts only exact deployment-safe result shapes", () => {
     const provider = { providerId: "openai-responses", modelId: "gpt-5",
-      credentialReadiness: "noauth" as const };
+      credentialReadiness: "noauth" as const, retentionDisabled: true as const,
+      selectionPolicy: "server-managed-single" as const, disclosureRevision: 1,
+      disclosedAt: "2026-08-24T00:00:00.000Z" };
     const profile = {
       profileId: "profile-1", actorId: "agent-1", displayName: "Researcher",
       globalResponsibility: "Verify sources", status: "enabled" as const,
@@ -54,6 +56,17 @@ describe("Tenant administration worker protocol", () => {
       roomId: "room-secret" })).toBe(false);
     expect(isTenantAdministrationResult({ kind: "provider-configuration",
       provider: { ...provider, credential: "secret-sentinel" } })).toBe(false);
+    for (const unsafeProvider of [
+      { ...provider, retentionDisabled: false },
+      { ...provider, selectionPolicy: "fallback-enabled" },
+      { ...provider, disclosureRevision: 0 },
+      { ...provider, disclosedAt: "2026-08-24T00:00:00Z" },
+      { ...provider, credentialGeneration: 2 },
+      { ...provider, keyVersion: "provider-key-v2" },
+    ]) {
+      expect(isTenantAdministrationResult({ kind: "provider-configuration",
+        provider: unsafeProvider })).toBe(false);
+    }
     expect(isTenantAdministrationResult({ kind: "agent-profiles", profiles: [profile], provider }))
       .toBe(true);
 
