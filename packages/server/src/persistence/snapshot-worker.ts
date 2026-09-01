@@ -2272,10 +2272,13 @@ function findReusableForRequest(
                 CASE WHEN access.access_revision IS NULL OR
                           membership.access_revision > access.access_revision
                   THEN membership.access_revision ELSE access.access_revision END AS accessRevision,
-                stream.head_seq AS watermark
+                stream.head_seq AS watermark,
+                identity.head_seq AS identityWatermark
          FROM rooms AS room
          JOIN room_memberships AS membership ON membership.room_id = room.id
          JOIN streams AS stream ON stream.stream_kind = 'room' AND stream.stream_id = room.id
+         JOIN streams AS identity ON identity.stream_kind = 'identity'
+           AND identity.stream_id = membership.actor_id
          LEFT JOIN room_access_authority AS access ON access.room_id = room.id
          WHERE room.id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
       ).get(request.roomId, request.context.principal.actorId);
@@ -2283,7 +2286,7 @@ function findReusableForRequest(
       if (row.roomStatus !== "active" && row.roomStatus !== "archived") return undefined;
       reuseKey = canonicalJson([request.context.principal.actorId,
         request.context.sessionFamilyId, request.roomId,
-        Number(row.watermark), Number(row.accessRevision)]);
+        Number(row.watermark), Number(row.accessRevision), Number(row.identityWatermark)]);
     } else {
       const actor = authority.prepare(
         "SELECT catalog_revision AS catalogRevision FROM actors WHERE id = ?",
@@ -2368,10 +2371,13 @@ function build(
                 CASE WHEN access.access_revision IS NULL OR
                           membership.access_revision > access.access_revision
                   THEN membership.access_revision ELSE access.access_revision END AS accessRevision,
-                stream.head_seq AS watermark
+                stream.head_seq AS watermark,
+                identity.head_seq AS identityWatermark
          FROM rooms AS room
          JOIN room_memberships AS membership ON membership.room_id = room.id
          JOIN streams AS stream ON stream.stream_kind = 'room' AND stream.stream_id = room.id
+         JOIN streams AS identity ON identity.stream_kind = 'identity'
+           AND identity.stream_id = membership.actor_id
          LEFT JOIN room_access_authority AS access ON access.room_id = room.id
          WHERE room.id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
       ).get(request.roomId, request.context.principal.actorId);
@@ -2386,7 +2392,7 @@ function build(
       const accessRevision = Number(row.accessRevision);
       const watermark = Number(row.watermark);
       reuseKey = canonicalJson([request.context.principal.actorId, request.context.sessionFamilyId,
-        request.roomId, watermark, accessRevision]);
+        request.roomId, watermark, accessRevision, Number(row.identityWatermark)]);
       const reusable = findReusable(reuseKey, request.now);
       if (reusable !== undefined) {
         authority.exec("COMMIT"); readTransactionOpen = false;

@@ -1,6 +1,6 @@
 # FT-12 In-app Notifications：生产工程设计
 
-> 日期：2026-08-31  
+> 日期：2026-08-31
 > 状态：Stage 14A 独立实施设计；不是验收或 verified 声明
 > 基线：产品 PRD、`docs/protocols/`、`docs/design/README.md` 当前正式审阅稿
 

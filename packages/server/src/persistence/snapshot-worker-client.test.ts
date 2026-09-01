@@ -1166,6 +1166,68 @@ describe("durable materialized snapshot worker", () => {
     await client.close();
   });
 
+  it("does not reuse a materialized Room snapshot after a recipient notification revision", async () => {
+    const fixture = await createDatabaseFixture({
+      rooms: [{ roomId: "notification-revision-room" }],
+    });
+    const context = fixture.contexts[0]!;
+    const seed = new DatabaseSync(fixture.authorityPath);
+    seedNotificationRepairRecords(seed, context, "notification-revision-room", ["restart"]);
+    seed.close();
+    let client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: async () => undefined,
+      clock: () => 2_000,
+      limits: { ttlMs: 120_000, reuseMinRemainingMs: 60_000 },
+    });
+    const before = await client.beginRoomRepair(
+      context, "notification-revision-before", "notification-revision-room",
+    );
+    if ("kind" in before) throw new Error("unexpected fallback");
+    expect(before.records.find((record) => record.kind === "notification")?.value)
+      .toMatchObject({ notificationId: "notification-restart", readRevision: 0 });
+    await client.close();
+
+    const writer = new DatabaseSync(fixture.authorityPath);
+    writer.exec("BEGIN IMMEDIATE");
+    try {
+      markNotificationReadInTransaction(writer, {
+        notificationId: "notification-restart",
+        principal: { kind: "human", actorId: context.principal.actorId },
+        session: "active",
+        membership: "active",
+        sourceAccessible: true,
+        availability: "ready",
+        expectedReadRevision: 0,
+        readAt: "2026-08-11T03:00:00.000Z",
+      }, appendNotificationIdentityEventInTransaction);
+      writer.exec("COMMIT");
+    } catch (error) {
+      writer.exec("ROLLBACK");
+      throw error;
+    } finally {
+      writer.close();
+    }
+
+    client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: async () => undefined,
+      clock: () => 2_000,
+      limits: { ttlMs: 120_000, reuseMinRemainingMs: 60_000 },
+    });
+    const after = await client.beginRoomRepair(
+      context, "notification-revision-after", "notification-revision-room",
+    );
+    if ("kind" in after) throw new Error("unexpected fallback");
+    expect(after.snapshotId).not.toBe(before.snapshotId);
+    expect(after.records.find((record) => record.kind === "notification")?.value)
+      .toMatchObject({ notificationId: "notification-restart", readRevision: 1 });
+    await expect(client.cacheCountForTest()).resolves.toBe(2);
+    await client.close();
+  });
+
   it("continues after restart and same-family refresh, then expires and cleans only expired", async () => {
     let now = 2_000;
     const original = contextFor("a", "shared");

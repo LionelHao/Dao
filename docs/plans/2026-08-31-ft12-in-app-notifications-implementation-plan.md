@@ -1,6 +1,6 @@
 # FT-12 In-app Notifications：Stage 14 implementation plan
 
-> 日期：2026-08-31  
+> 日期：2026-08-31
 > 依赖：[FT-12 design](./2026-08-31-ft12-in-app-notifications-design.md)、产品 PRD、
 > `docs/protocols/` 与 `docs/design/README.md` 当前正式审阅稿
 

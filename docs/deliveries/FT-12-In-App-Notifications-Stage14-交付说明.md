@@ -101,7 +101,7 @@ confirmation 均不会排入本地 command queue，transport 调用数为 0。
 
 | 验证 | 结果 |
 | --- | --- |
-| 全仓 `corepack pnpm test` | 290 files passed、3 skipped；2941 tests passed、3 skipped；0 failed；807.29s |
+| 全仓 `corepack pnpm test` | 290 files passed、3 skipped；2942 tests passed、3 skipped；0 failed；809.51s |
 | 10k capacity | `sqlite-authority.test.ts` 覆盖 recipient keyset、无 gap/duplicate |
 | `corepack pnpm typecheck` | passed |
 | `corepack pnpm lint` | passed，0 warnings |
@@ -114,9 +114,10 @@ skip 只能按最终实际运行结果记录；focused 分类互相重叠，不�
 
 ## 10. Independent reviewer
 
-最终内容 head 将由独立 Sol high reviewer 检查 recipient 泄漏、read/handled 混淆、source
-inaccessible、archive/reopen、repair/badge、高扇出 recall/outbox restart、真实 WS/Desktop 路径；
-结论只按实际报告回填。
+独立 Sol high reviewer 对首个内容 head 发现 1 个 materialized Room repair snapshot 未绑定
+recipient identity revision 的 P1，以及 1 个 Markdown trailing-whitespace P2。当前修复把 identity
+head 纳入 snapshot reuse key，并增加跨 Worker restart 的 notification revision 防回退测试；两项
+finding 的最终闭环结论等待同一 reviewer 对修复 head 复审后回填。
 
 ## 11. PR、CI、merge 与 Git 状态
 
