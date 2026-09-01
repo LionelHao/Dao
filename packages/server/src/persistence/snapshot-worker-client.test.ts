@@ -42,6 +42,12 @@ import {
   insertLegacyMessageAuthorityRecord,
 } from "./message-authority-legacy-adapter.js";
 import { createWorkerDatabaseClient } from "./worker-database-client.js";
+import {
+  appendNotificationIdentityEventInTransaction,
+  markNotificationReadInTransaction,
+  readNotificationProjectionById,
+  revokeNotificationInTransaction,
+} from "../notifications/sqlite-authority.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -210,6 +216,29 @@ function seedClosedMixedStressRecords(
      ) VALUES ('stress-calibration', ?, 'stress-agent', NULL, '👍',
        '2026-08-11T01:00:05.000Z', 'message-9999', ?)`,
   ).run(roomId, context.principal.actorId);
+}
+
+function seedNotificationRepairRecords(
+  database: DatabaseSync,
+  context: AuthenticatedSessionContext,
+  roomId: string,
+  ids: readonly string[],
+): void {
+  const insert = database.prepare(
+    `INSERT INTO notifications (
+       notification_id, room_id, recipient_actor_id, notification_kind, source_kind,
+       source_id, source_revision, source_boundary_id, source_ordinal, dedupe_key,
+       safe_actor_id, created_at, read_at, read_revision, handled_at, handled_revision,
+       revoked_at, revoke_reason
+     ) VALUES (?, ?, ?, 'human_mention', 'message_mention', ?, 1, ?, 0, ?,
+       NULL, ?, NULL, 0, NULL, 0, NULL, NULL)`,
+  );
+  ids.forEach((id, index) => {
+    const sourceId = `message-notification-${id}`;
+    insert.run(`notification-${id}`, roomId, context.principal.actorId, sourceId,
+      `boundary-${id}`, createHash("sha256").update(`notification-${id}`).digest("hex"),
+      new Date(Date.parse("2026-08-11T02:00:00.000Z") + index).toISOString());
+  });
 }
 
 const ATTACHMENT_SHA_A = "a".repeat(64);
@@ -1137,6 +1166,68 @@ describe("durable materialized snapshot worker", () => {
     await client.close();
   });
 
+  it("does not reuse a materialized Room snapshot after a recipient notification revision", async () => {
+    const fixture = await createDatabaseFixture({
+      rooms: [{ roomId: "notification-revision-room" }],
+    });
+    const context = fixture.contexts[0]!;
+    const seed = new DatabaseSync(fixture.authorityPath);
+    seedNotificationRepairRecords(seed, context, "notification-revision-room", ["restart"]);
+    seed.close();
+    let client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: async () => undefined,
+      clock: () => 2_000,
+      limits: { ttlMs: 120_000, reuseMinRemainingMs: 60_000 },
+    });
+    const before = await client.beginRoomRepair(
+      context, "notification-revision-before", "notification-revision-room",
+    );
+    if ("kind" in before) throw new Error("unexpected fallback");
+    expect(before.records.find((record) => record.kind === "notification")?.value)
+      .toMatchObject({ notificationId: "notification-restart", readRevision: 0 });
+    await client.close();
+
+    const writer = new DatabaseSync(fixture.authorityPath);
+    writer.exec("BEGIN IMMEDIATE");
+    try {
+      markNotificationReadInTransaction(writer, {
+        notificationId: "notification-restart",
+        principal: { kind: "human", actorId: context.principal.actorId },
+        session: "active",
+        membership: "active",
+        sourceAccessible: true,
+        availability: "ready",
+        expectedReadRevision: 0,
+        readAt: "2026-08-11T03:00:00.000Z",
+      }, appendNotificationIdentityEventInTransaction);
+      writer.exec("COMMIT");
+    } catch (error) {
+      writer.exec("ROLLBACK");
+      throw error;
+    } finally {
+      writer.close();
+    }
+
+    client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: async () => undefined,
+      clock: () => 2_000,
+      limits: { ttlMs: 120_000, reuseMinRemainingMs: 60_000 },
+    });
+    const after = await client.beginRoomRepair(
+      context, "notification-revision-after", "notification-revision-room",
+    );
+    if ("kind" in after) throw new Error("unexpected fallback");
+    expect(after.snapshotId).not.toBe(before.snapshotId);
+    expect(after.records.find((record) => record.kind === "notification")?.value)
+      .toMatchObject({ notificationId: "notification-restart", readRevision: 1 });
+    await expect(client.cacheCountForTest()).resolves.toBe(2);
+    await client.close();
+  });
+
   it("continues after restart and same-family refresh, then expires and cleans only expired", async () => {
     let now = 2_000;
     const original = contextFor("a", "shared");
@@ -2033,6 +2124,71 @@ describe("durable materialized snapshot worker", () => {
     );
     expect(paused.hooks.streamingPageScanCount()).toBe(199);
     await paused.client.close();
+    await authority.close();
+  });
+
+  it("keeps notification repair pages on the checksum fixed view across read/create/revoke", async () => {
+    const fixture = await createDatabaseFixture({ rooms: [{ roomId: "notification-fixed-room" }] });
+    const context = fixture.contexts[0]!;
+    const seed = new DatabaseSync(fixture.authorityPath);
+    seedNotificationRepairRecords(seed, context, "notification-fixed-room", ["a", "b", "c", "d", "e"]);
+    seed.close();
+    const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+      streamingAuthority: authority,
+      clock: () => 2_000,
+      limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 2 },
+    });
+    const page0 = await client.beginRoomRepair(
+      context, "notification-fixed-zero", "notification-fixed-room",
+    );
+    if ("kind" in page0 || page0.mode !== "streaming" || !page0.hasMore) {
+      throw new Error("expected multi-page streaming repair");
+    }
+    const writer = new DatabaseSync(fixture.authorityPath);
+    writer.exec("BEGIN IMMEDIATE");
+    try {
+      markNotificationReadInTransaction(writer, { notificationId: "notification-d",
+        principal: { kind: "human", actorId: context.principal.actorId }, session: "active",
+        membership: "active", sourceAccessible: true, availability: "ready",
+        expectedReadRevision: 0, readAt: "2026-08-11T03:00:00.000Z" },
+      appendNotificationIdentityEventInTransaction);
+      seedNotificationRepairRecords(writer, context, "notification-fixed-room", ["f"]);
+      const created = readNotificationProjectionById(writer, "notification-f");
+      if (created === undefined) throw new Error("missing concurrent notification");
+      appendNotificationIdentityEventInTransaction(writer, {
+        type: "notification.created", occurredAt: created.createdAt, payload: created,
+      });
+      revokeNotificationInTransaction(writer, { notificationId: "notification-e",
+        reason: "source_inaccessible", revokedAt: "2026-08-11T03:00:01.000Z" },
+      appendNotificationIdentityEventInTransaction);
+      writer.exec("COMMIT");
+    } catch (error) {
+      writer.exec("ROLLBACK"); throw error;
+    } finally {
+      writer.close();
+    }
+    const records = [...page0.records];
+    let page = page0;
+    while (page.hasMore) {
+      page = await client.readRoomRepairPage(context,
+        `notification-fixed-${page.page + 1}`, page.snapshotId, page.page);
+      records.push(...page.records);
+    }
+    const notifications = records.filter((record) => record.kind === "notification")
+      .map((record) => record.value);
+    expect(notifications.map((value) => value.notificationId)).toEqual([
+      "notification-a", "notification-b", "notification-c", "notification-d", "notification-e",
+    ]);
+    expect(notifications.find((value) => value.notificationId === "notification-d"))
+      .toMatchObject({ readAt: null, readRevision: 0 });
+    expect(page0.snapshotChecksum).toBe(createHash("sha256")
+      .update(canonicalJsonForTest({ kind: "room", values: records, version: 1 }), "utf8")
+      .digest("hex"));
+    await client.close();
     await authority.close();
   });
 

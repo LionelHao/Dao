@@ -15,6 +15,7 @@ import {
   createSubscriptionRegistry,
   type RegisteredConnection,
 } from "./subscription-registry.js";
+import { deriveNotificationProducerIntent } from "./notifications/producer-matrix.js";
 
 const roomEvent: PersistedRoomEvent = {
   eventId: "event-room-1",
@@ -50,6 +51,18 @@ const roomReadEvent: PersistedRoomEvent = {
     readerId: "human-member",
     readAt: "2026-08-11T00:00:00.500Z",
   },
+};
+
+const recalledRoomEvent: PersistedRoomEvent = {
+  eventId: "event-room-recalled-1",
+  streamKind: "room",
+  streamId: "room-1",
+  streamSeq: 3,
+  roomId: "room-1",
+  actorId: "human-author",
+  occurredAt: "2026-08-11T00:00:03.000Z",
+  type: "room.message.recalled",
+  payload: { id: "message-1" },
 };
 
 const messageAuthorityEvent: PersistedRoomEvent = {
@@ -120,6 +133,24 @@ const attachmentPrincipalEvent: PersistedIdentityEvent = {
       provenance: null,
     },
   },
+};
+
+const notificationProjection = deriveNotificationProducerIntent({
+  kind: "human_request", roomId: "room-1", roomLifecycle: "active",
+  createdAt: "2026-08-19T00:00:02.000Z", recipientRelation: "target_pending",
+  requestId: "request-notification-1", requestRevision: 1, requestBoundaryOrdinal: 0,
+  stableTargetHumanActorId: "human-author",
+  targetMembership: "active", requestStatus: "pending_acceptance", actorId: "human-requester",
+})!;
+const notificationPrincipalEvent: PersistedIdentityEvent = {
+  eventId: "event-notification-private-1",
+  streamKind: "identity",
+  streamId: "human-author",
+  streamSeq: 5,
+  actorId: "human-author",
+  occurredAt: notificationProjection.createdAt,
+  type: "notification.created",
+  payload: notificationProjection,
 };
 
 const revokedEvent: PersistedIdentityEvent = {
@@ -250,6 +281,27 @@ describe("OutboxDispatcher", () => {
     expect(send).toHaveBeenCalledWith(
       expect.objectContaining({ connectionId: uploader.connectionId }),
       { ...attachmentPrincipalEvent, streamKind: "principal" },
+      item,
+    );
+  });
+
+  it("dispatches a Notification stable event only through its recipient principal target", async () => {
+    const registry = createSubscriptionRegistry();
+    const recipient = connection("notification-recipient", "human-author");
+    const other = connection("notification-other", "human-other");
+    registry.addPrincipal({ principalId: "human-author", connection: recipient });
+    registry.addPrincipal({ principalId: "human-other", connection: other });
+    const item = delivery("delivery-notification-private", "principal", "human-author",
+      notificationPrincipalEvent);
+    const store = new MemoryOutboxStore([item], () => true);
+    const send = vi.fn(async () => ({ accepted: true as const }));
+    const dispatcher = createOutboxDispatcher({ store, registry, send });
+
+    await expect(dispatcher.flushOnce()).resolves.toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({ connectionId: recipient.connectionId }),
+      notificationPrincipalEvent,
       item,
     );
   });
@@ -580,6 +632,33 @@ describe("OutboxDispatcher", () => {
     await expect(dispatcher.flushOnce()).resolves.toBe(1);
 
     expect(revoke).not.toHaveBeenCalled();
+  });
+
+  it("defers a recall marker for bounded preparation without consuming retry state", async () => {
+    const registry = createSubscriptionRegistry();
+    registry.addRoom({ roomId: "room-1", connection: connection("member", "human-member") });
+    const item = delivery("delivery-recall", "room", "room-1", recalledRoomEvent);
+    const store = new MemoryOutboxStore([item], () => true);
+    const send = vi.fn(async () => ({ accepted: true as const }));
+    let batch = 0;
+    const prepareDelivery = vi.fn(() => {
+      batch += 1;
+      return batch < 3 ? "deferred" as const : "ready" as const;
+    });
+    const firstProcess = createOutboxDispatcher({ store, registry, send, prepareDelivery });
+    await expect(firstProcess.flushOnce()).resolves.toBe(0);
+    expect(store.pending.has(item.deliveryId)).toBe(true);
+    expect(store.failed).toEqual([]);
+    expect(send).not.toHaveBeenCalled();
+
+    // A new dispatcher continues from the same durable pending marker after restart.
+    const restarted = createOutboxDispatcher({ store, registry, send, prepareDelivery });
+    await expect(restarted.flushOnce()).resolves.toBe(0);
+    expect(store.pending.has(item.deliveryId)).toBe(true);
+    await expect(restarted.flushOnce()).resolves.toBe(1);
+    expect(send).toHaveBeenCalledOnce();
+    expect(store.dispatched).toEqual([item.deliveryId]);
+    expect(prepareDelivery).toHaveBeenCalledTimes(3);
   });
 
   it("starts by draining pending rows and can be closed idempotently", async () => {

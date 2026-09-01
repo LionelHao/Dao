@@ -7,6 +7,8 @@ import { isProjectSnapshot } from "@native-im/core";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
 import { listPendingOutboxDatabaseQuery } from "../persistence/authority-database-handler.js";
 import type { JsonValue } from "../persistence/contracts.js";
+import { persistNotificationProducerEvidenceBatchInTransaction } from
+  "../notifications/source-transaction-adapter.js";
 import {
   advanceProjectLoopTimedTransitionsInTransaction,
   executeProjectLoopAuthorityOperation,
@@ -18,6 +20,7 @@ import type { ProjectLoopAuthorityOperation } from "./authority-protocol.js";
 import {
   archiveProjectLoopBoundariesInTransaction,
   reopenProjectLoopBoundariesInTransaction,
+  scanProjectReminderBucketsInTransaction,
 } from "./boundary-authority.js";
 
 const NOW = Date.parse("2026-08-25T08:00:00.000Z");
@@ -169,6 +172,50 @@ function resolveFactProposal(proposalId: string, expectedRevision: number,
       expectedRevision, resolution, reason: resolution === "rejected" ? "Not approved" : null },
     now: NOW + expectedRevision,
   };
+}
+
+function seedPendingRequestNotifications(database: DatabaseSync, input: Readonly<{
+  requestId: string;
+  requesterHumanActorId: string;
+  targetHumanActorId: string;
+}>): void {
+  const occurredAt = new Date(NOW + 1).toISOString();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    persistNotificationProducerEvidenceBatchInTransaction(database, [
+      {
+        kind: "human_mention",
+        roomId: "room-project",
+        roomLifecycle: "active",
+        createdAt: occurredAt,
+        actorId: input.requesterHumanActorId,
+        messageId: "message-1",
+        messageRevision: 1,
+        mentionTargetId: `mention-${input.requestId}`,
+        targetHumanActorId: input.targetHumanActorId,
+        targetMembership: "active",
+        linkedRequestId: input.requestId,
+      },
+      {
+        kind: "human_request",
+        roomId: "room-project",
+        roomLifecycle: "active",
+        createdAt: occurredAt,
+        actorId: input.requesterHumanActorId,
+        recipientRelation: "target_pending",
+        requestId: input.requestId,
+        requestRevision: 1,
+        requestBoundaryOrdinal: 0,
+        stableTargetHumanActorId: input.targetHumanActorId,
+        targetMembership: "active",
+        requestStatus: "pending_acceptance",
+      },
+    ]);
+    database.exec("COMMIT");
+  } catch (error) {
+    try { database.exec("ROLLBACK"); } catch { /* preserve the seed failure */ }
+    throw error;
+  }
 }
 
 describe("Project Loop database authority", () => {
@@ -929,6 +976,11 @@ describe("Project Loop database authority", () => {
               text: "Evidence attached" }], verifier: null } },
       }));
       executeProjectLoopAuthorityOperation(database, resolveFactProposal("request-proposal", 1));
+      seedPendingRequestNotifications(database, {
+        requestId: "request-one",
+        requesterHumanActorId: "human-owner",
+        targetHumanActorId: "human-member",
+      });
       expect(database.prepare(
         `SELECT holder_actor_id AS holder, reason FROM project_ball_boundaries
          WHERE source_kind = 'request' AND status = 'active'`,
@@ -961,6 +1013,27 @@ describe("Project Loop database authority", () => {
       const transferred = executeProjectLoopAuthorityOperation(database, transfer);
       expect(transferred).toMatchObject({ acceptedRevision: 3,
       });
+      expect(database.prepare(
+        `SELECT source_ordinal AS ordinal, source_revision AS sourceRevision,
+                recipient_actor_id AS recipient, handled_at AS handledAt
+         FROM notifications
+         WHERE source_kind = 'project_request' AND source_ordinal IN (2, 3)
+         ORDER BY source_ordinal`,
+      ).all()).toEqual([
+        { ordinal: 2, sourceRevision: 2, recipient: "human-owner", handledAt: null },
+        { ordinal: 3, sourceRevision: 2, recipient: "human-owner",
+          handledAt: new Date(NOW + 2).toISOString() },
+      ]);
+      const notificationEventCountAfterTransfer = database.prepare(
+        `SELECT COUNT(*) AS count FROM events
+         WHERE stream_kind = 'identity' AND event_type LIKE 'notification.%'`,
+      ).get()?.count;
+      expect(executeProjectLoopAuthorityOperation(database, transfer))
+        .toMatchObject({ acceptedRevision: 3, replayed: true });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM events
+         WHERE stream_kind = 'identity' AND event_type LIKE 'notification.%'`,
+      ).get()?.count).toBe(notificationEventCountAfterTransfer);
       expect(database.prepare(
         "SELECT revision, status, target_human_actor_id AS target FROM project_requests WHERE id = 'request-one'",
       ).get()).toEqual({ revision: 2, status: "pending_acceptance", target: "human-owner" });
@@ -1002,8 +1075,141 @@ describe("Project Loop database authority", () => {
         { type: "fact.created", kind: "next_action" },
         { type: "fact.transitioned", kind: "request" },
       ]);
+      expect(database.prepare(
+        `SELECT source_revision AS sourceRevision, source_ordinal AS ordinal,
+                recipient_actor_id AS recipient, handled_at IS NOT NULL AS handled,
+                read_at AS readAt
+         FROM notifications WHERE source_kind = 'project_request'
+         ORDER BY source_ordinal`,
+      ).all()).toEqual([
+        { sourceRevision: 1, ordinal: 0, recipient: "human-member", handled: 1, readAt: null },
+        { sourceRevision: 2, ordinal: 2, recipient: "human-owner", handled: 1, readAt: null },
+        { sourceRevision: 2, ordinal: 3, recipient: "human-owner", handled: 1, readAt: null },
+        { sourceRevision: 3, ordinal: 4, recipient: "human-member", handled: 1, readAt: null },
+        { sourceRevision: 3, ordinal: 5, recipient: "human-owner", handled: 1, readAt: null },
+        { sourceRevision: 4, ordinal: 7, recipient: "human-owner", handled: 1, readAt: null },
+      ]);
+      expect(database.prepare(
+        `SELECT recipient_actor_id AS recipient, handled_at IS NOT NULL AS handled
+         FROM notifications WHERE source_kind = 'message_mention'`,
+      ).get()).toEqual({ recipient: "human-member", handled: 1 });
+      expect(database.prepare(
+        `SELECT event_type AS eventType, COUNT(*) AS count FROM events
+         WHERE stream_kind = 'identity' AND event_type LIKE 'notification.%'
+         GROUP BY event_type ORDER BY event_type`,
+      ).all()).toEqual([
+        { eventType: "notification.created", count: 7 },
+        { eventType: "notification.handled", count: 4 },
+      ]);
     });
   });
+
+  it("rolls back the Request transition and old-boundary handling when result delivery cannot commit", () => {
+    withDatabase((database) => {
+      executeProjectLoopAuthorityOperation(database, createFactProposal({
+        proposalId: "request-rollback-proposal", factKind: "request",
+        factId: "request-rollback", baseRevision: 0,
+        payload: { title: "Rollback", description: "Keep source and notifications atomic",
+          targetHumanActorId: "human-member", acceptanceMode: "next_action",
+          linkedFactKind: null, linkedFactId: null,
+          responsibility: { kind: "next_action", responsibilityId: "rollback-action",
+            title: "Rollback action", description: "Must not be created",
+            owner: { kind: "human", actorId: "human-member" }, dueAt: null,
+            deliverable: "None", acceptanceCriteria: [], verifier: null } },
+      }));
+      executeProjectLoopAuthorityOperation(database,
+        resolveFactProposal("request-rollback-proposal", 1));
+      seedPendingRequestNotifications(database, {
+        requestId: "request-rollback",
+        requesterHumanActorId: "human-owner",
+        targetHumanActorId: "human-member",
+      });
+      database.prepare(
+        "DELETE FROM streams WHERE stream_kind = 'identity' AND stream_id = 'human-owner'",
+      ).run();
+
+      expect(() => executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.fact.transition",
+        context: humanContext("request-rollback-reject", "human-member"),
+        command: { roomId: "room-project", projectId: "room-project", factKind: "request",
+          factId: "request-rollback", expectedRevision: 1, transition: "request.reject",
+          payload: { reason: "Exercise notification rollback" } },
+        now: NOW + 2,
+      })).toThrowError(expect.objectContaining({ code: "storage_unavailable" }));
+
+      expect(database.prepare(
+        `SELECT revision, status, resolution_actor_id AS resolutionActorId
+         FROM project_requests WHERE id = 'request-rollback'`,
+      ).get()).toEqual({ revision: 1, status: "pending_acceptance", resolutionActorId: null });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM notifications
+         WHERE source_boundary_id = 'request-rollback' AND handled_at IS NOT NULL`,
+      ).get()).toEqual({ count: 0 });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM notifications
+         WHERE source_boundary_id = 'request-rollback'`,
+      ).get()).toEqual({ count: 2 });
+      expect(database.prepare(
+        `SELECT event_type AS eventType, COUNT(*) AS count FROM events
+         WHERE stream_kind = 'identity' AND event_type LIKE 'notification.%'
+         GROUP BY event_type ORDER BY event_type`,
+      ).all()).toEqual([{ eventType: "notification.created", count: 2 }]);
+    });
+  });
+
+  it.each([
+    ["request.reject", "rejected", "human-member", "reject"],
+    ["request.cancel", "cancelled", "human-owner", "cancel"],
+  ] as const)("commits %s with old-boundary handling and one requester result",
+    (transition, expectedStatus, transitionActorId, suffix) => {
+      withDatabase((database) => {
+        const requestId = `request-${suffix}-result`;
+        const proposalId = `${requestId}-proposal`;
+        executeProjectLoopAuthorityOperation(database, createFactProposal({
+          proposalId, factKind: "request", factId: requestId, baseRevision: 0,
+          payload: { title: suffix, description: `Exercise ${transition}`,
+            targetHumanActorId: "human-member", acceptanceMode: "next_action",
+            linkedFactKind: null, linkedFactId: null,
+            responsibility: { kind: "next_action", responsibilityId: `${requestId}-action`,
+              title: suffix, description: suffix,
+              owner: { kind: "human", actorId: "human-member" }, dueAt: null,
+              deliverable: suffix, acceptanceCriteria: [], verifier: null } },
+        }));
+        executeProjectLoopAuthorityOperation(database, resolveFactProposal(proposalId, 1));
+        seedPendingRequestNotifications(database, {
+          requestId,
+          requesterHumanActorId: "human-owner",
+          targetHumanActorId: "human-member",
+        });
+
+        executeProjectLoopAuthorityOperation(database, {
+          type: "project-loop.fact.transition",
+          context: humanContext(`${suffix}-request-result`, transitionActorId),
+          command: { roomId: "room-project", projectId: "room-project", factKind: "request",
+            factId: requestId, expectedRevision: 1, transition,
+            payload: { reason: `${suffix} result` } },
+          now: NOW + 2,
+        });
+
+        expect(database.prepare(
+          "SELECT revision, status FROM project_requests WHERE id = ?",
+        ).get(requestId)).toEqual({ revision: 2, status: expectedStatus });
+        expect(database.prepare(
+          `SELECT source_kind AS sourceKind, source_revision AS sourceRevision,
+                  source_ordinal AS ordinal, recipient_actor_id AS recipient,
+                  handled_at IS NOT NULL AS handled, read_at AS readAt
+           FROM notifications WHERE source_boundary_id = ?
+           ORDER BY source_kind, source_ordinal`,
+        ).all(requestId)).toEqual([
+          { sourceKind: "message_mention", sourceRevision: 1, ordinal: 0,
+            recipient: "human-member", handled: 1, readAt: null },
+          { sourceKind: "project_request", sourceRevision: 1, ordinal: 0,
+            recipient: "human-member", handled: 1, readAt: null },
+          { sourceKind: "project_request", sourceRevision: 2, ordinal: 3,
+            recipient: "human-owner", handled: 1, readAt: null },
+        ]);
+      });
+    });
 
   it("persists defer, escalation, and accepted Obstacle transfer authority", () => {
     withDatabase((database) => {
@@ -1032,6 +1238,17 @@ describe("Project Loop database authority", () => {
       ).get()).toEqual({ kind: "review" });
       transition("reopen", 2, "obstacle.reopen", { reason: "Review arrived" });
       transition("cannot", 3, "obstacle.cannot_answer", { reason: "Needs escalation" });
+      expect(database.prepare(
+        `SELECT notification_kind AS notificationKind,
+                recipient_actor_id AS recipientActorId,
+                handled_at AS handledAt
+         FROM notifications WHERE source_kind = 'project_obstacle'
+           AND source_id = 'blocker-one'`,
+      ).get()).toEqual({
+        notificationKind: "cannot_answer_escalation",
+        recipientActorId: "human-member",
+        handledAt: null,
+      });
       const proposed = transition("propose-transfer", 4, "obstacle.transfer_propose", {
         transferProposalId: "transfer-blocker", toOwnerKind: "human",
         toOwnerActorId: "human-owner", reason: "Owner decides",
@@ -1069,6 +1286,11 @@ describe("Project Loop database authority", () => {
       expect(database.prepare(
         "SELECT to_owner_actor_id AS target FROM project_transfer_chain WHERE transfer_id = 'transfer-blocker'",
       ).get()).toEqual({ target: "human-owner" });
+      expect(database.prepare(
+        `SELECT read_at AS readAt, handled_at AS handledAt
+         FROM notifications WHERE source_kind = 'project_obstacle'
+           AND source_id = 'blocker-one'`,
+      ).get()).toEqual({ readAt: null, handledAt: new Date(NOW + 4).toISOString() });
       const repaired = readProjectLoopRepairSnapshotDatabaseQuery(database, {
         roomId: "room-project", projectId: "room-project", watermark: 8,
         afterEventSeq: 0, limit: 50,
@@ -1253,6 +1475,20 @@ describe("Project Loop database authority", () => {
         source: { kind: "message", sourceId: "message-1", sourceRevision: 1,
           roomId: "room-project", visibility: "room" }, summary: "Evidence is ready",
       });
+      const reminder = scanProjectReminderBucketsInTransaction(database, {
+        now: "2026-08-26T08:00:00.000Z",
+        limit: 20,
+        agentProviderReady: false,
+      }, () => {
+        throw new Error("Human reminder must not create an Agent invocation");
+      });
+      expect(reminder.claims).toEqual([
+        expect.objectContaining({
+          status: "claimed",
+          recipientActorId: "human-owner",
+          dispatch: expect.objectContaining({ kind: "human_notification" }),
+        }),
+      ]);
       expect(() => action(agentContext("agent-complete"), "agent-complete", 4,
         "next_action.complete", { completionNote: "Agent cannot verify",
           criteriaSnapshot: [{ criterionId: "criterion-evidence", met: true }] }))
@@ -1260,6 +1496,11 @@ describe("Project Loop database authority", () => {
       action(humanContext("complete-action"), "complete-action", 4, "next_action.complete", {
         completionNote: "Verified", criteriaSnapshot: [{ criterionId: "criterion-evidence", met: true }],
       });
+      expect(database.prepare(
+        `SELECT read_at AS readAt, handled_at AS handledAt
+         FROM notifications WHERE notification_kind = 'project_due'
+           AND recipient_actor_id = 'human-owner'`,
+      ).get()).toEqual({ readAt: null, handledAt: new Date(NOW + 4).toISOString() });
       expect(database.prepare(
         `SELECT status, deliverable, delivery_summary AS deliverySummary,
                 completed_by_human_actor_id AS completedBy

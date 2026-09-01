@@ -22,6 +22,9 @@ const render = (): void => {
     window.dao?.invocation,
     window.dao?.projectLoop,
     window.dao?.toolSafety,
+    window.dao?.notificationCenter,
+    window.dao?.notificationToolResult,
+    window.dao?.notificationExecutionResult,
   );
 };
 

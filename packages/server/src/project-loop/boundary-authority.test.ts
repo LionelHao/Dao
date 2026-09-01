@@ -62,11 +62,22 @@ function fixture(holderKind: "human" | "agent" = "human") {
     );
     CREATE TABLE events (
       event_id TEXT PRIMARY KEY, stream_kind TEXT, stream_id TEXT, stream_seq INTEGER,
-      room_id TEXT, actor_id TEXT, event_type TEXT, occurred_at TEXT, payload_json TEXT
+      room_id TEXT, authority_kind TEXT, actor_id TEXT, event_type TEXT,
+      occurred_at TEXT, payload_json TEXT
     );
     CREATE TABLE outbox_deliveries (
       id TEXT PRIMARY KEY, event_id TEXT, target_kind TEXT, target_id TEXT, stream_seq INTEGER,
       status TEXT, attempts INTEGER, available_at TEXT, delivered_at TEXT, last_error TEXT
+    );
+    CREATE TABLE notifications (
+      notification_id TEXT PRIMARY KEY, room_id TEXT NOT NULL,
+      recipient_actor_id TEXT NOT NULL, notification_kind TEXT NOT NULL,
+      source_kind TEXT NOT NULL, source_id TEXT NOT NULL, source_revision INTEGER NOT NULL,
+      source_boundary_id TEXT NOT NULL, source_ordinal INTEGER NOT NULL,
+      dedupe_key TEXT NOT NULL UNIQUE, safe_actor_id TEXT, created_at TEXT NOT NULL,
+      read_at TEXT, read_revision INTEGER NOT NULL, handled_at TEXT,
+      handled_revision INTEGER NOT NULL, revoked_at TEXT, revoke_reason TEXT,
+      UNIQUE(recipient_actor_id, source_boundary_id, notification_kind, source_ordinal)
     );
     INSERT INTO actors VALUES ('holder-1','${holderKind}'), ('lifecycle-owner','human');
     INSERT INTO rooms VALUES ('room-1','active',4,'lifecycle-owner');
@@ -152,7 +163,7 @@ describe("FT-09 database reminder authority", () => {
         `SELECT event.event_type AS type, delivery.target_kind AS targetKind,
                 delivery.target_id AS targetId
          FROM events AS event JOIN outbox_deliveries AS delivery ON delivery.event_id = event.event_id`,
-      ).get()).toEqual({ type: "project.reminder.due", targetKind: "principal",
+      ).get()).toEqual({ type: "notification.created", targetKind: "principal",
         targetId: "holder-1" });
     } finally { database.close(); }
   });

@@ -19,6 +19,12 @@ import type {
   ToolSafetyAuthorityOperation,
   ToolSafetyAuthorityResult,
 } from "./authority-protocol.js";
+import {
+  persistNotificationProducerEvidenceBatchInTransaction,
+  persistNotificationProducerEvidenceInTransaction,
+  projectNotificationSourceTerminalInTransaction,
+} from "../notifications/source-transaction-adapter.js";
+import type { NotificationProducerEvidence } from "../notifications/producer-matrix.js";
 
 const PHYSICAL_TOOL_IDS = new Set<ToolId>([
   "http-json.read", "repository.git-status", "sandbox-file.write",
@@ -796,6 +802,16 @@ function prepare(
         toolCallId: operation.toolCallId, state: "pending", version: 1,
         safePreview: operation.safePreview, expiresAt: expiry,
       }, occurredAt);
+    const notification = persistNotificationProducerEvidenceInTransaction(database, {
+      kind: "tool_confirmation", roomId: binding.roomId as string,
+      roomLifecycle: "active", createdAt: occurredAt, actorId: binding.agentId as string,
+      confirmationId: operation.confirmation.confirmationId, confirmationRevision: 1,
+      exactPrincipalHumanActorId: principalActorId, principalBinding: "current",
+      confirmationState: "pending",
+    });
+    if (notification === null) {
+      return fail("storage_unavailable", "Pending tool confirmation did not produce a notification");
+    }
     return { kind: "prepared", toolCallId: operation.toolCallId,
       confirmationId: operation.confirmation.confirmationId, version: 1,
       claimBinding: { ...preparedClaimBinding, principalActorId,
@@ -967,6 +983,10 @@ function decide(
       version: operation.expectedVersion + 1,
       safePreview: JSON.parse(row.safePreviewJson as string) as unknown,
     }, occurredAt);
+  projectNotificationSourceTerminalInTransaction(database, {
+    sourceKind: "tool_confirmation", sourceBoundaryId: operation.confirmationId,
+    sourceTerminal: "confirmation_terminal", occurredAt,
+  });
   return { kind: "confirmation-decision", confirmationId: operation.confirmationId,
     state, version: operation.expectedVersion + 1,
     ...(grantId === undefined ? {} : { grantId }), replayed: false };
@@ -1278,10 +1298,13 @@ function settle(
             dispatch.tool_call_id AS toolCallId, call.execution_id AS executionId,
             call.attempt_seq AS attemptSeq, call.tool_id AS toolId,
             confirmation.principal_human_actor_id AS confirmationPrincipalActorId,
+            execution.requester_actor_id AS requesterActorId,
             room.owner_actor_id AS roomOwnerActorId,
+            room.status AS roomLifecycle,
             review.review_id AS reviewId
      FROM tool_dispatches_v2 AS dispatch
      JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+     JOIN agent_executions AS execution ON execution.id = call.execution_id
      JOIN rooms AS room ON room.id = call.room_id
      LEFT JOIN tool_grants_v2 AS grant ON grant.grant_id = dispatch.grant_id
      LEFT JOIN tool_confirmations_v2 AS confirmation
@@ -1405,6 +1428,30 @@ function settle(
         version: nextVersion,
       }, occurredAt);
   }
+  const notificationEvidence: NotificationProducerEvidence[] = [];
+  if (dispatch.roomLifecycle !== "active" && dispatch.roomLifecycle !== "archived") {
+    return fail("storage_unavailable", "Tool settlement Room lifecycle was invalid");
+  }
+  if (typeof dispatch.confirmationPrincipalActorId === "string") {
+    notificationEvidence.push({
+      kind: "tool_result", roomId: dispatch.roomId as string,
+      roomLifecycle: dispatch.roomLifecycle,
+      createdAt: occurredAt, actorId: null, toolCallId: dispatch.toolCallId as string,
+      toolCallRevision: nextVersion,
+      exactRelatedHumanActorId: dispatch.confirmationPrincipalActorId,
+      relation: "confirmation_principal", resultState: operation.state,
+    });
+  }
+  if (typeof dispatch.requesterActorId === "string") {
+    notificationEvidence.push({
+      kind: "tool_result", roomId: dispatch.roomId as string,
+      roomLifecycle: dispatch.roomLifecycle,
+      createdAt: occurredAt, actorId: null, toolCallId: dispatch.toolCallId as string,
+      toolCallRevision: nextVersion, exactRelatedHumanActorId: dispatch.requesterActorId,
+      relation: "invocation_source", resultState: operation.state,
+    });
+  }
+  persistNotificationProducerEvidenceBatchInTransaction(database, notificationEvidence);
   return { kind: "settled", dispatchId: operation.dispatchId,
     state: operation.state, version: nextVersion, replayed: false };
 }
@@ -1592,6 +1639,19 @@ function acceptHandoff(
   writeRepair(database, "tool-handoff", operation.handoffId, row.roomId as string, 2,
     { handoffId: operation.handoffId, confirmationId: row.confirmationId,
       state: "accepted", targetActorId: actorId, version: 2 }, occurredAt);
+  projectNotificationSourceTerminalInTransaction(database, {
+    sourceKind: "tool_confirmation", sourceBoundaryId: row.confirmationId as string,
+    sourceTerminal: "confirmation_terminal", occurredAt,
+  });
+  const notification = persistNotificationProducerEvidenceInTransaction(database, {
+    kind: "tool_confirmation", roomId: row.roomId as string, roomLifecycle: "active",
+    createdAt: occurredAt, actorId, confirmationId: row.confirmationId as string,
+    confirmationRevision: nextVersion, exactPrincipalHumanActorId: actorId,
+    principalBinding: "current", confirmationState: "pending",
+  });
+  if (notification === null) {
+    return fail("storage_unavailable", "Accepted confirmation handoff did not produce a notification");
+  }
   return { kind: "handoff", handoffId: operation.handoffId,
     confirmationId: row.confirmationId as string, state: "accepted",
     version: nextVersion, replayed: false };
@@ -1713,6 +1773,10 @@ function review(
   }
   appendCanonicalParentProjection(database, parent.executionId, occurredAt,
     `side-effect-review-closed:${operation.dispatchId}:${version}`);
+  projectNotificationSourceTerminalInTransaction(database, {
+    sourceKind: "tool_call", sourceBoundaryId: dispatch.toolCallId as string,
+    sourceTerminal: "tool_result_acknowledged_or_reviewed", occurredAt,
+  });
   return { kind: "reviewed", dispatchId: operation.dispatchId, reviewId,
     resolution: operation.resolution, version, replayed: false };
 }
@@ -1896,6 +1960,16 @@ function proposeCompensation(
   writeRepair(database, "tool-confirmation", operation.confirmationId, original.roomId, 1,
     { confirmationId: operation.confirmationId, toolCallId: operation.toolCallId,
       state: "pending", safePreview, expiresAt, version: 1 }, occurredAt);
+  const confirmationNotification = persistNotificationProducerEvidenceInTransaction(database, {
+    kind: "tool_confirmation", roomId: original.roomId, roomLifecycle: "active",
+    createdAt: occurredAt, actorId: original.agentId,
+    confirmationId: operation.confirmationId, confirmationRevision: 1,
+    exactPrincipalHumanActorId: actorId, principalBinding: "current",
+    confirmationState: "pending",
+  });
+  if (confirmationNotification === null) {
+    return fail("storage_unavailable", "Compensation confirmation did not produce a notification");
+  }
   writeRepair(database, "tool-compensation", lineageId, original.roomId, 1,
     { lineageId, originalDispatchId: operation.dispatchId,
       compensationInvocationId: operation.invocationId,
@@ -1951,6 +2025,10 @@ function expire(
       nextVersion, { confirmationId: row.id, toolCallId: row.toolCallId, state: "expired",
         reason: "confirmation_expired", version: nextVersion,
         safePreview: JSON.parse(row.safePreviewJson as string) as unknown }, occurredAt);
+    projectNotificationSourceTerminalInTransaction(database, {
+      sourceKind: "tool_confirmation", sourceBoundaryId: row.id as string,
+      sourceTerminal: "confirmation_terminal", occurredAt,
+    });
     database.prepare(
       `UPDATE agent_execution_runtime_states
        SET public_status = 'failed', phase = 'failed',

@@ -33,6 +33,10 @@ import {
   memoryRepairSegmentDescriptor,
   ROOM_MEMORY_REPAIR_KEYSET_LIMIT,
 } from "../room-memory/repair-descriptor.js";
+import {
+  NOTIFICATION_REPAIR_KEYSET_LIMIT,
+  readNotificationRepairPage,
+} from "../notifications/sqlite-authority.js";
 import { readProjectLoopRepairSnapshotDatabaseQuery } from "../project-loop/database-authority.js";
 import { createProjectLoopRepairSegmentDescriptor } from "../project-loop/repair-descriptor.js";
 import {
@@ -497,6 +501,7 @@ function streamingValues(
     ? registeredRoomRecords(
         authority,
         lease.scope.roomId,
+        lease.principalId,
         lease.version.kind === "room" ? lease.version.watermark : 0,
         () => undefined,
       )
@@ -510,6 +515,8 @@ interface StreamingCursor {
 
 interface StreamingSnapshotState {
   readonly manifest: StreamingSnapshotManifest;
+  /** One read-only WAL snapshot is retained until the bounded streaming lease is released. */
+  readonly authority: DatabaseSync;
   cursor: StreamingCursor | undefined;
   lastServedPage: number;
   replayPage?: {
@@ -697,6 +704,7 @@ const ROOM_REPAIR_KIND_MAP = Object.freeze({
   "tool-review": true,
   "tool-handoff": true,
   "tool-compensation": true,
+  notification: true,
 } as const satisfies Readonly<Record<RoomRepairKind, true>>);
 
 const ROOM_REPAIR_KINDS = Object.freeze(
@@ -1536,6 +1544,22 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
     stableKey: (record) => String(record.kind === "tool-compensation"
       ? record.value.lineageId : ""),
   },
+  {
+    descriptorId: "dao.repair.notification.v1", descriptorVersion: 1,
+    kind: "notification", order: 27,
+    readKeysetPage: (input: RepairKeysetPageInput) => input.principalActorId === undefined
+      ? []
+      : readNotificationRepairPage(
+          input.database,
+          { recipientActorId: input.principalActorId, roomId: input.roomId,
+            afterNotificationId: input.afterKey, limit: input.limit },
+        ),
+    mapRow: (row: unknown) => row as Extract<RoomRepairRecord, {
+      readonly kind: "notification";
+    }>,
+    stableKey: (record) => String(record.kind === "notification"
+      ? record.value.notificationId : ""),
+  },
 ] as const satisfies readonly RoomRepairSegmentDescriptor<RoomRepairKind, RoomRepairRecord>[]);
 
 const ROOM_REPAIR_REGISTRY = createGuardedClosedRepairProjectionRegistry<
@@ -1562,6 +1586,7 @@ const ROOM_REPAIR_REGISTRY = createGuardedClosedRepairProjectionRegistry<
 function registeredRoomRecords(
   authority: DatabaseSync,
   roomId: string,
+  principalActorId: string,
   watermark: number,
   recordScanned: () => void,
 ): readonly RoomRepairRecord[] {
@@ -1572,6 +1597,7 @@ function registeredRoomRecords(
       const page = ROOM_REPAIR_REGISTRY.readStablePage({
         database: authority,
         roomId,
+        principalActorId,
         watermark,
         afterKey,
         limit: data.limits.scanBatchSize,
@@ -1593,6 +1619,7 @@ function registeredRoomRecords(
 function keysetRoomPage(
   authority: DatabaseSync,
   roomId: string,
+  principalActorId: string,
   watermark: number,
   initial: StreamingCursor | undefined,
   limit: number,
@@ -1606,10 +1633,13 @@ function keysetRoomPage(
     const remaining = limit - values.length;
     const descriptorLimit = descriptor.kind === "memory"
       ? Math.min(remaining, ROOM_MEMORY_REPAIR_KEYSET_LIMIT)
-      : remaining;
+      : descriptor.kind === "notification"
+        ? Math.min(remaining, NOTIFICATION_REPAIR_KEYSET_LIMIT)
+        : remaining;
     const page = ROOM_REPAIR_REGISTRY.readStablePage({
       database: authority,
       roomId,
+      principalActorId,
       watermark,
       afterKey: key,
       limit: descriptorLimit,
@@ -1662,8 +1692,8 @@ function keysetCatalogPage(
 
 function streamingChecksumAndCount(
   lease: StreamingRepairLease,
-): { readonly checksum: string; readonly count: number } {
-  const authority = openAuthorityPreflight();
+): { readonly checksum: string; readonly count: number; readonly authority: DatabaseSync } {
+  const authority = openAuthorityReadView();
   try {
     const kind = lease.scope.kind;
     const digest = createHash("sha256");
@@ -1675,10 +1705,17 @@ function streamingChecksumAndCount(
       countValue += 1;
     }
     digest.update(`],"version":1}`, "utf8");
-    return { checksum: digest.digest("hex"), count: countValue };
-  } finally {
+    return { checksum: digest.digest("hex"), count: countValue, authority };
+  } catch (cause: unknown) {
+    try { authority.exec("ROLLBACK"); } catch { /* preserve cause */ }
     authority.close();
+    throw cause;
   }
+}
+
+function closeStreamingSnapshot(state: StreamingSnapshotState): void {
+  try { state.authority.exec("ROLLBACK"); } catch { /* read view may already be closed */ }
+  try { state.authority.close(); } catch { /* release remains idempotent */ }
 }
 
 function streamingPageEnvelope(
@@ -1748,18 +1785,17 @@ function readStreamingPage(
   if (page !== state.lastServedPage + 1) {
     throw new SnapshotBuildError("invalid_request", "Streaming pages must be read continuously");
   }
-  const authority = openAuthorityPreflight();
-  try {
-    const selected = lease.scope.kind === "room"
+  const selected = lease.scope.kind === "room"
       ? keysetRoomPage(
-          authority,
+          state.authority,
           lease.scope.roomId,
+          lease.principalId,
           lease.version.kind === "room" ? lease.version.watermark : 0,
           state.cursor,
           data.limits.maxRecordsPerPage,
         )
       : keysetCatalogPage(
-          authority, lease.scope.principalId, state.cursor, data.limits.maxRecordsPerPage,
+          state.authority, lease.scope.principalId, state.cursor, data.limits.maxRecordsPerPage,
         );
     const expectedCount = page === manifest.pageCount - 1
       ? undefined : data.limits.maxRecordsPerPage;
@@ -1771,10 +1807,7 @@ function readStreamingPage(
     state.cursor = selected.cursor;
     state.lastServedPage = page;
     state.replayPage = { page, values: selected.values };
-    return streamingPageEnvelope(manifest, requestId, page, selected.values, lease.idleExpiresAt);
-  } finally {
-    authority.close();
-  }
+  return streamingPageEnvelope(manifest, requestId, page, selected.values, lease.idleExpiresAt);
 }
 
 function beginStreaming(
@@ -1821,18 +1854,27 @@ function beginStreaming(
         : (() => { throw new SnapshotBuildError("invalid_request", "Streaming version mismatch"); })();
     const state: StreamingSnapshotState = {
       manifest,
+      authority: measured.authority,
       cursor: undefined,
       lastServedPage: -1,
     };
+    const replaced = streamingSnapshots.get(manifest.snapshotId);
+    if (replaced !== undefined) closeStreamingSnapshot(replaced);
     streamingSnapshots.set(manifest.snapshotId, state);
-    const page = readStreamingPage(
-      state,
-      { ...request.lease, checksum: manifest.checksum, pageCount: manifest.pageCount,
-        lastPage: manifest.pageCount - 1, highestAuthorizedPage: -1 },
-      request.responseRequestId,
-      0,
-    );
-    respond({ type: "snapshot.streaming-page", requestId: request.requestId, page, manifest });
+    try {
+      const page = readStreamingPage(
+        state,
+        { ...request.lease, checksum: manifest.checksum, pageCount: manifest.pageCount,
+          lastPage: manifest.pageCount - 1, highestAuthorizedPage: -1 },
+        request.responseRequestId,
+        0,
+      );
+      respond({ type: "snapshot.streaming-page", requestId: request.requestId, page, manifest });
+    } catch (cause: unknown) {
+      streamingSnapshots.delete(manifest.snapshotId);
+      closeStreamingSnapshot(state);
+      throw cause;
+    }
   } catch (cause: unknown) {
     if (cause instanceof SnapshotBuildError) error(request.requestId, cause.code, cause.message);
     else error(request.requestId, "storage_unavailable", "Streaming snapshot initialization failed");
@@ -2230,10 +2272,13 @@ function findReusableForRequest(
                 CASE WHEN access.access_revision IS NULL OR
                           membership.access_revision > access.access_revision
                   THEN membership.access_revision ELSE access.access_revision END AS accessRevision,
-                stream.head_seq AS watermark
+                stream.head_seq AS watermark,
+                identity.head_seq AS identityWatermark
          FROM rooms AS room
          JOIN room_memberships AS membership ON membership.room_id = room.id
          JOIN streams AS stream ON stream.stream_kind = 'room' AND stream.stream_id = room.id
+         JOIN streams AS identity ON identity.stream_kind = 'identity'
+           AND identity.stream_id = membership.actor_id
          LEFT JOIN room_access_authority AS access ON access.room_id = room.id
          WHERE room.id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
       ).get(request.roomId, request.context.principal.actorId);
@@ -2241,7 +2286,7 @@ function findReusableForRequest(
       if (row.roomStatus !== "active" && row.roomStatus !== "archived") return undefined;
       reuseKey = canonicalJson([request.context.principal.actorId,
         request.context.sessionFamilyId, request.roomId,
-        Number(row.watermark), Number(row.accessRevision)]);
+        Number(row.watermark), Number(row.accessRevision), Number(row.identityWatermark)]);
     } else {
       const actor = authority.prepare(
         "SELECT catalog_revision AS catalogRevision FROM actors WHERE id = ?",
@@ -2326,10 +2371,13 @@ function build(
                 CASE WHEN access.access_revision IS NULL OR
                           membership.access_revision > access.access_revision
                   THEN membership.access_revision ELSE access.access_revision END AS accessRevision,
-                stream.head_seq AS watermark
+                stream.head_seq AS watermark,
+                identity.head_seq AS identityWatermark
          FROM rooms AS room
          JOIN room_memberships AS membership ON membership.room_id = room.id
          JOIN streams AS stream ON stream.stream_kind = 'room' AND stream.stream_id = room.id
+         JOIN streams AS identity ON identity.stream_kind = 'identity'
+           AND identity.stream_id = membership.actor_id
          LEFT JOIN room_access_authority AS access ON access.room_id = room.id
          WHERE room.id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
       ).get(request.roomId, request.context.principal.actorId);
@@ -2344,13 +2392,19 @@ function build(
       const accessRevision = Number(row.accessRevision);
       const watermark = Number(row.watermark);
       reuseKey = canonicalJson([request.context.principal.actorId, request.context.sessionFamilyId,
-        request.roomId, watermark, accessRevision]);
+        request.roomId, watermark, accessRevision, Number(row.identityWatermark)]);
       const reusable = findReusable(reuseKey, request.now);
       if (reusable !== undefined) {
         authority.exec("COMMIT"); readTransactionOpen = false;
         return pageFromCache(reusable, request.responseRequestId, 0);
       }
-      values = registeredRoomRecords(authority, request.roomId, watermark, recordScanned);
+      values = registeredRoomRecords(
+        authority,
+        request.roomId,
+        request.context.principal.actorId,
+        watermark,
+        recordScanned,
+      );
       version = { roomId: request.roomId, watermark };
       const checksum = canonicalChecksum("room", values);
       const snapshotId = randomUUID();
@@ -2461,6 +2515,7 @@ function dispatch(value: unknown): void {
   if (!initialized || closed) { error(value.requestId, "storage_unavailable", "Snapshot worker is unavailable"); return; }
   if (value.type === "snapshot.close") {
     closed = true;
+    for (const state of streamingSnapshots.values()) closeStreamingSnapshot(state);
     streamingSnapshots.clear();
     respond({ type: "snapshot.closed", requestId: value.requestId }); port.close();
     return;
@@ -2474,6 +2529,8 @@ function dispatch(value: unknown): void {
     return;
   }
   if (value.type === "snapshot.release-streaming") {
+    const state = streamingSnapshots.get(value.snapshotId);
+    if (state !== undefined) closeStreamingSnapshot(state);
     streamingSnapshots.delete(value.snapshotId);
     respond({ type: "snapshot.streaming-released", requestId: value.requestId });
     return;

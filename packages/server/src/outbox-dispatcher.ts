@@ -1,4 +1,9 @@
-import { isAttachmentPrivateEvent, isMessage, type AttachmentPrivateEvent } from "@native-im/core";
+import {
+  isAttachmentPrivateEvent,
+  isMessage,
+  type AttachmentPrivateEvent,
+  type NotificationStableEvent,
+} from "@native-im/core";
 import type {
   OutboxDelivery,
   OutboxDeliveryFailureReason,
@@ -25,6 +30,7 @@ export type OutboxDispatchFrame =
   | MessageCreatedFrame
   | RoomEventFrame
   | IdentityRoomAccessChangedFrame
+  | NotificationStableEvent
   | AttachmentPrivateEvent
   | AuthSessionRevokedFrame;
 
@@ -83,6 +89,10 @@ export interface OutboxDispatcherOptions {
   readonly failureLifecycle?: OutboxFailureLifecyclePort;
   readonly alertSink?: OutboxAlertSink;
   readonly afterSendBeforeMark?: (delivery: OutboxDelivery) => Promise<void> | void;
+  /** Runs durable, bounded prerequisite work without consuming delivery retry state. */
+  readonly prepareDelivery?: (
+    delivery: OutboxDelivery,
+  ) => Promise<"ready" | "deferred"> | "ready" | "deferred";
 }
 
 function dispatchFrame(delivery: OutboxDelivery): OutboxDispatchFrame {
@@ -100,6 +110,12 @@ function dispatchFrame(delivery: OutboxDelivery): OutboxDispatchFrame {
         throw new TypeError("Principal attachment delivery is invalid");
       }
       return event;
+    }
+    if (delivery.event.type === "notification.created" ||
+        delivery.event.type === "notification.read" ||
+        delivery.event.type === "notification.handled" ||
+        delivery.event.type === "notification.revoked") {
+      return delivery.event;
     }
     if (delivery.event.type !== "identity.room-access.changed") {
       throw new TypeError("Principal delivery must carry a private identity event");
@@ -248,6 +264,7 @@ export function createOutboxDispatcher(
           throw new RangeError("outbox clock must return a non-negative safe integer");
         }
         if ((retryNotBefore.get(delivery.deliveryId) ?? 0) > currentNow) continue;
+        if (await options.prepareDelivery?.(delivery) === "deferred") continue;
         await observeBacklog(delivery, currentNow);
         const candidates = options.registry.candidates(delivery);
         let failedReason: OutboxDeliveryFailureReason | undefined;

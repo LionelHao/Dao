@@ -180,8 +180,22 @@ export {
 export type {
   MessageWebSocketServer,
   StartMessageWebSocketServerOptions,
+  NotificationAuthorityTransport,
   ToolSafetyAuthorityTransport,
 } from "./websocket.js";
+export {
+  isNotificationFrameType,
+  isNotificationServerFrame,
+  parseNotificationClientFrame,
+} from "./notifications/protocol.js";
+export type {
+  NotificationClientFrame,
+  NotificationServerFrame,
+} from "./notifications/protocol.js";
+export type {
+  NotificationAuthorityOperation,
+  NotificationAuthorityResult,
+} from "./notifications/authority-protocol.js";
 export {
   CollaborationPrimitiveError,
   createAuthoritativeCollaborationPrimitives,
@@ -224,6 +238,7 @@ export type WorkerDatabaseClient = Omit<
   | "executeBall"
   | "executeMemory"
   | "executeProjectLoop"
+  | "executeNotification"
   | "executeAttachment"
   | "executeTenantAdministration"
   | "executeRoomAssignment"

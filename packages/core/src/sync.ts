@@ -72,6 +72,11 @@ import {
   type ProjectRepairRecord,
 } from "./project-loop.js";
 import {
+  isNotificationRepairRecord,
+  type NotificationStableEvent,
+  type NotificationRepairRecord,
+} from "./notification.js";
+import {
   isAgentProfileRecord,
   isCanonicalAgentCapabilitySet,
   isCanonicalAgentToolSet,
@@ -277,7 +282,8 @@ export type RoomRepairRecord =
   | AttachmentRepairRecord
   | RoomMemoryRepairRecord
   | ToolSafetyRepairRecord
-  | ProjectRepairRecord;
+  | ProjectRepairRecord
+  | NotificationRepairRecord;
 
 export type SnapshotVersion =
   | { readonly kind: "room"; readonly roomId: string; readonly watermark: number }
@@ -471,7 +477,8 @@ export type PersistedIdentityEvent =
       "identity.room-access.changed",
       { readonly roomId: string; readonly change: "joined" | "updated" | "removed" | "archived" }
     >
-  | PersistedAttachmentPrivateEvent;
+  | PersistedAttachmentPrivateEvent
+  | NotificationStableEvent;
 
 export type RoomSyncResult =
   | {
@@ -723,6 +730,10 @@ function isRepairRecord(value: unknown, expectedRoomId?: string): value is RoomR
   if (value.kind === "attachment") return isAttachmentRepairRecord(value, expectedRoomId);
   if (value.kind === "memory") return isRoomMemoryRepairRecord(value, expectedRoomId);
   if (value.kind === "project-loop") return isProjectRepairRecord(value, expectedRoomId);
+  if (value.kind === "notification") {
+    return isNotificationRepairRecord(value) &&
+      (!expectedRoomId || value.value.roomId === expectedRoomId);
+  }
   if (value.kind === "tool-call" || value.kind === "tool-confirmation" ||
       value.kind === "tool-grant" || value.kind === "tool-dispatch" ||
       value.kind === "tool-review" || value.kind === "tool-handoff" ||

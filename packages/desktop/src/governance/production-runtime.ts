@@ -87,6 +87,7 @@ export interface DesktopGovernanceRuntime {
   readonly controller: GovernanceController;
   readonly invocations: InvocationController;
   readonly cache: DesktopAuthorityCache;
+  restoreWorkspace(): Promise<void>;
   repairRoom(roomId: string): Promise<void>;
   clearCache(roomId: string): Promise<GovernanceRemoteState>;
   restoreCache(actorId: string): Promise<boolean>;
@@ -361,6 +362,12 @@ export function createDesktopGovernanceRuntime(options: {
     controller,
     invocations,
     cache,
+    async restoreWorkspace() {
+      const session = options.session();
+      if (session === undefined) throw new GovernanceTransportError("authentication_required", 401);
+      await replica.restoreWorkspace();
+      for (const roomId of cache.roomIds()) await refreshOfflineLease(roomId, session);
+    },
     async repairRoom(roomId: string) {
       const session = options.session();
       if (session === undefined) throw new GovernanceTransportError("authentication_required", 401);

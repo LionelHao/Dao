@@ -7,6 +7,15 @@ import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js"
 import type { InvocationBridge } from "../invocation-runtime/contracts.js";
 import type { ProjectLoopBridge } from "../project-loop/contracts.js";
 import type { ToolSafetyBridge } from "../tool-safety/contracts.js";
+import type { NotificationCenterBridge } from "../notification-center/contracts.js";
+import type { NotificationToolResultActionBridge } from
+  "../notification-center/tool-result-action-contracts.js";
+import type { NotificationExecutionResultActionBridge } from
+  "../notification-center/execution-result-action-contracts.js";
+import {
+  mountNotificationCenterShell,
+  type NotificationDeepLinkTarget,
+} from "./notification-center/host-adapter.js";
 import { mountAgentSettingsBridgeSurface } from "./agent-settings/bridge-adapter.js";
 import {
   mountGovernanceSurface,
@@ -63,6 +72,15 @@ export interface DesktopRendererEntryPorts {
     roomId: string,
     actions: { openSource(sourceRef: string): void; newInvocation(): void; reauthenticate(): void },
   ) => () => void;
+  readonly mountNotificationCenterShell?: (options: Readonly<{
+    workspace: HTMLElement;
+    bridge: NotificationCenterBridge;
+    toolResultAction: NotificationToolResultActionBridge;
+    executionResultAction: NotificationExecutionResultActionBridge;
+    roomId: string;
+    onDeepLink(target: NotificationDeepLinkTarget): void;
+    onReauthenticate(): void;
+  }>) => () => void;
 }
 
 const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
@@ -130,6 +148,7 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
     },
     ),
   mountToolSafetySurface: mountToolSafetyBridgeSurface,
+  mountNotificationCenterShell,
 });
 
 const encoder = new TextEncoder();
@@ -175,10 +194,10 @@ function focusRouteEntry(
   };
 }
 
-function navigateRenderer(search: string): void {
+function navigateRenderer(search: string, hash = ""): void {
   const url = new URL(window.location.href);
   url.search = search;
-  url.hash = "";
+  url.hash = hash;
   window.history.pushState(null, "", url);
   window.dispatchEvent(new PopStateEvent("popstate", { state: window.history.state }));
 }
@@ -285,6 +304,9 @@ export function mountDesktopRendererEntry(
   invocation?: InvocationBridge,
   projectLoop?: ProjectLoopBridge,
   toolSafety?: ToolSafetyBridge,
+  notificationCenter?: NotificationCenterBridge,
+  notificationToolResult?: NotificationToolResultActionBridge,
+  notificationExecutionResult?: NotificationExecutionResultActionBridge,
 ): (() => void) | undefined {
   const route = new URLSearchParams(search);
   root.dataset.governanceRouteContract = "closed-v1";
@@ -437,6 +459,37 @@ export function mountDesktopRendererEntry(
         notice.tabIndex = -1; notice.focus();
       }
     };
+    const openNotificationSource = (target: NotificationDeepLinkTarget): void => {
+      if (target.roomId !== roomId) {
+        const hash = `notification-source=${encodeURIComponent(`${target.kind}:${target.targetId}`)}`;
+        navigateRenderer(`?message-room=${encodeURIComponent(target.roomId)}`, hash);
+        return;
+      }
+      const selectors: Readonly<Record<NotificationDeepLinkTarget["kind"], string>> = {
+        message: "[data-message-id]", request: "[data-request-transfer-target]",
+        confirmation: "[data-confirmation-id]", project_boundary: "[data-project-source-ref]",
+        tool_call: "[data-tool-call-id]", agent_execution: "[data-execution-id]",
+        project_obstacle: "[data-obstacle-reason]",
+      };
+      const attribute = selectors[target.kind];
+      const source = [...workspace.querySelectorAll<HTMLElement>(attribute)].find((candidate) =>
+        Object.values(candidate.dataset).includes(target.targetId));
+      if (source !== undefined) {
+        source.tabIndex = -1; source.dataset.sourceHighlighted = "true";
+        source.scrollIntoView({ block: "center", behavior: "auto" }); source.focus();
+        return;
+      }
+      const notice = document.createElement("p"); notice.setAttribute("role", "status");
+      notice.textContent = "来源仍可访问，但当前 Room projection 尚未载入该位置。请刷新对应权威面板。";
+      timeline.prepend(notice); notice.tabIndex = -1; notice.focus();
+    };
+    const disposeNotifications = notificationCenter === undefined || notificationToolResult === undefined ||
+      notificationExecutionResult === undefined ||
+      ports.mountNotificationCenterShell === undefined ? undefined
+      : ports.mountNotificationCenterShell({ workspace, bridge: notificationCenter, roomId,
+          toolResultAction: notificationToolResult,
+          executionResultAction: notificationExecutionResult,
+          onDeepLink: openNotificationSource, onReauthenticate: () => navigateRenderer("") });
     const disposeTools = tools === undefined || toolSafety === undefined ||
       ports.mountToolSafetySurface === undefined ? undefined
       : ports.mountToolSafetySurface(tools, toolSafety, roomId, {
@@ -468,7 +521,20 @@ export function mountDesktopRendererEntry(
           showInvocationHostHandoff(workspace, executions, action, context.executionId);
         },
       });
+    const notificationHash = window.location.hash.startsWith("#notification-source=")
+      ? decodeURIComponent(window.location.hash.slice("#notification-source=".length)) : undefined;
+    if (notificationHash !== undefined) {
+      const separator = notificationHash.indexOf(":");
+      const kind = notificationHash.slice(0, separator) as NotificationDeepLinkTarget["kind"];
+      const targetId = notificationHash.slice(separator + 1);
+      if (separator > 0 && ["message", "request", "confirmation", "project_boundary", "tool_call",
+        "agent_execution", "project_obstacle"].includes(kind) && targetId.length > 0 &&
+        new TextEncoder().encode(targetId).byteLength <= 256) {
+        queueMicrotask(() => openNotificationSource({ roomId, kind, targetId }));
+      }
+    }
     return () => {
+      disposeNotifications?.();
       disposeInvocations?.();
       disposeTools?.();
       disposeProject?.();

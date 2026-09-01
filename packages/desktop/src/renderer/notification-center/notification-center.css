@@ -1,0 +1,128 @@
+.notification-center {
+  --notification-focus: #2563eb;
+  --notification-border: #94a3b8;
+  --notification-muted: #475569;
+  width: min(32rem, calc(100vw - 2rem));
+  max-height: min(42rem, calc(100vh - 2rem));
+  display: grid;
+  grid-template-rows: auto auto auto auto minmax(0, 1fr) auto auto;
+  overflow: hidden;
+  color: #0f172a;
+  background: #fff;
+  border: 1px solid var(--notification-border);
+  border-radius: 0.625rem;
+}
+.notification-center-host {
+  position: absolute;
+  inset-block-start: 0.75rem;
+  inset-inline-end: 0.75rem;
+  z-index: 30;
+}
+.notification-center-trigger {
+  min-height: 2.25rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.375rem 0.625rem;
+  border: 1px solid #64748b;
+  border-radius: 0.4375rem;
+  background: #fff;
+  color: #1f2937;
+  font: 700 0.75rem/1 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+}
+.notification-center-trigger__badge {
+  min-width: 1.25rem;
+  padding: 0.1875rem 0.3125rem;
+  border-radius: 999px;
+  background: #b42318;
+  color: #fff;
+  text-align: center;
+}
+.notification-center-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: start end;
+  padding: 3rem 1rem 1rem;
+  background: rgb(15 23 42 / 18%);
+}
+.notification-center-overlay[hidden] { display: none; }
+.notification-center :focus-visible {
+  outline: 0.1875rem solid var(--notification-focus);
+  outline-offset: 0.125rem;
+}
+.notification-center__header,
+.notification-center__pagination,
+.notification-center__states,
+.notification-center__badges {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.notification-center__header,
+.notification-center__pagination,
+.notification-center__connection,
+.notification-center__live,
+.notification-center__badges,
+.notification-center__recovery { padding: 0.625rem 0.75rem; }
+.notification-center__header h2 { margin: 0; }
+.notification-center__header p { color: var(--notification-muted); margin: 0; }
+.notification-center__header button { margin-inline-start: auto; }
+.notification-center__live,
+.notification-center__connection { margin: 0; }
+.notification-center__badges { overflow-x: auto; }
+.notification-center__badges span {
+  border: 1px solid #64748b;
+  border-radius: 999px;
+  padding: 0.25rem 0.5rem;
+  white-space: nowrap;
+}
+.notification-center__list { overflow: auto; padding: 0.5rem; }
+.notification-center__row {
+  display: grid;
+  gap: 0.375rem;
+  padding-block: 0.1875rem;
+}
+.notification-center__item {
+  width: 100%;
+  display: grid;
+  gap: 0.375rem;
+  padding: 0.75rem;
+  text-align: start;
+  background: #fff;
+  border: 1px solid #cbd5e1;
+  border-inline-start: 0.1875rem solid #1d4ed8;
+  border-radius: 0 0.4375rem 0.4375rem 0;
+}
+.notification-center__source-action {
+  justify-self: start;
+  min-height: 2rem;
+  padding: 0 0.625rem;
+  border: 1px solid #1d4ed8;
+  border-radius: 0.375rem;
+  background: #fff;
+  color: #175cd3;
+  font-weight: 700;
+}
+.notification-center__source-action:disabled { border-color: #94a3b8; color: #64748b; }
+.notification-center__source-action-status { color: var(--notification-muted); font-size: 0.75rem; }
+.notification-center__source-action-status[role="alert"] { color: #b42318; }
+.notification-center__meta { color: var(--notification-muted); font-size: 0.75rem; }
+.notification-center__states span { font-weight: 700; }
+[data-read-state="unread"]::before { content: "● "; }
+[data-read-state="read"]::before { content: "○ "; }
+[data-handled-state="unhandled"]::before { content: "待办 "; }
+[data-handled-state="handled"]::before { content: "完成 "; }
+.notification-center__pagination { justify-content: space-between; }
+.notification-center__empty { min-height: 8rem; display: grid; place-items: center; }
+.notification-center[data-notification-center-status="empty"] .notification-center__badges { display: none; }
+
+@media (max-width: 840px) {
+  .notification-center { width: min(28rem, calc(100vw - 1rem)); max-height: calc(100vh - 1rem); }
+  .notification-center__header p { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .notification-center,
+  .notification-center * { animation: none !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+}
