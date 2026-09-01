@@ -115,9 +115,12 @@ skip 只能按最终实际运行结果记录；focused 分类互相重叠，不�
 ## 10. Independent reviewer
 
 独立 Sol high reviewer 对首个内容 head 发现 1 个 materialized Room repair snapshot 未绑定
-recipient identity revision 的 P1，以及 1 个 Markdown trailing-whitespace P2。当前修复把 identity
-head 纳入 snapshot reuse key，并增加跨 Worker restart 的 notification revision 防回退测试；两项
-finding 的最终闭环结论等待同一 reviewer 对修复 head 复审后回填。
+recipient identity revision 的 P1，以及 1 个 Markdown trailing-whitespace P2。修复把 identity
+head 纳入 snapshot reuse key，并增加跨 Worker restart 的 notification revision 防回退测试。
+同一 reviewer 对修复 head `eeb8033775110a2e99e5af575926dc57b70e4364` 完成闭环复审：
+`0 P0 / 0 P1 / 0 P2`；同时确认 FT-14 零泄漏、schema 仅 append-only v28、v1-v27 不变，且
+recipient filter、read/handled、multi-session/restart、archive/revoke/recall、closed WS/outbox、
+Desktop J-07、无 OS push/五分区和 offline mutation transport=0 均保持。
 
 ## 11. PR、CI、merge 与 Git 状态
 
