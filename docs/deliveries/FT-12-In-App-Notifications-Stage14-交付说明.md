@@ -126,12 +126,12 @@ Desktop J-07、无 OS push/五分区和 offline mutation transport=0 均保持�
 
 | 证据 | 当前事实 |
 | --- | --- |
-| 内容 PR | 待创建 |
-| Required CI / Node matrix | 待远端真实结果；不得用本地结果替代 |
-| Content merge SHA | 待内容 PR 合入后回填 |
-| Evidence-only PR / merge | 待真实证据回填并独立合入 |
-| 分支 / worktree | `codex/ft12-stage14a-notifications`；`/Users/leo/code/Dao-ft12-stage14a` |
-| 当前 base | `53f3fed8696293ee9644efa266c3585b66811267`（创建分支时的最新 `origin/main`） |
+| 内容 PR | [#79](https://github.com/LionelHao/Dao/pull/79)，content head `bc7b5f432df95ffee9f1710997836039f539a405`，2026-09-01 02:43:27 UTC merged |
+| Required CI / Node matrix | quality run `33461972715`；[Node 22.x](https://github.com/LionelHao/Dao/actions/runs/33461972715/job/99713829069) SUCCESS（22m59s）；[Node 22.13.1](https://github.com/LionelHao/Dao/actions/runs/33461972715/job/99713829232) SUCCESS（25m52s） |
+| Content merge SHA | `6f62474fcf6483b829eae1bebf6e698b6b27dd9a` |
+| Evidence-only PR / merge | [#80](https://github.com/LionelHao/Dao/pull/80)，从 content merge 后的最新 `origin/main` 创建；quality run `33463651398`：[Node 22.x](https://github.com/LionelHao/Dao/actions/runs/33463651398/job/99718928829) SUCCESS（23m02s）、[Node 22.13.1](https://github.com/LionelHao/Dao/actions/runs/33463651398/job/99718928997) SUCCESS（25m41s）；最终 evidence head required CI 与 merge 由 PR 状态保留真实记录 |
+| 分支 / worktree | content：`codex/ft12-stage14a-notifications` / `/Users/leo/code/Dao-ft12-stage14a`；evidence：`codex/ft12-stage14a-evidence` / `/Users/leo/code/Dao-ft12-stage14a-evidence` |
+| base | content：`53f3fed8696293ee9644efa266c3585b66811267`；evidence：`6f62474fcf6483b829eae1bebf6e698b6b27dd9a` |
 
 原工作区与四个 owner 文件保持只读；最终清理前再次核对 HEAD、status 与 SHA-256。
 
